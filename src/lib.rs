@@ -5,3 +5,5 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod cli;
+pub mod git;
+pub mod plan;

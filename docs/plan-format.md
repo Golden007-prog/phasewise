@@ -1,0 +1,117 @@
+# Plan format
+
+A plan is one Markdown file, by default `phasewise.md` at the repository root.
+`phasewise init` creates a starter one and `phasewise check` validates it
+without running anything.
+
+## Structure
+
+```text
++++ ... +++        optional TOML front matter (settings)
+# Plan title       optional level-1 heading
+shared context     everything before the first `##` heading
+## Phase heading   each level-2 heading opens a phase
+phase text         instructions for the agent
+```verify ...```   optional checks for that phase
+```
+
+## Front matter
+
+Optional. It only counts if line 1 of the file is exactly `+++`; it ends at the
+next line that is exactly `+++`. The content is TOML. Unknown keys are errors.
+Every key is optional.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `agent` | string | `"claude"` | Agent that runs the phases: `"claude"` or `"codex"`. |
+| `verify` | array of strings | `[]` | Commands run after every phase. |
+| `max_retries` | integer >= 0 | `1` | Automatic retries when verification fails. |
+| `phase_timeout_minutes` | integer >= 1 | `60` | Time limit for the agent in one phase. |
+| `verify_timeout_seconds` | integer >= 1 | `600` | Time limit for each verification command. |
+| `agent_args` | array of strings | `[]` | Extra arguments for the agent command line. |
+
+## Phases and titles
+
+- Every level-2 heading (`## Title`, or a setext heading underlined with
+  `---`) opens a phase. Phases are numbered 1, 2, 3... by order of appearance.
+- The title is the heading text without the `#` markers. A leading
+  `Phase <number>:` (any case, any spacing) is removed, so
+  `## Phase 2: Convert utils` becomes `Convert utils`. If nothing would be left
+  (`## Phase 1:`), the title is kept as written.
+- A `##` inside a fenced code block is not a heading.
+- Titles must be unique, ignoring case.
+- Level-3 and deeper headings (`###`) stay inside the phase body.
+- The body is everything after the heading up to the next phase, without the
+  `verify` blocks. It must not be empty.
+
+## Shared context and plan title
+
+Everything between the front matter and the first phase is the shared context
+and is sent to the agent in every phase. The first level-1 heading in that
+region is the plan title; it is not part of the context.
+
+## Verify blocks
+
+A fenced code block whose info string is exactly `verify` lists commands that
+must succeed for the phase to pass: one command per line. Empty lines and lines
+starting with `#` are ignored. The block is removed from the text the agent
+receives. A `verify` block before the first phase is an error.
+
+The commands of a phase run after the global `verify` commands from the front
+matter.
+
+## What the agent receives
+
+For each phase the agent gets the shared context (title excluded), a summary of
+the phases already completed, the phase body (title and instructions, without
+`verify` blocks) and the list of checks it will have to pass. It does not
+receive the other phases' instructions.
+
+## Validation errors
+
+`phasewise check` reports every problem as `<file>:<line>: <message>` (lines are
+1-based, counted in the original file including the front matter), sorted by
+line, and exits with code 1:
+
+- front matter that is not closed (line 1);
+- unknown key (named in the message), invalid TOML or wrong value type;
+- unknown `agent` (the valid values are listed);
+- `phase_timeout_minutes` or `verify_timeout_seconds` below 1;
+- a plan with no phases;
+- a phase with an empty body;
+- duplicate phase titles (reported at the second one, with the first one's line);
+- a `verify` block before the first phase.
+
+## Full example
+
+````markdown
++++
+agent = "claude"
+verify = ["cargo test"]
+max_retries = 1
+phase_timeout_minutes = 60
+verify_timeout_seconds = 600
++++
+
+# Add a stats subcommand
+
+Shared context: a clap-based Rust CLI. Do not add dependencies.
+
+## Phase 1: Define the subcommand
+
+Add `stats` with a `--json` flag that prints `not implemented`.
+
+```verify
+cargo run -q -- stats --help
+```
+
+## Phase 2: Implement it
+
+Print a summary, or one JSON object with `--json`.
+
+### Constraints
+
+- Output goes to stdout.
+````
+
+More plans are in `examples/plans/`.

@@ -1,18 +1,32 @@
 //! Command-line interface: clap definitions, dispatch and exit codes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
-/// Agent selectable from the command line (temporary; a later phase maps it
-/// to `plan::AgentKind`).
+use crate::git::Git;
+use crate::plan::{self, AgentKind};
+
+const PLAN_FILE: &str = "phasewise.md";
+const PLAN_TEMPLATE: &str = include_str!("templates/phasewise.md");
+
+/// Agent selectable from the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum AgentArg {
     Claude,
     Codex,
+}
+
+impl From<AgentArg> for AgentKind {
+    fn from(arg: AgentArg) -> Self {
+        match arg {
+            AgentArg::Claude => AgentKind::Claude,
+            AgentArg::Codex => AgentKind::Codex,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -144,8 +158,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Cli::command().print_long_help()?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Init) => not_implemented("init"),
-        Some(Command::Check { .. }) => not_implemented("check"),
+        Some(Command::Init) => init(),
+        Some(Command::Check { plan }) => check(plan),
         Some(Command::Doctor) => not_implemented("doctor"),
         Some(Command::Run { .. }) => not_implemented("run"),
         Some(Command::Next { .. }) => not_implemented("next"),
@@ -160,4 +174,94 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
 
 fn not_implemented(name: &str) -> Result<ExitCode> {
     Err(anyhow!("`phasewise {name}` is not implemented yet"))
+}
+
+/// Explicit path as given, else `phasewise.md` at the repository root (or in
+/// the current directory outside a repository).
+fn resolve_plan_path(arg: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = arg {
+        return Ok(path);
+    }
+    let cwd = std::env::current_dir().context("Cannot read the current directory")?;
+    let dir = match Git::discover(&cwd) {
+        Ok(git) => git.root().to_path_buf(),
+        Err(_) => cwd,
+    };
+    Ok(dir.join(PLAN_FILE))
+}
+
+fn check(arg: Option<PathBuf>) -> Result<ExitCode> {
+    let path = resolve_plan_path(arg)?;
+    let loaded = match plan::load(&path) {
+        Ok(plan) => plan,
+        Err(err) => {
+            let message = err.to_string();
+            // Parse problems are already rendered as `<path>:<line>: <message>`.
+            if message.starts_with(&format!("{}:", path.display())) {
+                eprintln!("{message}");
+                eprintln!("error: the plan has {} problem(s)", message.lines().count());
+                return Ok(ExitCode::from(1));
+            }
+            return Err(err);
+        }
+    };
+    print_plan(&loaded, &path);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_plan(plan: &plan::Plan, path: &Path) {
+    let config = &plan.config;
+    println!(
+        "{} ({})",
+        plan.title.as_deref().unwrap_or("(untitled)"),
+        path.display()
+    );
+    println!("Agent: {}", config.agent);
+    if config.verify.is_empty() {
+        println!("Checks after every phase: (none)");
+    } else {
+        println!("Checks after every phase:");
+        for command in &config.verify {
+            println!("  - {command}");
+        }
+    }
+    println!("Max retries: {}", config.max_retries);
+    println!("Phase timeout: {} min", config.phase_timeout_minutes);
+    println!("Check timeout: {} s", config.verify_timeout_seconds);
+    println!();
+    for phase in &plan.phases {
+        println!("  {}. {}", phase.number, phase.title);
+        if phase.verify.is_empty() {
+            println!("       (no phase-specific checks)");
+        } else {
+            for command in &phase.verify {
+                println!("       - {command}");
+            }
+        }
+    }
+    println!();
+    println!("{} phases. The plan is valid.", plan.phases.len());
+}
+
+fn init() -> Result<ExitCode> {
+    let cwd = std::env::current_dir().context("Cannot read the current directory")?;
+    let git = Git::discover(&cwd)?;
+    let path = git.root().join(PLAN_FILE);
+    if path.exists() {
+        println!("{PLAN_FILE} already exists; left untouched.");
+    } else {
+        std::fs::write(&path, PLAN_TEMPLATE)
+            .with_context(|| format!("Cannot write {}", path.display()))?;
+        println!("Created {}.", path.display());
+    }
+    if git.ensure_excluded(".phasewise/")? {
+        println!("Added .phasewise/ to the git exclude file.");
+    }
+    println!();
+    println!("Next steps:");
+    println!("  1. Edit {PLAN_FILE} to describe your phases.");
+    println!("  2. Commit it (`phasewise run` needs a clean working tree).");
+    println!("  3. phasewise check");
+    println!("  4. phasewise run");
+    Ok(ExitCode::SUCCESS)
 }

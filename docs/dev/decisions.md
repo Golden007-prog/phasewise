@@ -38,3 +38,17 @@ deviates from the original plan, with the reason.
   shared by the CLI and the TUI, so the TUI does not depend on the CLI) and
   `process.rs` (process groups and termination). `AgentEvent` gains an
   `Error { detail }` variant for non-final errors reported by the agent.
+
+## Build phase 2
+
+- **Dependencies added in phase 2:** `serde` (derive) and `toml` for the front
+  matter (`deny_unknown_fields`, error spans), `pulldown-cmark` without default
+  features for heading/code-block detection with byte offsets, `thiserror` for
+  `PlanError`; dev: `tempfile` for test repositories.
+- **Setext level-2 headings also open a phase**, as in any Markdown renderer;
+  `##` inside code blocks never does.
+- **Plan errors:** front-matter (TOML) errors stop parsing, because the rest
+  cannot be trusted; all other validation errors are collected and reported
+  together, sorted by line. "No phases" is reported at line 1.
+- **Default plan path:** `phasewise.md` at the repository root, or in the
+  current directory when outside a repository.
