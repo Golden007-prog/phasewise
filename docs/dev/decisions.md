@@ -57,3 +57,22 @@ deviates from the original plan, with the reason.
 
 - **Dependencies added in phase 3:** `jiff` (with `serde`) for timestamps in
   `state.json` and UTC run ids; `serde_json` to read and write `state.json`.
+
+## Build phase 4
+
+- **Agent event shapes are assumptions until phase 5.** Fixtures are synthetic
+  (`tests/fixtures/*.synthetic.jsonl`). Claude `permission_denied` is read from
+  `system`/`permission_denied` (or type `permission_denied`) with `tool_name`,
+  `tool_use_id`, `tool_input`; `api_retry` uses `attempt`, `max_retries`, `error`.
+  Codex file changes use item type `file_change` with `changes: [{path, kind}]`.
+- **Claude `Finished.summary`** is empty when `result` is missing; Codex
+  `Finished.summary` is the last agent message (empty if none).
+- **Codex `agent_message` with empty text** is not reported or marked as seen,
+  so a later `item.completed` with text for the same id still produces a `Message`.
+- **Tool details** also replace `<root>/` inside commands, not only whole paths.
+- **`terminate_group`** always sends `KILL` to the group after the grace period,
+  even when the leader already exited, because group members may outlive it.
+- **`verify.rs` output tail** drops the `exit code:` / `timed out after` trailer
+  line written by phasewise itself.
+- **`fresh_retry_prompt` / `resume_prompt` / `verify_failure_report` wording**
+  is not fixed by the spec; the texts live in `prompt.rs`.

@@ -4,8 +4,11 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod agent;
 pub mod cli;
 pub mod git;
 pub mod plan;
 pub mod process;
+pub mod prompt;
 pub mod state;
+pub mod verify;
