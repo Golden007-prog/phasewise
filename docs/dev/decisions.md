@@ -52,3 +52,8 @@ deviates from the original plan, with the reason.
   together, sorted by line. "No phases" is reported at line 1.
 - **Default plan path:** `phasewise.md` at the repository root, or in the
   current directory when outside a repository.
+
+## Build phase 3
+
+- **Dependencies added in phase 3:** `jiff` (with `serde`) for timestamps in
+  `state.json` and UTC run ids; `serde_json` to read and write `state.json`.

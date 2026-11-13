@@ -11,9 +11,16 @@ pub struct TestRepo {
     dir: TempDir,
 }
 
+/// Environment that hides the global and system git configuration.
+pub fn isolated_git_env() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+}
+
 fn isolate(cmd: &mut Command) {
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
+    cmd.envs(isolated_git_env())
         .env_remove("PHASEWISE_CLAUDE_BIN")
         .env_remove("PHASEWISE_CODEX_BIN");
 }
@@ -36,6 +43,13 @@ impl TestRepo {
         repo.git(&["config", "user.name", "Test User"]);
         repo.git(&["config", "user.email", "test@example.com"]);
         repo
+    }
+
+    /// A `Git` handle on this repository with the isolated environment.
+    pub fn git_handle(&self) -> phasewise::git::Git {
+        phasewise::git::Git::discover(self.path())
+            .expect("discover repository")
+            .with_env(isolated_git_env())
     }
 
     pub fn path(&self) -> &Path {
@@ -77,10 +91,22 @@ impl TestRepo {
     pub fn phasewise(&self) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::new(assert_cmd::cargo::cargo_bin!("phasewise"));
         cmd.current_dir(self.path())
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .envs(isolated_git_env())
             .env_remove("PHASEWISE_CLAUDE_BIN")
             .env_remove("PHASEWISE_CODEX_BIN");
         cmd
+    }
+}
+
+impl TestRepo {
+    /// Trimmed stdout of a git command.
+    pub fn git_trim(&self, args: &[&str]) -> String {
+        self.git(args).trim().to_string()
+    }
+
+    /// Commits `rel` with `content` as a commit made "by the agent".
+    pub fn commit_file(&self, rel: &str, content: &str, msg: &str) {
+        self.write(rel, content);
+        self.commit_all(msg);
     }
 }
