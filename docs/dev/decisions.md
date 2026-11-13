@@ -23,3 +23,18 @@ deviates from the original plan, with the reason.
   `--sandbox`; `codex exec --sandbox workspace-write resume <id> -` parses.
 - **`repository` in `Cargo.toml`** is `https://github.com/userfypp/phasewise`,
   from `gh api user --jq .login`. The repository does not exist yet.
+
+## Build phase 1
+
+- **Dependencies:** `clap` (derive) for the CLI and `anyhow` for error chains,
+  both in the planned list; dev: `assert_cmd`, `predicates`.
+- **clap usage errors exit with 1**, not clap's default 2, to match the
+  documented exit codes (0 ok, 1 usage/environment, 3 failed phase).
+- **CI actions:** `actions/checkout@v7` and `Swatinem/rust-cache@v2` (latest
+  releases according to the GitHub API on 2026-11-14),
+  `dtolnay/rust-toolchain@stable`.
+- **Internal design** fixed in `docs/dev/design.md` before implementation,
+  with two modules not in the original layout: `ops.rs` (run-level operations
+  shared by the CLI and the TUI, so the TUI does not depend on the CLI) and
+  `process.rs` (process groups and termination). `AgentEvent` gains an
+  `Error { detail }` variant for non-final errors reported by the agent.
