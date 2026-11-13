@@ -1,0 +1,15 @@
+[package]
+name = "phasewise"
+version = "0.1.0"
+edition = "2024"
+description = "Run big plans with Claude Code or Codex one phase at a time — verified, checkpointed, and reviewable."
+license = "MIT"
+repository = "https://github.com/userfypp/phasewise"
+readme = "README.md"
+keywords = ["claude", "codex", "agent", "cli", "git"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
