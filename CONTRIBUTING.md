@@ -85,26 +85,31 @@ cargo test --all-features -- --ignored readme_screenshots
 ```
 
 The title card and the diagram of a run are drawn by
-`scripts/readme-graphics.py`, which needs `pip install fonttools` and the
-DejaVu fonts (matplotlib ships them). Regenerate them after changing the look
-of the screens, and read the result in a browser, in light and dark mode.
+`scripts/readme-graphics.py`, which needs `pip install fonttools` and a folder
+with `SourceSansPro-Regular.ttf`, `Inconsolata-Regular.ttf` and
+`DejaVuSansMono.ttf` (all free to embed), passed as `--fonts DIR`. Regenerate
+them after changing the look of the screens, and read the result in a browser,
+in light and dark mode.
 
 ## Pull requests
 
 - Keep each pull request focused on one change; leave out unrelated edits and
   generated files.
 - Use a [Conventional Commits](https://www.conventionalcommits.org/) title:
-  `feat:`, `fix:`, `docs:`, `refactor:`, `test:` or `chore:`, with `!` for a
-  breaking change.
+  `feat:`, `fix:`, `perf:`, `docs:`, `refactor:`, `test:`, `ci:` or `chore:`,
+  with `!` for a breaking change. Pull requests are squash-merged and the
+  title becomes the commit message, so it decides the next version and the
+  changelog entry. A check fails when the title does not follow the format.
+  Do not edit `CHANGELOG.md` or the version in `Cargo.toml`; see
+  [Releasing](docs/RELEASING.md).
 - Add or update tests for every change in behaviour.
 - Update the documentation the change affects: the
   [user guide](docs/user-guide.md) for anything a user sees, the
   [plan format](docs/plan-format.md), [Architecture](docs/ARCHITECTURE.md) for
-  structure or invariants, [Decisions](docs/decisions.md) for a choice others
-  would ask about, and an entry under `Unreleased` in the
-  [changelog](CHANGELOG.md).
-- New dependencies are added with `cargo add` and justified in
-  [Decisions](docs/decisions.md).
+  structure or invariants, and the reason for any choice others would ask
+  about (in the code comment or the pull request description).
+- New dependencies are added with `cargo add` and justified in the pull
+  request description.
 - Describe what you checked by hand, especially for the TUI and for anything
   that touches git, processes or signals.
 

@@ -1,8 +1,9 @@
 ## Summary
 
 <!--
-Title: a Conventional Commit, for example `feat: …`, `fix: …`, `docs: …`.
-Describe the change and its effect for users in the first bullet.
+Title: a Conventional Commit, for example `feat: …`, `fix: …`, `docs: …`. It
+becomes the commit message and decides the next version, so check it before
+merging. Describe the change and its effect for users in the first bullet.
 -->
 
 -

@@ -1,8 +1,7 @@
 # Architecture
 
 How phasewise is built. This page is binding: a change to module boundaries,
-on-disk formats or the invariants below updates it in the same commit, and the
-reason goes to [decisions](decisions.md). For what users see, read the
+on-disk formats or the invariants below updates it in the same commit. For what users see, read the
 [user guide](user-guide.md); for the exact agent command lines,
 [agents](agents.md).
 

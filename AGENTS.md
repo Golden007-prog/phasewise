@@ -16,7 +16,8 @@ and stops for the user's review.
   layout and invariants. Binding: change it together with the code.
 - [docs/agents.md](docs/agents.md): the exact command lines phasewise gives
   Claude Code and Codex, and the output formats it parses.
-- [docs/decisions.md](docs/decisions.md): why things are the way they are.
+- [docs/RELEASING.md](docs/RELEASING.md): how versions, the changelog and releases
+  are made (by tooling, from pull request titles).
 - [docs/user-guide.md](docs/user-guide.md) and
   [docs/plan-format.md](docs/plan-format.md): the behaviour users rely on.
 
@@ -45,8 +46,8 @@ cargo test --all-features
 
 1. Do not invent interfaces: check agent CLI options with `--help` and crate
    APIs against the documentation of the installed version.
-2. Add dependencies with `cargo add` (latest stable) and justify each one in
-   `docs/decisions.md`.
+2. Add dependencies with `cargo add` (latest stable) and justify each one in the
+   commit message.
 3. No `unsafe` (`#![forbid(unsafe_code)]`). No `unwrap()`/`expect()` outside
    tests, except provable invariants with a comment. No `#[allow]` without a
    comment that justifies it.
@@ -86,6 +87,5 @@ cargo test --all-features
 Update, in the same change: the tests and snapshots, the
 [user guide](docs/user-guide.md) (and [plan format](docs/plan-format.md) if
 plans are affected), [Architecture](docs/ARCHITECTURE.md) for structure or
-invariants, [Decisions](docs/decisions.md) for choices others would question,
-the `Unreleased` section of [CHANGELOG.md](CHANGELOG.md), and the README
-screenshots if a screen changed.
+invariants, and the README screenshots if a screen changed. The changelog is
+written by the release tooling from commit titles; do not edit it by hand.

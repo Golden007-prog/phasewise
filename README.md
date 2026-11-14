@@ -8,7 +8,7 @@
 </div>
 
 <p align="center">
-  <a href="#quick-start"><b>Quick start</b></a> ·
+  <a href="#quick-start">Quick start</a> ·
   <a href="docs/user-guide.md">User guide</a> ·
   <a href="SECURITY.md">Security</a>
 </p>
@@ -23,9 +23,9 @@
   <img src="assets/readme/home-light.svg" alt="The phasewise home screen: a plan with four phases and their checks, Claude Code with its model and effort, and a notice to commit the plan before starting.">
 </picture>
 
-phasewise hands a Markdown plan to Claude Code or Codex one phase at a time. The agent works on a single phase, your checks prove it, a git commit saves it, and nothing continues until you have looked at it.
+phasewise runs a Markdown plan with Claude Code or Codex, one phase at a time. The agent works on a single phase, your checks prove it, a git commit saves it, and nothing continues until you have looked at it.
 
-Give an agent a big plan in one go and you get one enormous change to review, with no safe point to return to when step 7 breaks step 3. With phasewise every phase is a commit on a branch of its own: you can read it, retry it with a note, or roll back to it. Your branch stays untouched until you decide to merge.
+Hand an agent a big plan in one go and you get one enormous change to review, with no safe point to return to when step 7 breaks step 3. Here every phase is a commit on a branch of its own: you can read it, retry it with a note, or roll back to it. Your own branch stays untouched until you decide to merge.
 
 ## How a run works
 
@@ -36,10 +36,10 @@ Give an agent a big plan in one go and you get one enormous change to review, wi
   <img src="assets/readme/run-graph-wide-light.svg" alt="Your branch, main, stays untouched. A run forks the branch phasewise/run-id from it. Phases 1 to 3 passed their checks and are saved as commits; phase 4 is in review. When you decide, you merge the run branch into main.">
 </picture>
 
-1. **Plan.** Say what you want in a sentence. The agent reads your project, without changing it, and writes `phasewise.md`. Or write the plan yourself.
-2. **Run.** Each phase runs headless on the branch `phasewise/<run-id>`, then your checks run. A failure goes back to the agent together with its output.
-3. **Review.** Read the diff, the agent's log and the checks. Approve the phase, retry it with a note, or roll back.
-4. **Merge.** When the last phase is approved, merge the run branch into yours with the command phasewise prints.
+1. You describe what you want in a sentence. The agent reads your project, without changing it, and writes `phasewise.md`. Or you write the plan yourself.
+2. Each phase runs headless on the branch `phasewise/<run-id>`, and then your checks run. If one fails, the agent gets its output and tries again.
+3. You read the diff, the agent's log and the checks, then approve the phase, retry it with a note, or roll back.
+4. When the last phase is approved, you merge the run branch into yours with the command phasewise prints.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/run-dark.svg">
@@ -48,12 +48,12 @@ Give an agent a big plan in one go and you get one enormous change to review, wi
 
 ## What you get
 
-- **A plan the agent drafts.** It explores the project read-only, then writes phases that are small enough to review, each with checks taken from your build files.
-- **A fresh session for every phase.** The agent sees that phase's instructions and a one-line summary of the phases already done, nothing else.
-- **Checks that decide.** Your own commands, such as `cargo test` or `npm run lint`, run after every phase. If one fails, the agent gets the output and another try while retries remain.
-- **Checkpoints you can trust.** Each phase is a commit with `Phasewise-Run` and `Phasewise-Phase` trailers, so any of them is a place to return to.
-- **A model for each job.** The planner picks the model and effort of every phase, cheap for mechanical work and strong for hard work. Change any of them in the plan or from the home screen.
-- **Claude Code or Codex.** The same plan runs on either; switch with one key.
+- A plan the agent drafts: it explores the project read-only, then writes phases small enough to review, each with checks taken from your build files.
+- A fresh session for every phase: the agent sees that phase's instructions and a one-line summary of the phases already done, nothing else.
+- Checks that decide: your own commands, such as `cargo test` or `npm run lint`, run after every phase. If one fails, the agent gets the output and another try while retries remain.
+- Checkpoints you can return to: each phase is a commit with `Phasewise-Run` and `Phasewise-Phase` trailers.
+- A model for each job: the planner picks the model and effort of every phase, cheap for mechanical work and strong for hard work. Change any of them in the plan or from the home screen.
+- Claude Code or Codex: the same plan runs on either, and one key switches between them.
 
 ## Quick start
 
@@ -79,11 +79,12 @@ Every step is also a command: `phasewise plan "…"`, `phasewise run`, `phasewis
 
 ## Documentation
 
-- **[User guide](docs/user-guide.md)**: the screens, every command, models and effort, and what to do when something goes wrong.
-- **[Plan format](docs/plan-format.md)**: the Markdown file phasewise reads, with validation errors explained.
-- **[Agents](docs/agents.md)**: the command lines and output formats of Claude Code and Codex.
-- **[Architecture](docs/ARCHITECTURE.md)**: modules, data flow, files on disk and invariants.
-- **[Decisions](docs/decisions.md)** and **[Roadmap](docs/ROADMAP.md)**: why it is the way it is, and what may come.
-- **[Contributing](CONTRIBUTING.md)**, **[Security](SECURITY.md)**, **[Code of conduct](CODE_OF_CONDUCT.md)** and **[Changelog](CHANGELOG.md)**.
+- [User guide](docs/user-guide.md): the screens, every command, models and effort, and what to do when something goes wrong.
+- [Plan format](docs/plan-format.md): the Markdown file phasewise reads, with its validation errors explained.
+- [Agents](docs/agents.md): the command lines and output formats of Claude Code and Codex.
+- [Architecture](docs/ARCHITECTURE.md): modules, data flow, files on disk and invariants.
+- [Roadmap](docs/ROADMAP.md): what may come.
+- [Releasing](docs/RELEASING.md): how versions and releases are made.
+- [Contributing](CONTRIBUTING.md), [Security](SECURITY.md), [Code of conduct](CODE_OF_CONDUCT.md) and [Changelog](CHANGELOG.md).
 
 <p align="center"><sub>MIT licensed · © userfypp</sub></p>

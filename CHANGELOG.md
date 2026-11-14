@@ -1,11 +1,9 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased]
+All notable changes to this project are documented in this file. From version
+0.2.0 on it is written by [Release Please](docs/RELEASING.md) from the titles of
+the merged pull requests. The project adheres to
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.1.0] — 2026-11-14
 
@@ -52,5 +50,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Guarantees:** phasewise never pushes, never deletes branches, never uses
   `--force`, makes no network connections of its own and has no `unsafe` code.
 - **Documentation:** README, user guide, plan format, agents, architecture,
-  decisions, roadmap, contributing guide, security policy and code of conduct;
+  roadmap, contributing guide, security policy and code of conduct;
   example plans and a smoke-test script for real agents.
