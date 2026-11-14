@@ -31,5 +31,5 @@ directory. Each item names the evidence behind it.
    - On a panic: `ratatui::try_init` installs a panic hook that restores the terminal (ratatui 0.30.2, `src/init.rs`), and a `Drop` guard calls `ratatui::restore()`. The panic path was not triggered at runtime.
 8. **No network connections of its own.** `src/` uses no `std::net` and no HTTP/TLS client, and the dependency tree has none. `mio` is present only as crossterm's terminal-event poller. The agents phasewise launches use the network themselves.
 9. **No `unsafe`, `todo!()`, `unimplemented!()` or "not implemented yet" in `src/`.** A grep finds only `#![forbid(unsafe_code)]` and a comment.
-10. **The README states the real status of each agent.** Both are listed as "experimental — not yet verified against a real run".
+10. **The README states the real status of each agent.** Claude Code is listed as tested (real smoke test passed, see `docs/dev/agent-cli-notes.md`); Codex as "experimental — not yet verified against a real run".
 11. **Nothing was pushed, published or created remotely.** `git remote -v` is empty. Nothing was published to crates.io or anywhere else.

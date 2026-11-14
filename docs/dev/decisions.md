@@ -248,3 +248,8 @@ deviates from the original plan, with the reason.
   SHA the user confirmed and changes nothing if the target moved meanwhile;
   `next` checks the git identity only when a phase will run; phases recovered
   under the lock are announced after the operation.
+- **Real smoke test with Claude Code passed** (2.1.325, 8/8 checks, about
+  $0.13) once the maintainer had logged in; Claude Code is now "tested" in the
+  README. Two unknown event types (`rate_limit_event`, `system`/`thinking_tokens`)
+  were ignored as designed. Codex is still not logged in and stays
+  "experimental". Raw captures were not saved as fixtures (personal data).

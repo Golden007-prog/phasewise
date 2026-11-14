@@ -149,14 +149,18 @@ The fixtures `tests/fixtures/codex-*.synthetic.jsonl` follow these shapes.
 
 ## Real smoke test (plan section 8)
 
-Not run on 2026-11-14: neither CLI had a session of its own on this machine.
+**Claude Code: passed on 2026-11-14** with Claude Code 2.1.325, after the
+maintainer logged in. `scripts/smoke-test.sh claude` ran in a clean
+environment (no host credentials): both phases reached `awaiting_review`, two
+checkpoints, session id captured, diffs `+hello` / `+world`, `.phasewise/` in
+no commit, `main` unchanged; 8/8 checks, about $0.13 in total
+($0.0636 + $0.0675). The real stream had `system`/`init`, `assistant`,
+`user`, `result`/`success` and two event types the parser does not know and
+ignored as designed: `rate_limit_event` and `system`/`thinking_tokens`. The raw
+captures were not committed as fixtures: they contain local paths and account
+details and need sanitizing first.
 
-- `claude auth status` (in a clean environment and in the user's login shell):
-  `"loggedIn": false`, `"authMethod": "none"`, and no `ANTHROPIC_API_KEY`.
-- `codex login status`: `Not logged in`; no `~/.codex/auth.json` or
-  `config.toml`. An `OPENAI_API_KEY` for another provider exists in the shell;
-  it was not used, because Codex would send it to OpenAI.
-
-Both agents stay "experimental — not yet verified against a real run" until
-the smoke test passes. To run it after logging in, see
-`docs/dev/smoke-test.md`.
+**Codex: not run.** `codex login status` said `Not logged in` and there is no
+`~/.codex/auth.json`. An `OPENAI_API_KEY` for another provider exists in the
+shell and was not used on purpose (see `decisions.md`, build phase 8, for one
+accidental run that was rejected with HTTP 401). Codex stays "experimental".
