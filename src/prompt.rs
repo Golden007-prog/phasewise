@@ -273,7 +273,8 @@ effort that will do the phase reliably:
   a bug whose cause is unknown, changes that touch many modules): the strongest model and a high effort.
 
 Use only model names from the list above, and only efforts that the chosen model supports when the list
-shows them. Do not set `model` or `effort` in the front matter (it would apply to every phase); use
+shows them. Within a tier prefer the newest model: skip one the list describes as older unless it is
+the only one that fits. Do not set `model` or `effort` in the front matter (it would apply to every phase); use
 the `phasewise` block of each phase. A phase for which the agent's own default is the right choice may
 leave the block out.
 
@@ -479,6 +480,7 @@ Do the second thing.
         assert!(p.contains("- opus: Complex reasoning"));
         assert!(!p.contains("could not be read"));
         assert!(p.contains("Choose the model and the effort of every phase yourself"));
+        assert!(p.contains("prefer the newest model"));
         let p = plan_prompt("x", AgentKind::Claude, None);
         assert!(p.contains("could not be read; any model name accepted by the agent's CLI works"));
     }
