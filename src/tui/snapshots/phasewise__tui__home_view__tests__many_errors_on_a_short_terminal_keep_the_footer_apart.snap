@@ -1,0 +1,24 @@
+---
+source: src/tui/home_view.rs
+expression: terminal.backend()
+---
+" ╭──────────────────────────────────────────╮                                   "
+" │ ✻ phasewise 0.3.0                        │                                   "
+" │   demo · main                            │                                   "
+" ╰──────────────────────────────────────────╯                                   "
+"                                                                                "
+" ✗ phasewise.md has errors                                                      "
+"   line 1  problem 1                                                            "
+"   line 2  problem 2                                                            "
+"   … 13 more                                                                    "
+" Fix them in your editor; this screen updates on its own.                       "
+"                                                                                "
+" Agent   Claude Code 2.1.325                                                    "
+" Model   Default · Claude Code's choice                                         "
+" Effort  Default · Claude Code's choice                                         "
+"                                                                                "
+" ! phasewise.md is not committed                                                "
+"   git add phasewise.md && git commit -m "Add phasewise plan"                   "
+"                                                                                "
+" ✗ Could not read the plan.                                                     "
+" p new plan · a agent · m model · e effort · q quit · ? shortcuts               "

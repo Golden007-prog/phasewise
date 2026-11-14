@@ -50,6 +50,8 @@ const HOME_RELOAD_EVERY: Duration = Duration::from_secs(2);
 /// the parent process has ended, before the watchdog ends phasewise.
 const STUCK_AFTER: Duration = Duration::from_secs(30);
 const WATCH_EVERY: Duration = Duration::from_millis(500);
+/// Exit code of a forced quit (128 + SIGINT).
+const FORCED_EXIT: u8 = 130;
 /// Exit code when the watchdog ends phasewise (128 + SIGHUP).
 const HANGUP_EXIT: i32 = 129;
 
@@ -105,6 +107,16 @@ fn join_beating<T>(handle: JoinHandle<T>) -> thread::Result<T> {
         thread::sleep(POLL);
     }
     handle.join()
+}
+
+/// While stopping, Ctrl-C or `q` again forces the exit.
+fn is_force_key(key: KeyEvent) -> bool {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    match key.code {
+        KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::CONTROL),
+        KeyCode::Char('q') => !key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
 }
 
 /// The loop has been silent too long while it has a reason to stop.
@@ -198,6 +210,9 @@ fn launch(cwd: &Path, data: HomeData, run: Option<Run>, screen: Screen) -> Resul
         ui.stop_all();
         return Err(err);
     }
+    if ui.forced {
+        return Ok(ExitCode::from(FORCED_EXIT));
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -207,6 +222,9 @@ enum Background {
     Models(AgentKind, Result<Vec<ModelInfo>, String>),
     /// The plan commit ended: the short SHA, or git's error.
     Committed(Result<String, String>),
+    /// The periodic reload of the home data ended (with the generation it
+    /// started in).
+    Reloaded(u64, Box<Result<HomeData, String>>),
 }
 
 /// The planning running in its own thread.
@@ -229,6 +247,10 @@ struct HomeTui<'a> {
     commit: Option<JoinHandle<()>>,
     /// Start the run with these choices when the commit succeeds.
     then_start: Option<(AgentKind, Overrides)>,
+    /// A periodic reload runs in its own thread.
+    reloading: bool,
+    /// Bumped by every explicit reload: an older periodic result is stale.
+    reload_gen: u64,
     dirty: bool,
     /// Set when a run was started: the loop shows the run screen.
     started: Option<Run>,
@@ -245,6 +267,8 @@ impl<'a> HomeTui<'a> {
             background_tx,
             commit: None,
             then_start: None,
+            reloading: false,
+            reload_gen: 0,
             dirty: true,
             started: None,
         }
@@ -368,15 +392,62 @@ impl<'a> HomeTui<'a> {
         self.home.begin_planning();
     }
 
-    fn drain_background(&mut self, quitting: bool) {
+    /// Handles what the background threads sent. A periodic reload is applied
+    /// only when `apply_reload` (the home screen is shown and idle).
+    fn drain_background(&mut self, quitting: bool, apply_reload: bool) {
         while let Ok(message) = self.background.try_recv() {
             match message {
                 Background::Version(kind, probe) => self.home.set_probe(kind, probe),
                 Background::Models(kind, result) => self.home.set_models(kind, result),
                 Background::Committed(result) => self.commit_done(&result, quitting),
+                Background::Reloaded(generation, result) => {
+                    self.reloading = false;
+                    let fresh = generation == self.reload_gen;
+                    if let Ok(data) = *result
+                        && apply_reload
+                        && fresh
+                        && self.commit.is_none()
+                        && self.home.set_data(data)
+                    {
+                        self.dirty = true;
+                    }
+                    continue;
+                }
             }
             self.dirty = true;
         }
+    }
+
+    /// A commit thread that ended without a result panicked: report it, or
+    /// the spinner would never stop and quitting would never finish.
+    fn check_commit(&mut self, quitting: bool) {
+        if !self.commit.as_ref().is_some_and(|h| h.is_finished()) {
+            return;
+        }
+        // A result sent just before the thread ended is in the channel now.
+        self.drain_background(quitting, false);
+        if self.commit.is_some() {
+            let panicked =
+                Err("The commit thread panicked. This is a bug; please report it.".to_string());
+            self.commit_done(&panicked, quitting);
+            self.dirty = true;
+        }
+    }
+
+    /// Loads the home data in a thread (at most one at a time); the result
+    /// comes back as `Background::Reloaded`.
+    fn spawn_reload(&mut self) {
+        if self.reloading {
+            return;
+        }
+        self.reloading = true;
+        let generation = self.reload_gen;
+        let tx = self.background_tx.clone();
+        let cwd: PathBuf = self.cwd.to_path_buf();
+        thread::spawn(move || {
+            let result = data::load_home(&cwd).map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Background::Reloaded(generation, Box::new(result)));
+        });
     }
 
     fn commit_done(&mut self, result: &Result<String, String>, quitting: bool) {
@@ -449,6 +520,7 @@ impl<'a> HomeTui<'a> {
     /// (the periodic one) reports nothing on failure and redraws only when
     /// the data changed. False on error.
     fn reload(&mut self, quiet: bool) -> bool {
+        self.reload_gen += 1;
         match data::load_home(self.cwd) {
             Ok(data) => {
                 if self.home.set_data(data) || !quiet {
@@ -475,6 +547,8 @@ struct Ui<'a> {
     /// The state of the current run, when the repository has one.
     run: Option<Tui<'a>>,
     quitting: bool,
+    /// Left by a second Ctrl-C or `q` while stopping: exit code 130.
+    forced: bool,
     /// Set by SIGINT/SIGTERM/SIGHUP (the first one acts like a confirmed quit).
     signalled: Arc<AtomicBool>,
     /// A closed terminal acts like a signal (see `ParentWatch`).
@@ -504,6 +578,7 @@ impl<'a> Ui<'a> {
             home: HomeTui::new(cwd, home),
             run,
             quitting: false,
+            forced: false,
             signalled,
             parent: process::ParentWatch::new(),
             clock: Instant::now(),
@@ -551,6 +626,7 @@ impl<'a> Ui<'a> {
         let frame = spinner_frame(self.clock.elapsed());
         self.home.home.frame = frame;
         if let Some(tui) = &mut self.run {
+            tui.app.worker_busy = tui.worker.is_some();
             tui.app.planning_busy = planning;
             tui.app.frame = frame;
         }
@@ -593,10 +669,16 @@ impl<'a> Ui<'a> {
                 // A resize needs nothing more than the redraw of the next turn.
                 if let Event::Key(key) = event::read()?
                     && key.kind != KeyEventKind::Release
-                    // While quitting only drawing continues; keys are ignored.
-                    && !self.quitting
                 {
-                    self.on_key(key);
+                    if !self.quitting {
+                        self.on_key(key);
+                    } else if is_force_key(key) {
+                        // A worker that never stops must not trap the user:
+                        // do what a second signal does.
+                        process::kill_all_groups();
+                        self.forced = true;
+                        return Ok(());
+                    }
                 }
             }
             self.pump();
@@ -609,7 +691,9 @@ impl<'a> Ui<'a> {
             self.screen = Screen::Home;
             self.home.dirty = true;
         }
-        self.home.drain_background(self.quitting);
+        let apply_reload = self.screen == Screen::Home && self.home.home.mode == HomeMode::Normal;
+        self.home.drain_background(self.quitting, apply_reload);
+        self.home.check_commit(self.quitting);
         self.home.drain_plan_events();
         self.home.finish_worker(self.quitting);
         if let Some(tui) = &mut self.run {
@@ -635,7 +719,7 @@ impl<'a> Ui<'a> {
             return;
         }
         self.next_reload = Instant::now() + HOME_RELOAD_EVERY;
-        self.home.reload(true);
+        self.home.spawn_reload();
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -672,7 +756,7 @@ impl<'a> Ui<'a> {
             tui.interrupt();
         }
         if self.any_worker() {
-            let notice = Notice::info("Stopping… phasewise exits when the work has stopped.");
+            let notice = Notice::info("Stopping… press Ctrl-C again to force");
             self.home.home.message = Some(notice.clone());
             if let Some(tui) = &mut self.run {
                 tui.app.message = Some(notice);
@@ -734,6 +818,13 @@ impl<'a> Ui<'a> {
 
     /// A run was started from the home screen: its phases start running.
     fn begin_run(&mut self, run: Run) {
+        // A worker belongs to its Tui: never drop one that is still alive.
+        if self.run.as_ref().is_some_and(|t| t.worker.is_some()) {
+            self.home.home.message = Some(Notice::error(
+                "A phase is still running, so the new run cannot be shown. Open it with enter when that phase ends.",
+            ));
+            return;
+        }
         let mut tui = Tui::new(self.cwd, run);
         tui.spawn(|run, tx, cancel| ops::execute(run, false, tx, cancel).map(NextOutcome::Ran));
         tui.load_caches();
@@ -868,6 +959,11 @@ impl Tui<'_> {
         loop {
             match worker.events.try_recv() {
                 Ok(EngineEvent::PhaseStarted { phase, .. }) => {
+                    // A new phase is selected; a retry of the running one
+                    // leaves the user's selection alone.
+                    if self.app.running != Some(phase) {
+                        self.app.follow(phase);
+                    }
                     self.app.running = Some(phase);
                     changed = true;
                 }
@@ -996,9 +1092,7 @@ fn outcome_notice(result: &Result<NextOutcome>, state: &RunState) -> Notice {
                 .rev()
                 .find(|p| p.status == PhaseStatus::AwaitingReview)
                 .map_or(0, |p| p.number);
-            Notice::ok(format!(
-                "Phase {number} is ready for review. Press n to approve it and continue."
-            ))
+            Notice::ok(format!("Phase {number} is ready for review."))
         }
     }
 }
@@ -1127,6 +1221,90 @@ mod tests {
             abandon_notice(&stayed, &s).text,
             "Run abandoned. Still on other; branch phasewise/r kept."
         );
+    }
+
+    #[test]
+    fn ctrl_c_or_q_while_stopping_force_the_exit() {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        let key = |c, m| KeyEvent::new(KeyCode::Char(c), m);
+        assert!(is_force_key(key('c', KeyModifiers::CONTROL)));
+        assert!(is_force_key(key('q', KeyModifiers::NONE)));
+        assert!(!is_force_key(key('c', KeyModifiers::NONE)));
+        assert!(!is_force_key(key('x', KeyModifiers::NONE)));
+    }
+
+    fn home_tui() -> HomeTui<'static> {
+        let data = home_view::tests::data(data::PlanState::Missing);
+        HomeTui::new(Path::new("/nonexistent"), Home::new(data))
+    }
+
+    #[test]
+    fn a_panicked_commit_thread_is_reported_and_cleared() {
+        let mut tui = home_tui();
+        tui.commit = Some(thread::spawn(|| panic!("hook exploded")));
+        tui.home.begin_commit();
+        while !tui.commit.as_ref().is_some_and(|h| h.is_finished()) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        tui.check_commit(false);
+        assert!(tui.commit.is_none());
+        assert!(tui.home.committing.is_none());
+        let HomeMode::Error(lines) = &tui.home.mode else {
+            panic!("expected an error popup");
+        };
+        assert!(
+            lines.iter().any(|l| l.contains("commit thread panicked")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_commit_result_sent_before_the_thread_ended_is_not_a_panic() {
+        let mut tui = home_tui();
+        let tx = tui.background_tx.clone();
+        tui.commit = Some(thread::spawn(move || {
+            let _ = tx.send(Background::Committed(Ok("abc1234".into())));
+        }));
+        tui.home.begin_commit();
+        while !tui.commit.as_ref().is_some_and(|h| h.is_finished()) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        tui.check_commit(false);
+        assert!(tui.commit.is_none());
+        assert_eq!(tui.home.mode, HomeMode::Normal);
+    }
+
+    #[test]
+    fn a_periodic_reload_is_applied_only_when_fresh_and_idle() {
+        let changed = |branch: &str| {
+            let mut d = home_view::tests::data(data::PlanState::Missing);
+            d.branch = branch.into();
+            d
+        };
+        let mut tui = home_tui();
+        tui.reloading = true;
+        tui.background_tx
+            .send(Background::Reloaded(0, Box::new(Ok(changed("dev")))))
+            .expect("send");
+        // The home screen is not shown (or a popup is open): dropped.
+        tui.drain_background(false, false);
+        assert_eq!(
+            (tui.reloading, tui.home.data.branch.as_str()),
+            (false, "main")
+        );
+        // Stale: an explicit reload happened meanwhile.
+        tui.reload_gen = 1;
+        tui.background_tx
+            .send(Background::Reloaded(0, Box::new(Ok(changed("dev")))))
+            .expect("send");
+        tui.drain_background(false, true);
+        assert_eq!(tui.home.data.branch, "main");
+        // Fresh and idle: applied.
+        tui.background_tx
+            .send(Background::Reloaded(1, Box::new(Ok(changed("dev")))))
+            .expect("send");
+        tui.drain_background(false, true);
+        assert_eq!(tui.home.data.branch, "dev");
     }
 
     #[test]

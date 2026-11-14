@@ -331,10 +331,19 @@ impl Home {
     pub fn plan_finished(&mut self, report: PlanReport) {
         self.planning = None;
         self.planning_started = None;
+        // The quit question stays open: the report becomes a notice, so the
+        // user's next key still answers the question.
+        let asking = matches!(self.mode, Mode::ConfirmQuit(_));
         match report {
             PlanReport::Success(text) => {
-                self.mode = Mode::Normal;
+                if !asking {
+                    self.mode = Mode::Normal;
+                }
                 self.message = Some(Notice::ok(text));
+            }
+            PlanReport::Failure(lines) if asking => {
+                let first = lines.first().cloned().unwrap_or_default();
+                self.message = Some(Notice::error(first));
             }
             PlanReport::Failure(lines) => self.mode = Mode::Error(lines),
         }
@@ -1481,6 +1490,28 @@ mod tests {
         let mut committed = valid();
         committed.show_start_error(&anyhow::anyhow!("a\nb"));
         assert_eq!(committed.mode, Mode::Error(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn a_finished_planning_does_not_close_the_quit_question() {
+        for report in [
+            PlanReport::Success("ok".into()),
+            PlanReport::Failure(vec!["bad".into(), "more".into()]),
+        ] {
+            let mut h = valid();
+            h.begin_planning();
+            h.handle_key(key('q'));
+            assert_eq!(h.mode, Mode::ConfirmQuit(0));
+            h.plan_finished(report);
+            assert_eq!(h.mode, Mode::ConfirmQuit(0));
+            assert!(h.message.is_some());
+            assert_eq!(h.planning, None);
+        }
+        let mut h = valid();
+        h.begin_planning();
+        h.handle_key(key('x'));
+        h.plan_finished(PlanReport::Success("ok".into()));
+        assert_eq!(h.mode, Mode::Normal);
     }
 
     #[test]

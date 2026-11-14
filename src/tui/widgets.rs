@@ -50,9 +50,35 @@ pub fn accent_bold() -> Style {
     accent().add_modifier(Modifier::BOLD)
 }
 
-/// Number of columns of a text (one per character).
+/// Number of terminal columns of a text (wide characters take two).
 pub fn text_width(text: &str) -> usize {
-    text.chars().count()
+    Span::raw(text).width()
+}
+
+fn char_width(c: char) -> usize {
+    Span::raw(c.to_string()).width()
+}
+
+/// `text` split after at most `width` columns, never inside a wide
+/// character; at least one character is taken so that callers progress.
+fn split_at_width(text: &str, width: usize) -> (&str, &str) {
+    let mut used = 0;
+    for (i, c) in text.char_indices() {
+        let w = char_width(c);
+        if used + w > width && i > 0 {
+            return text.split_at(i);
+        }
+        used += w;
+    }
+    (text, "")
+}
+
+/// `text` padded with spaces on the right to `width` columns.
+pub fn pad_to(text: &str, width: usize) -> String {
+    format!(
+        "{text}{}",
+        " ".repeat(width.saturating_sub(text_width(text)))
+    )
 }
 
 pub fn line_width(line: &Line) -> usize {
@@ -64,7 +90,17 @@ pub fn truncate(text: &str, max: usize) -> String {
     if text_width(text) <= max {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    let room = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = char_width(c);
+        if used + w > room {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
     if max > 0 {
         out.push('…');
     }
@@ -79,22 +115,22 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     for paragraph in text.split('\n') {
         let mut current = String::new();
         for word in paragraph.split(' ').filter(|w| !w.is_empty()) {
-            let mut word: Vec<char> = word.chars().collect();
             let used = text_width(&current);
-            if used > 0 && used + 1 + word.len() <= width {
+            if used > 0 && used + 1 + text_width(word) <= width {
                 current.push(' ');
-                current.extend(word);
+                current.push_str(word);
                 continue;
             }
             if used > 0 {
                 out.push(std::mem::take(&mut current));
             }
-            while word.len() > width {
-                let rest = word.split_off(width);
-                out.push(word.into_iter().collect());
-                word = rest;
+            let mut rest = word;
+            while text_width(rest) > width {
+                let (head, tail) = split_at_width(rest, width);
+                out.push(head.to_string());
+                rest = tail;
             }
-            current = word.into_iter().collect();
+            current = rest.to_string();
         }
         out.push(current);
     }
@@ -385,11 +421,11 @@ pub fn picker_lines(rows: &[PickerRow], selected: usize) -> Vec<Line<'static>> {
                 let mut spans = vec![
                     pointer,
                     Span::raw(digit),
-                    Span::styled(format!("{label:<label_width$}"), label_style),
+                    Span::styled(pad_to(label, label_width), label_style),
                 ];
                 if description_width > 0 {
                     spans.push(Span::styled(
-                        format!("  {description:<description_width$}"),
+                        format!("  {}", pad_to(description, description_width)),
                         dim(),
                     ));
                 }
@@ -407,13 +443,21 @@ pub fn picker_lines(rows: &[PickerRow], selected: usize) -> Vec<Line<'static>> {
 /// `> text█`, hard-wrapped at `width` columns.
 pub fn input_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     let room = width.saturating_sub(2).max(1);
-    let chars: Vec<char> = text.chars().collect();
-    let mut chunks: Vec<String> = chars
-        .chunks(room)
-        .map(|c| c.iter().collect::<String>())
-        .collect();
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = char_width(c);
+        if used + w > room && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(c);
+        used += w;
+    }
+    chunks.push(current);
     // The cursor needs a column of its own.
-    if chunks.last().is_none_or(|c| text_width(c) >= room) {
+    if chunks.last().is_some_and(|c| text_width(c) >= room) {
         chunks.push(String::new());
     }
     let last = chunks.len() - 1;
@@ -647,6 +691,23 @@ mod tests {
         let lines: Vec<String> = input_lines("abcdefgh", 6).iter().map(text).collect();
         assert_eq!(lines, ["> abcd", "  efgh", "  █"]);
         assert_eq!(text(&input_lines("", 10)[0]), "> █");
+    }
+
+    #[test]
+    fn widths_are_terminal_columns() {
+        assert_eq!(text_width("フェーズ"), 8);
+        assert_eq!(text_width("a😀b"), 4);
+        assert_eq!(truncate("フェーズ一二", 7), "フェー…");
+        assert_eq!(truncate("フェーズ", 8), "フェーズ");
+        assert_eq!(truncate("a😀b😀", 5), "a😀b…");
+        assert_eq!(pad_to("フェ", 6), "フェ  ");
+        assert_eq!(wrap_text("フェーズ フェーズ", 8), ["フェーズ", "フェーズ"]);
+        assert_eq!(
+            wrap_text("フェーズフェーズ", 6),
+            ["フェー", "ズフェ", "ーズ"]
+        );
+        let lines: Vec<String> = input_lines("フェーズ", 6).iter().map(text).collect();
+        assert_eq!(lines, ["> フェ", "  ーズ", "  █"]);
     }
 
     #[test]

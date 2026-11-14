@@ -80,6 +80,9 @@ pub struct App {
     pub mode: Mode,
     /// Phase run by a worker thread, if any.
     pub running: Option<usize>,
+    /// The run's worker thread is alive (set by the loop every turn; `running`
+    /// only follows the engine's events).
+    pub worker_busy: bool,
     /// The home screen is planning (set by the loop, for the quit question).
     pub planning_busy: bool,
     /// Spinner frame, set by the loop from the elapsed time.
@@ -111,6 +114,7 @@ impl App {
             page: DEFAULT_PAGE,
             mode: Mode::Normal,
             running: None,
+            worker_busy: false,
             planning_busy: false,
             frame: 0,
             message: None,
@@ -129,6 +133,17 @@ impl App {
     pub fn set_view(&mut self, view: RunView) {
         self.view = view;
         self.selected = self.selected.min(self.view.phases.len().saturating_sub(1));
+    }
+
+    /// Selects phase `number` when it starts running, so its progress shows
+    /// without a key.
+    pub fn follow(&mut self, number: usize) {
+        if let Some(index) = self.view.phases.iter().position(|p| p.number == number)
+            && index != self.selected
+        {
+            self.selected = index;
+            self.scroll = 0;
+        }
     }
 
     pub fn set_caches(&mut self, diff: DiffView, log: Vec<LogLine>, verify: String) {
@@ -279,7 +294,7 @@ impl App {
     }
 
     fn abandon(&mut self) -> Option<Command> {
-        if self.running.is_some() {
+        if self.running.is_some() || self.worker_busy {
             return self.refuse("Interrupt the running phase first (x).".to_string());
         }
         if !self.view.active {
@@ -290,7 +305,7 @@ impl App {
     }
 
     fn quit(&mut self) -> Option<Command> {
-        if self.running.is_some() || self.planning_busy {
+        if self.running.is_some() || self.worker_busy || self.planning_busy {
             self.mode = Mode::ConfirmQuit(0);
             None
         } else {
@@ -724,6 +739,20 @@ mod tests {
     }
 
     #[test]
+    fn a_starting_phase_is_selected() {
+        let mut a = app(vec![
+            phase(1, PhaseStatus::Done, true),
+            phase(2, PhaseStatus::Pending, false),
+        ]);
+        a.selected = 0;
+        a.scroll = 7;
+        a.follow(2);
+        assert_eq!((a.selected, a.scroll), (1, 0));
+        a.follow(9);
+        assert_eq!(a.selected, 1);
+    }
+
+    #[test]
     fn footer_follows_the_state() {
         let a = reviewing();
         assert_eq!(keys(&a), ["n", "r", "b", "tab", "esc", "q"]);
@@ -827,6 +856,18 @@ mod tests {
         a.handle_key(key('b'));
         assert_eq!(a.handle_key(code(KeyCode::Esc)), None);
         assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn a_live_worker_counts_before_its_first_event_and_after_the_last() {
+        let mut a = reviewing();
+        a.worker_busy = true;
+        assert_eq!(a.running, None);
+        assert_eq!(a.handle_key(key('A')), None);
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(text(&a), Some("Interrupt the running phase first (x)."));
+        assert_eq!(a.handle_key(key('q')), None);
+        assert_eq!(a.mode, Mode::ConfirmQuit(0));
     }
 
     #[test]

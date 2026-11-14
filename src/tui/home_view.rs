@@ -13,8 +13,8 @@ use super::shared::spinner;
 use super::widgets::{
     MIN_HEIGHT, MIN_WIDTH, PickerRow, accent, bold, confirm_popup, dim, draw_too_small,
     duration_text, elapsed_since, error_popup, event_text, footer_line, input_popup, margin,
-    notice_line, picker_lines, render_card, render_popup, role_style, shortcuts_popup, text_width,
-    truncate, wrap_text,
+    notice_line, pad_to, picker_lines, render_card, render_popup, role_style, shortcuts_popup,
+    text_width, truncate, wrap_text,
 };
 use crate::display::{model_name, phase_count, status_label};
 use crate::plan::AgentKind;
@@ -49,12 +49,15 @@ pub(super) fn draw_with_version(frame: &mut Frame, home: &Home, version: &str) {
     // the content after another.
     let fixed = usize::from(card_height) + 1 + 1 + usize::from(home.message.is_some()) + 1;
     let room = usize::from(frame.area().height).saturating_sub(fixed);
-    let mut doc = document(home, width, usize::MAX);
-    if doc.len() > room {
-        // Show fewer phases: `… N more` takes a row of its own.
-        let hidden = doc.len() - room + 1;
-        doc = document(home, width, hidden_limit(home, hidden));
+    // Cut the list (phases or errors) until the content fits; whatever is
+    // still too tall is cut at the end. The footer never overlaps anything.
+    let mut limit = list_len(home);
+    let mut doc = document(home, width, limit);
+    while doc.len() > room && limit > 1 {
+        limit -= 1;
+        doc = document(home, width, limit);
     }
+    doc.truncate(room);
     let top = area.y + card_height + 1;
     let doc_height = u16::try_from(doc.len()).unwrap_or(u16::MAX);
     let bottom = frame.area().bottom();
@@ -83,13 +86,13 @@ pub(super) fn draw_with_version(frame: &mut Frame, home: &Home, version: &str) {
     draw_popup(frame, home, frame.area());
 }
 
-/// How many phases to show when `hidden` of them must go.
-fn hidden_limit(home: &Home, hidden: usize) -> usize {
-    let count = match &home.data.plan {
+/// Rows of the list that can be cut: the phases, or the errors shown.
+fn list_len(home: &Home) -> usize {
+    match &home.data.plan {
         PlanState::Valid(plan) => plan.phases.len(),
-        _ => 0,
-    };
-    count.saturating_sub(hidden).max(1)
+        PlanState::Invalid(problems) => problems.len().min(MAX_PROBLEMS),
+        PlanState::Missing => 0,
+    }
 }
 
 /// `✻ phasewise 0.3.0` and `repo · branch` in a rounded card.
@@ -181,7 +184,11 @@ fn run_card(home: &Home, run: &RunSummary, width: usize) -> Vec<Line<'static>> {
         let title = truncate(&phase.title, title_width);
         let mut spans = vec![
             Span::styled(mark, style),
-            Span::raw(format!(" {:>2}  {title:<title_width$}", phase.number)),
+            Span::raw(format!(
+                " {:>2}  {}",
+                phase.number,
+                pad_to(&title, title_width)
+            )),
         ];
         if !state.is_empty() {
             spans.push(Span::styled(format!("   {state}"), dim()));
@@ -223,13 +230,14 @@ fn plan_section(home: &Home, width: usize, phase_limit: usize) -> Vec<Line<'stat
                 format!("✗ {file} has errors"),
                 role_style(Role::Fail),
             )];
+            let shown = problems.len().min(MAX_PROBLEMS).min(phase_limit);
             let digits = problems
                 .iter()
-                .take(MAX_PROBLEMS)
+                .take(shown)
                 .map(|p| p.line.to_string().len())
                 .max()
                 .unwrap_or(1);
-            for problem in problems.iter().take(MAX_PROBLEMS) {
+            for problem in problems.iter().take(shown) {
                 let mut spans = vec![Span::raw("  ")];
                 if problem.line > 0 {
                     spans.push(Span::styled(
@@ -244,9 +252,9 @@ fn plan_section(home: &Home, width: usize, phase_limit: usize) -> Vec<Line<'stat
                 )));
                 lines.push(Line::from(spans));
             }
-            if problems.len() > MAX_PROBLEMS {
+            if problems.len() > shown {
                 lines.push(Line::styled(
-                    format!("  … {} more", problems.len() - MAX_PROBLEMS),
+                    format!("  … {} more", problems.len() - shown),
                     dim(),
                 ));
             }
@@ -293,7 +301,11 @@ fn phase_rows(
         .map(|(phase, meta)| {
             let title = truncate(&phase.title, title_width);
             Line::from(vec![
-                Span::raw(format!("  {:>2}  {title:<title_width$}   ", phase.number)),
+                Span::raw(format!(
+                    "  {:>2}  {}   ",
+                    phase.number,
+                    pad_to(&title, title_width)
+                )),
                 Span::styled(meta.clone(), dim()),
             ])
         })
@@ -983,6 +995,26 @@ pub(super) mod tests {
         home.message = Some(Notice::warn("careful"));
         let text = format!("{}", render(&home).backend());
         assert!(text.contains("! careful"), "{text}");
+    }
+
+    #[test]
+    fn many_errors_on_a_short_terminal_keep_the_footer_apart() {
+        let problems = (1..=15)
+            .map(|line| PlanProblem {
+                line,
+                message: format!("problem {line}"),
+            })
+            .collect();
+        let mut home = home(PlanState::Invalid(problems));
+        home.data.plan_uncommitted = true;
+        home.message = Some(Notice::error("Could not read the plan."));
+        let terminal = render_sized(&home, 80, 20);
+        let text = format!("{}", terminal.backend());
+        let rows: Vec<&str> = text.lines().collect();
+        assert!(rows[18].contains("Could not read the plan."), "{text}");
+        assert!(rows[19].contains("? shortcuts"), "{text}");
+        assert!(text.contains(" more"), "{text}");
+        insta::assert_snapshot!(terminal.backend());
     }
 
     #[test]
