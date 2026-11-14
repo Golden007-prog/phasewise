@@ -262,6 +262,35 @@ fn dirty_paths(git: &Git) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Commits the plan file alone (the user's hooks and signing apply) and
+/// returns the short SHA of the new commit.
+pub fn commit_plan(cwd: &Path, plan_path: &Path) -> Result<String> {
+    let git = Git::discover(cwd)?;
+    let absolute = if plan_path.is_absolute() {
+        plan_path.to_path_buf()
+    } else {
+        cwd.join(plan_path)
+    };
+    // Resolve symlinks (for example /tmp on macOS) so the paths compare.
+    let absolute = absolute.canonicalize().unwrap_or(absolute);
+    let root = git
+        .root()
+        .canonicalize()
+        .unwrap_or_else(|_| git.root().to_path_buf());
+    let relative = absolute.strip_prefix(&root).map_err(|_| {
+        anyhow!(
+            "{} is outside the repository at {}. Move the plan inside the repository.",
+            plan_path.display(),
+            root.display()
+        )
+    })?;
+    let relative = relative.to_string_lossy().into_owned();
+    if !git.dirty_paths()?.contains(&relative) {
+        bail!("{} has no changes to commit.", plan_path.display());
+    }
+    git.commit_file(&relative, "Add phasewise plan")
+}
+
 /// The latest run, whatever its status, with crash recovery applied.
 pub fn load_current(cwd: &Path) -> Result<Option<Run>> {
     let git = Git::discover(cwd)?;

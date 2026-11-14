@@ -393,21 +393,63 @@ fn heading_text(source: &str) -> String {
     }
 }
 
-/// Removes a leading `Phase <digits>:` unless nothing would remain.
-fn strip_phase_prefix(title: &str) -> String {
-    let rest = match title.get(..5) {
-        Some(p) if p.eq_ignore_ascii_case("phase") => &title[5..],
-        _ => return title.to_string(),
+/// Removes a leading phase-number prefix from `title` unless nothing would
+/// remain. `position` is the 1-based position of the phase.
+///
+/// `Phase <digits>:` is removed whatever the number. A single word of letters
+/// plus the number of `position` followed by `:`, `.`, `)`, `-`, `–` or `—`
+/// (`Fase 1: X`, `Paso 4. X`) and a bare `position` followed by `.`, `)` or `:`
+/// and a space (`1. X`) are removed too.
+fn strip_phase_prefix(title: &str, position: usize) -> String {
+    let keep = || title.to_string();
+    let non_empty = |rest: &str| {
+        let rest = rest.trim();
+        (!rest.is_empty()).then(|| rest.to_string())
     };
-    let rest = rest.trim_start();
-    let digits = rest.chars().take_while(char::is_ascii_digit).count();
-    if digits == 0 {
-        return title.to_string();
+
+    // English `Phase <digits>:`, any number.
+    if let Some(head) = title.get(..5)
+        && head.eq_ignore_ascii_case("phase")
+    {
+        let rest = title[5..].trim_start();
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0
+            && let Some(after) = rest[digits..].trim_start().strip_prefix(':')
+        {
+            return non_empty(after).unwrap_or_else(keep);
+        }
     }
-    match rest[digits..].trim_start().strip_prefix(':') {
-        Some(after) if !after.trim().is_empty() => after.trim().to_string(),
-        _ => title.to_string(),
+
+    let number = position.to_string();
+    // A word of letters, then the position number and a separator.
+    let word = title.chars().take_while(|c| c.is_alphabetic()).count();
+    if word > 0 {
+        let byte = title
+            .char_indices()
+            .nth(word)
+            .map_or(title.len(), |(i, _)| i);
+        let rest = title[byte..].trim_start();
+        if let Some(after) = rest.strip_prefix(number.as_str())
+            && !after.starts_with(|c: char| c.is_ascii_digit())
+            && let Some(after) = after
+                .trim_start()
+                .strip_prefix([':', '.', ')', '-', '–', '—'])
+            && let Some(text) = non_empty(after)
+        {
+            return text;
+        }
+        return keep();
     }
+
+    // A bare position number, a separator and a space.
+    if let Some(after) = title.strip_prefix(number.as_str())
+        && let Some(after) = after.strip_prefix(['.', ')', ':'])
+        && after.starts_with(char::is_whitespace)
+        && let Some(text) = non_empty(after)
+    {
+        return text;
+    }
+    keep()
 }
 
 struct PhaseHeading {
@@ -443,7 +485,7 @@ fn parse_body(text: &str, body_start: usize) -> Result<Parsed, Vec<PlanError>> {
                         h1_title = Some(title);
                     }
                     HeadingLevel::H2 => headings.push(PhaseHeading {
-                        title: strip_phase_prefix(&title),
+                        title: strip_phase_prefix(&title, headings.len() + 1),
                         range,
                     }),
                     _ => {}
@@ -799,6 +841,46 @@ mod tests {
         let titles: Vec<_> = plan.phases.iter().map(|p| p.title.as_str()).collect();
         assert_eq!(titles, vec!["Add toolchain", "Shout", "x", "Phased out"]);
         assert_eq!(plan.phases[1].number, 2);
+    }
+
+    #[test]
+    fn localized_prefix_stripped_at_position() {
+        let plan = ok(
+            "## Fase 1: Primer archivo vacío\n\na\n\n## Étape 2 : X\n\nb\n\n## Step 3 — Y\n\nc\n\n## Paso 4. Z\n\nd\n\n## Stage 5) W\n\ne\n\n## 6. Six\n\nf\n\n## 7) Seven\n\ng\n",
+        );
+        let titles: Vec<_> = plan.phases.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Primer archivo vacío", "X", "Y", "Z", "W", "Six", "Seven"]
+        );
+    }
+
+    #[test]
+    fn prefix_kept_when_it_is_not_a_phase_number() {
+        let plan = ok(
+            "## Python 3: migrate\n\na\n\n## Fase 9: X\n\nb\n\n## 2024 roadmap\n\nc\n\n## Fase 4:\n\nd\n\n## 5.x notes\n\ne\n",
+        );
+        let titles: Vec<_> = plan.phases.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Python 3: migrate",
+                "Fase 9: X",
+                "2024 roadmap",
+                "Fase 4:",
+                "5.x notes"
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_check_uses_stripped_titles() {
+        let errors = errs("## Fase 1: Same\n\na\n\n## Phase 2: same\n\nb\n");
+        assert!(
+            errors
+                .iter()
+                .any(|(_, m)| m.contains("duplicate phase title"))
+        );
     }
 
     #[test]

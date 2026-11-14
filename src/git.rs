@@ -5,6 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -22,6 +23,7 @@ impl Git {
             .arg("-C")
             .arg(dir)
             .args(["rev-parse", "--show-toplevel"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .output()
             .context("Cannot run `git`. Install git and make sure it is on your PATH.")?;
         if !output.status.success() {
@@ -238,6 +240,22 @@ Set it with `git config user.name \"Your Name\"` and `git config user.email you@
         self.head_sha()
     }
 
+    /// Commits only `path` (relative to the repository root) with `message`
+    /// and returns the short SHA of the new `HEAD`. This is the user's own
+    /// commit: their hooks and signing apply.
+    pub fn commit_file(&self, path: &str, message: &str) -> Result<String> {
+        self.run(&["add", "--", path])?;
+        let args = ["commit", "-q", "-F", "-", "--", path];
+        let output = self.output(&args, Some(message))?;
+        if !output.status.success() {
+            return Err(failure(&args, &output));
+        }
+        Ok(self
+            .run(&["rev-parse", "--short", "HEAD"])?
+            .trim()
+            .to_string())
+    }
+
     pub fn reset_hard(&self, sha: &str) -> Result<()> {
         self.run(&["reset", "--hard", sha]).map(|_| ())
     }
@@ -310,13 +328,30 @@ Set it with `git config user.name \"Your Name\"` and `git config user.email you@
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// Runs git with captured output and optional stdin; does not check the status.
+    /// Runs git with captured output and optional stdin; does not check the
+    /// status. A command that fails because `index.lock` exists is run again a
+    /// few times (git fails before changing anything in that case).
     fn output(&self, args: &[&str], stdin: Option<&str>) -> Result<Output> {
+        let mut waits = LOCK_RETRY_WAITS_MS.iter();
+        loop {
+            let output = self.output_once(args, stdin)?;
+            if output.status.success() || !is_lock_contention(&output) {
+                return Ok(output);
+            }
+            match waits.next() {
+                Some(ms) => std::thread::sleep(Duration::from_millis(*ms)),
+                None => return Ok(output),
+            }
+        }
+    }
+
+    fn output_once(&self, args: &[&str], stdin: Option<&str>) -> Result<Output> {
         let mut command = Command::new("git");
         command
             .arg("-C")
             .arg(&self.root)
             .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -340,7 +375,40 @@ Set it with `git config user.name \"Your Name\"` and `git config user.email you@
     }
 }
 
+/// Waits between attempts when `index.lock` is held (about 3.5 s in total).
+const LOCK_RETRY_WAITS_MS: [u64; 7] = [50, 100, 200, 400, 800, 1000, 1000];
+
+/// True when git could not take `index.lock`. Only the file name is matched:
+/// the rest of git's message is translated in other locales.
+fn is_lock_contention(output: &Output) -> bool {
+    String::from_utf8_lossy(&output.stderr).contains("index.lock")
+}
+
+/// The lock file named in git's message (`Unable to create '<path>': File
+/// exists.` in English), whatever the language of the message.
+fn lock_path(stderr: &str) -> String {
+    const NAME: &str = "index.lock";
+    stderr
+        .find(NAME)
+        .and_then(|end| {
+            let end = end + NAME.len();
+            let start = stderr[..end].rfind(['\'', '"', '‘', '«', '`'])? + 1;
+            let start = start + stderr[start..].find(|c: char| !c.is_whitespace())?;
+            Some(stderr[start..end].to_string())
+        })
+        .unwrap_or_else(|| ".git/index.lock".to_string())
+}
+
 fn failure(args: &[&str], output: &Output) -> anyhow::Error {
+    if is_lock_contention(output) {
+        let path = lock_path(&String::from_utf8_lossy(&output.stderr));
+        return anyhow!(
+            "`git {}` failed: another git process is using the repository ({path} exists). \
+Wait for it to finish or close the tool that runs it (an editor's git integration, for example). \
+If no git command is running, the lock is left over from a crash: delete {path} and try again.",
+            args.join(" ")
+        );
+    }
     anyhow!(
         "`git {}` failed: {}. Fix the problem in the repository and try again.",
         args.join(" "),
@@ -361,4 +429,111 @@ pub fn checkpoint_message(run_id: &str, phase: usize, title: &str) -> String {
     format!(
         "phasewise: phase {phase} — {title}\n\nPhasewise-Run: {run_id}\nPhasewise-Phase: {phase}\n"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ENV: [(&str, &str); 6] = [
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_AUTHOR_NAME", "T"),
+        ("GIT_AUTHOR_EMAIL", "t@example.com"),
+        ("GIT_COMMITTER_NAME", "T"),
+        ("GIT_COMMITTER_EMAIL", "t@example.com"),
+    ];
+
+    fn repo() -> (tempfile::TempDir, Git) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir.path())
+            .envs(ENV)
+            .output()
+            .expect("git init");
+        assert!(init.status.success());
+        for (k, v) in [("user.name", "T"), ("user.email", "t@example.com")] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["config", k, v])
+                .envs(ENV)
+                .output()
+                .expect("git config");
+            assert!(out.status.success());
+        }
+        let git = Git::discover(dir.path()).expect("discover").with_env(ENV);
+        (dir, git)
+    }
+
+    fn lock(git: &Git) -> PathBuf {
+        git.root().join(".git").join("index.lock")
+    }
+
+    #[test]
+    fn add_all_retries_while_the_lock_is_held() {
+        let (dir, git) = repo();
+        fs::write(dir.path().join("a.txt"), "a").expect("write");
+        let lock = lock(&git);
+        fs::write(&lock, "").expect("lock");
+        let to_remove = lock.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = fs::remove_file(to_remove);
+        });
+        git.add_all().expect("add_all should wait for the lock");
+        handle.join().expect("join");
+    }
+
+    #[test]
+    fn stale_lock_error_names_the_lock_and_how_to_fix_it() {
+        let (dir, git) = repo();
+        fs::write(dir.path().join("a.txt"), "a").expect("write");
+        let lock = lock(&git);
+        fs::write(&lock, "").expect("lock");
+        let err = git.add_all().expect_err("must fail").to_string();
+        assert!(err.contains("index.lock"), "{err}");
+        assert!(err.contains("delete"), "{err}");
+        assert!(err.contains("another git process"), "{err}");
+    }
+
+    #[test]
+    fn lock_path_is_found_in_any_language() {
+        let english = "fatal: Unable to create '/r/.git/index.lock': File exists.\n";
+        assert_eq!(lock_path(english), "/r/.git/index.lock");
+        let spanish = "fatal: No se pudo crear '/r/.git/index.lock': El archivo existe.";
+        assert_eq!(lock_path(spanish), "/r/.git/index.lock");
+        assert_eq!(lock_path("fatal: something else"), ".git/index.lock");
+    }
+
+    #[test]
+    fn commit_file_commits_only_that_file() {
+        let (dir, git) = repo();
+        fs::write(dir.path().join("plan.md"), "plan").expect("write");
+        fs::write(dir.path().join("other.txt"), "other").expect("write");
+        git.run(&["add", "--", "other.txt"]).expect("stage other");
+        git.commit_file("plan.md", "Add phasewise plan")
+            .expect("commit_file");
+        let tracked = git
+            .run(&["ls-tree", "-r", "--name-only", "HEAD"])
+            .expect("ls-tree");
+        assert_eq!(tracked.trim(), "plan.md");
+        let status = git.run(&["status", "--porcelain"]).expect("status");
+        assert_eq!(status.trim(), "A  other.txt");
+    }
+
+    #[test]
+    fn commit_file_returns_the_short_sha() {
+        let (dir, git) = repo();
+        fs::write(dir.path().join("plan.md"), "plan").expect("write");
+        let sha = git
+            .commit_file("plan.md", "Add phasewise plan")
+            .expect("commit");
+        let expected = git
+            .run(&["rev-parse", "--short", "HEAD"])
+            .expect("rev-parse");
+        assert_eq!(sha, expected.trim());
+        assert!(!sha.is_empty());
+    }
 }

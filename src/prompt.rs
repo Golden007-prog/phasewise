@@ -199,7 +199,7 @@ Body:
   the first phase is the shared context, sent to the agent in every phase: what the project is, the
   conventions and anything true for the whole plan.
 - Every level-2 heading (`## Phase 1: Title`) opens a phase. A leading `Phase <number>:` is removed
-  from the title. Titles must be unique (ignoring case). Level-3 and deeper headings stay inside the
+  from the title, and so is a word plus the phase's own number (`Fase 2: X`, `Step 2 - X`, `2. X`). Titles must be unique (ignoring case). Level-3 and deeper headings stay inside the
   phase body. A `##` inside a fenced code block is not a heading.
 - Each phase body is the instructions for the agent and must not be empty.
 - A fenced block whose info string is exactly `verify` lists the checks of that phase, one command per

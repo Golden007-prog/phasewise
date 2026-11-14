@@ -526,3 +526,27 @@ findings:
   first while something runs).
 - **Waiting for a stopped worker on an error path beats the heartbeat**, so the
   watchdog cannot cut that wait short.
+
+## v0.3 — git locks and phase titles
+
+- **`GIT_OPTIONAL_LOCKS=0` and a retry on `index.lock`.** A run failed with
+  `checkpoint_failed` because the review TUI refreshes the diff every 250 ms
+  and `git status`/`git diff` take `index.lock` to refresh the index, racing
+  with the checkpoint (`add -A`, `reset`, `commit`). Editors' git integrations
+  do the same. Every git command phasewise runs now sets
+  `GIT_OPTIONAL_LOCKS=0`, and a command that fails because `index.lock`
+  exists is run again after 50, 100, 200, 400, 800, 1000 and 1000 ms (about
+  3.5 s). This is safe: git fails before changing anything when it cannot
+  create the lock. If it still fails, the error names the lock file and says
+  how to proceed. Only the name `index.lock` is matched in git's message:
+  the rest of it is translated in other locales.
+- **The plan commit keeps hooks and signing.** `Git::commit_file` (used by
+  `ops::commit_plan`) does not pass `--no-verify` or `--no-gpg-sign`: unlike
+  checkpoints, it is the user's own commit on their branch. A pathspec commit
+  takes only that file, even if other files are staged.
+- **Localized phase-number prefixes.** `Phase <n>:` is removed whatever the
+  number. A single word of letters plus a number followed by `:`, `.`, `)`,
+  `-`, `–` or `—`, and a bare `<n>.`, `<n>)` or `<n>:`, are removed only when
+  the number is the phase's position, so `Python 3: migrate` (phase 1) and
+  `Fase 9: X` (phase 2) are kept. Nothing is removed if no text would remain.
+  The duplicate-title check uses the stripped titles.

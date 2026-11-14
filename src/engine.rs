@@ -698,8 +698,8 @@ so no checkpoint was created. Run `git switch {run_branch}`, then `phasewise ret
         Err(err) => {
             let detail = format!(
                 "phasewise could not create the checkpoint commit: {err:#}. \
-The phase's changes are still in the working tree. Fix the cause (for example set git \
-user.name and user.email), then run `phasewise retry` to run the phase again"
+The phase's changes are still in the working tree. Fix the cause, then run \
+`phasewise retry` to run the phase again"
             );
             return ctx.fail(phase, FailureKind::CheckpointFailed, detail);
         }

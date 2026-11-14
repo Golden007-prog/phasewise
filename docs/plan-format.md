@@ -38,8 +38,11 @@ Every key is optional.
   `---`) opens a phase. Phases are numbered 1, 2, 3... by order of appearance.
 - The title is the heading text without the `#` markers. A leading
   `Phase <number>:` (any case, any spacing) is removed, so
-  `## Phase 2: Convert utils` becomes `Convert utils`. If nothing would be left
-  (`## Phase 1:`), the title is kept as written.
+  `## Phase 2: Convert utils` becomes `Convert utils`. A single word plus the
+  phase's own number, followed by `:`, `.`, `)`, `-`, `–` or `—`, is removed
+  too, in any language (`## Fase 2: X`, `## Step 2 — X`), and so is the bare
+  number (`## 2. X`, `## 2) X`). If nothing would be left (`## Phase 1:`), the
+  title is kept as written.
 - A `##` inside a fenced code block is not a heading.
 - Titles must be unique, ignoring case.
 - Level-3 and deeper headings (`###`) stay inside the phase body.
