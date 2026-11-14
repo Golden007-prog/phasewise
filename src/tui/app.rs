@@ -140,6 +140,11 @@ impl App {
             return None;
         }
         self.message = None;
+        // Ctrl-C works from every popup and input: it closes it and then acts
+        // as in the main view (quit, or ask first while a phase runs).
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.mode = Mode::Normal;
+        }
         match self.mode.clone() {
             Mode::Normal => self.key_normal(key),
             Mode::ConfirmRollback(n) => {
@@ -602,6 +607,22 @@ mod tests {
         a.handle_key(key('x'));
         assert_eq!(a.handle_key(key('q')), None);
         assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_popups_and_inputs() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut a = reviewing();
+        a.mode = Mode::Note("half a note".into());
+        assert_eq!(a.handle_key(ctrl_c), Some(Command::Quit));
+        assert_eq!(a.mode, Mode::Normal);
+        a.mode = Mode::ConfirmRollback(1);
+        assert_eq!(a.handle_key(ctrl_c), Some(Command::Quit));
+        // While a phase runs it still asks first.
+        a.running = Some(1);
+        a.mode = Mode::Help;
+        assert_eq!(a.handle_key(ctrl_c), None);
+        assert_eq!(a.mode, Mode::ConfirmQuit);
     }
 
     #[test]

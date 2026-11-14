@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Home screen: `phasewise` with no arguments in a git repository without an active run opens a TUI that shows the plan and the agent, model and effort settings, writes a plan with the agent (`p`), and starts a run (`Enter`) that continues in the review screen.
 - `phasewise plan [GOAL]`: a read-only agent session explores the project and writes the plan; it is validated, repaired up to twice in the same session, and written only if valid (`--agent`, `--model`, `--effort`, `--output`, `--force`).
 - Model and effort selection: `model`/`effort` in the plan front matter and in per-phase `phasewise` blocks, `--model`/`--effort` on `run`, `next` and `retry` (stored in the run), a `MODEL` column in `status`, and `phasewise models` to list what each agent offers.
 - Clearer output: phase blocks with icons and a summary line (files and cost), colour on terminals only (`NO_COLOR` and `TERM=dumb` respected), a coloured TUI with a resizable phase panel, attempt headings in the Log tab and a `?` help popup.
@@ -18,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--auto` for `run` and `next`, `retry --note`, `rollback --yes`, and the instructions to integrate with `git merge --squash` when a run completes.
 - Run state in `.phasewise/` (atomic writes, lock file, recovery of phases left running by a dead process), excluded from git.
 - Adapters for Claude Code and Codex, both checked with a real smoke test, with per-phase cost shown when Claude reports it.
-- Review TUI with phase list, Diff / Log / Verify tabs, live engine output, approve, retry with a note, rollback and interrupt; the terminal is restored on exit and on panic.
+- Review TUI with phase list, Diff / Log / Verify tabs, live engine output, approve, retry with a note, rollback and interrupt; the terminal is restored on exit, and a closed terminal ends the TUI within about 30 s (the agent is stopped and the phase recovered as interrupted) and on panic.
 - Ctrl-C, SIGTERM and SIGHUP handling that stops the agent's process group and records the phase as interrupted; a second signal kills every process phasewise started and exits with 130.
 - Guarantees: never pushes, never deletes branches, never uses `--force`, no network access of its own, no `unsafe`.
 - Documentation (README, plan format, security model, roadmap), example plans, smoke-test script for real agents and a VHS demo script.

@@ -175,6 +175,53 @@ Codex 0.160.0 (`codex exec --help`, `codex debug models --help`):
 - `--sandbox read-only` exists for read-only runs; `-o, --output-last-message
   <FILE>` exists but phasewise reads the JSON stream instead.
 
+## Planning sessions (`phasewise plan`, checked 2026-11-14)
+
+Claude Code 2.1.325:
+
+```sh
+claude -p --output-format stream-json --verbose \
+  --permission-mode dontAsk --permission-prompts none \
+  --tools Read,Grep,Glob --strict-mcp-config \
+  --allowedTools Read,Grep,Glob \
+  --disallowedTools Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch \
+  [--model M] [--effort E] [--resume <session_id>]
+```
+
+- `--tools <tools...>` sets the built-in tools that exist in the session.
+  Without it, the `system`/`init` event of a real session listed `Task`,
+  `CronCreate`, `EnterWorktree`, `RemoteTrigger`, `Skill`, `SendMessage` and
+  more besides `Read`, `Grep` and `Glob`. With it, `init` listed only `Glob`,
+  `Grep`, `Read`.
+- `--strict-mcp-config` without `--mcp-config` loads no MCP server (`init`
+  showed `mcp_servers: []`).
+
+Codex 0.160.0:
+
+```sh
+codex exec --json --sandbox read-only [-m M] [-c model_reasoning_effort="E"] [resume <thread_id>] -
+```
+
+Codex explores through shell commands (`rg --files`, `cat`), which the
+read-only sandbox allows.
+
+**Real test, 2026-11-14** (clean environment, a two-file shell project, goal
+"make greet.sh accept an optional name and add test.sh"):
+
+- `phasewise plan --agent claude --model haiku --effort low`: valid plan at
+  the first answer (2–3 phases with real `sh` checks), `claude-haiku-5-5` in
+  `init`, no permission denials, $0.0070 and, after the tool restriction,
+  $0.0032.
+- `phasewise plan --agent codex --model gpt-6-luna --effort low`: valid plan
+  at the first answer (1 phase); stderr only held the MCP login error of the
+  maintainer's Codex configuration.
+- `phasewise run --model haiku --effort low` (Claude) and `phasewise run
+  --model gpt-6-luna --effort low` (Codex) each ran phase 1 to
+  `awaiting_review` with all checks passing; Claude's `init` showed
+  `claude-haiku-5-5` ($0.0047), `status` showed the model column.
+- Nothing outside the scratch repositories changed; the plans were left
+  uncommitted until committed by hand for the runs.
+
 ## Real smoke test (plan section 8)
 
 **Claude Code: passed on 2026-11-14** with Claude Code 2.1.325, after the

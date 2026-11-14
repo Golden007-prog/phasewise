@@ -44,7 +44,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_popup(frame, app, area);
 }
 
-fn draw_too_small(frame: &mut Frame, area: Rect) {
+pub(super) fn draw_too_small(frame: &mut Frame, area: Rect) {
     let text = format!(
         "phasewise needs a terminal of at least {MIN_WIDTH}×{MIN_HEIGHT} (now {}×{}). Enlarge the window.",
         area.width, area.height
@@ -83,7 +83,7 @@ pub fn truncate(text: &str, max: usize) -> String {
 }
 
 /// ratatui style for a role; the same roles the CLI paints with ANSI codes.
-fn role_style(role: Role) -> Style {
+pub(super) fn role_style(role: Role) -> Style {
     match role {
         Role::Default => Style::new(),
         Role::Heading => Style::new().add_modifier(Modifier::BOLD),
@@ -194,9 +194,18 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).scroll((app.scroll, 0)), content);
 }
 
-fn event_spans(line: &EventLine) -> Vec<Span<'static>> {
+/// Spans of an event line: the time column when the line has one (the Log tab
+/// has none), the icon, the label and the detail.
+pub(super) fn event_spans(line: &EventLine) -> Vec<Span<'static>> {
     let style = role_style(line.role);
-    let mut spans = vec![Span::styled(line.icon, style)];
+    let mut spans = Vec::new();
+    if let Some(secs) = line.time {
+        spans.push(Span::styled(
+            format!("{:02}:{:02}  ", secs / 60, secs % 60),
+            role_style(Role::Dim),
+        ));
+    }
+    spans.push(Span::styled(line.icon, style));
     if !line.label.is_empty() {
         let label = if line.detail.is_empty() {
             line.label.clone()
@@ -410,9 +419,49 @@ fn draw_popup(frame: &mut Frame, app: &App, area: Rect) {
             ],
         ),
     };
-    let height = u16::try_from(body.len())
+    render_popup(frame, area, title, body, POPUP_WIDTH);
+}
+
+/// Rows a line takes when wrapped at `width` columns (greedy, by words).
+fn wrapped_rows(line: &Line, width: usize) -> usize {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let mut rows = 1;
+    let mut used = 0;
+    for word in text.split(' ') {
+        let len = word.chars().count();
+        if used == 0 || used + 1 + len > width {
+            if used != 0 {
+                rows += 1;
+            }
+            used = len;
+        } else {
+            used += 1 + len;
+        }
+        // A word longer than the width continues on the next rows.
+        while used > width {
+            rows += 1;
+            used -= width;
+        }
+    }
+    rows
+}
+
+/// A centred, bordered popup `width` columns wide (less on a narrow screen).
+/// Long lines wrap; the height follows the wrapped text, within the screen.
+pub(super) fn render_popup(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    body: Vec<Line<'_>>,
+    width: u16,
+) {
+    let width = width.min(area.width);
+    let inner = usize::from(width.saturating_sub(2)).max(1);
+    let text_rows: usize = body.iter().map(|l| wrapped_rows(l, inner)).sum();
+    let height = u16::try_from(text_rows)
         .unwrap_or(u16::MAX)
-        .saturating_add(2);
+        .saturating_add(2)
+        .min(area.height);
     let [_, row, _] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(height),
@@ -421,7 +470,7 @@ fn draw_popup(frame: &mut Frame, app: &App, area: Rect) {
     .areas(area);
     let [_, popup, _] = Layout::horizontal([
         Constraint::Fill(1),
-        Constraint::Length(POPUP_WIDTH.min(area.width)),
+        Constraint::Length(width),
         Constraint::Fill(1),
     ])
     .areas(row);
@@ -429,7 +478,7 @@ fn draw_popup(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(body)
             .wrap(Wrap { trim: false })
-            .block(Block::new().borders(Borders::ALL).title(title)),
+            .block(Block::new().borders(Borders::ALL).title(title.to_string())),
         popup,
     );
 }

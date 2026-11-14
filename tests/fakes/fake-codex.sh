@@ -29,7 +29,8 @@ fi
 
 # Planning session (read-only flags in argv). FAKE_PLAN_MODE: valid (default),
 # invalid_then_valid (duplicate title; valid after a resume), wrong_agent_then_valid,
-# fenced (plan wrapped in a ```markdown fence), no_markers, always_invalid, fail, slow.
+# fenced (plan wrapped in a ```markdown fence), no_markers, always_invalid, fail, slow,
+# crash (exits 2 with a message on stderr and no output).
 # A resume keeps the same session id.
 plan_text() {
     # $1: agent line value, $2: second phase title. JSON-escaped, markers included.
@@ -90,6 +91,10 @@ fi
 
 case " $* " in
     *" read-only "*)
+        if [ "${FAKE_PLAN_MODE:-valid}" = "crash" ]; then
+            echo "error: fake option rejected" >&2
+            exit 2
+        fi
         ptid=${resume:-fake-plan-thread}
         printf '{"type":"thread.started","thread_id":"%s"}\n' "$ptid"
         echo '{"type":"turn.started"}'

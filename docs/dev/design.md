@@ -24,10 +24,12 @@ with the code, and record the reason in `decisions.md`.
 | `display.rs` | The one place that turns events into text: structured `EventLine`s (time, icon, label, detail, role), phase header and summary, status labels. Rendered by the CLI (via `Styler`) and the TUI (ratatui styles). See `design-v0.2.md` §1. |
 | `style.rs` | `Styler` and `Role`: ANSI colour for the CLI output, only on a terminal with `NO_COLOR` unset or empty and `TERM` not `dumb`. |
 | `doctor.rs` | `phasewise doctor`: presence and version of git, claude and codex, repository suitability. |
-| `tui/mod.rs` | `phasewise review`: terminal setup/restore, event loop, engine worker threads. |
+| `tui/mod.rs` | `phasewise review` and the home screen: terminal setup/restore, event loops, engine and planning worker threads, the switch from home to review in one terminal session. |
 | `tui/app.rs` | Pure state machine: key in, `Command` out. |
-| `tui/data.rs` | Read-only loaders of run, diff, log (`LogLine`: attempt headings and `EventLine`s) and verify data. |
-| `tui/view.rs` | Rendering with ratatui (snapshot-tested). |
+| `tui/data.rs` | Read-only loaders of run, diff, log (`LogLine`: attempt headings and `EventLine`s) and verify data, and `load_home` (repository name, branch, plan state, uncommitted flag). |
+| `tui/view.rs` | Rendering of the review screen with ratatui (snapshot-tested), plus the helpers shared with the home screen (styles, event spans, popups). |
+| `tui/home.rs` | Home screen state machine: key in, `HomeCommand` out, no I/O (see `design-v0.2.md` §4). |
+| `tui/home_view.rs` | Rendering of the home screen (snapshot-tested). |
 
 The engine and `ops` never print. They report through `std::sync::mpsc::Sender<EngineEvent>`; the CLI and the TUI are the two consumers.
 

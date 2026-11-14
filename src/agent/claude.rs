@@ -113,6 +113,11 @@ impl Agent for ClaudeAgent {
             .args(["-p", "--output-format", "stream-json", "--verbose"])
             .args(["--permission-mode", "dontAsk"])
             .args(["--permission-prompts", "none"])
+            // Only these built-in tools exist in the session, and no MCP server
+            // is loaded (`--strict-mcp-config` without `--mcp-config`): tools
+            // that need no permission, such as worktrees or subagents, are gone.
+            .args(["--tools", "Read,Grep,Glob"])
+            .arg("--strict-mcp-config")
             .args(["--allowedTools", "Read,Grep,Glob"])
             .args([
                 "--disallowedTools",
@@ -493,6 +498,9 @@ mod tests {
             "dontAsk",
             "--permission-prompts",
             "none",
+            "--tools",
+            "Read,Grep,Glob",
+            "--strict-mcp-config",
             "--allowedTools",
             "Read,Grep,Glob",
             "--disallowedTools",

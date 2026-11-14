@@ -244,9 +244,12 @@ phasewise plan [GOAL] [--agent claude|codex] [--model M] [--effort E] [--output 
 The agent runs in the repository root:
 
 - **Claude:** `-p --output-format stream-json --verbose --permission-mode
-  dontAsk --permission-prompts none --allowedTools Read,Grep,Glob
-  --disallowedTools Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch`, plus
-  `--model`/`--effort`.
+  dontAsk --permission-prompts none --tools Read,Grep,Glob --strict-mcp-config
+  --allowedTools Read,Grep,Glob --disallowedTools
+  Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch`, plus `--model`/`--effort`.
+  `--tools` leaves only those three built-in tools in the session and
+  `--strict-mcp-config` (without `--mcp-config`) loads no MCP server, so tools
+  that need no permission (subagents, worktrees, schedulers) are not there.
 - **Codex:** `exec --json --sandbox read-only`, plus `-m`/`-c`, then `-`.
 
 Other rules:

@@ -186,6 +186,37 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// Notices that the process that started phasewise has ended.
+///
+/// When a terminal closes, the shell that started phasewise gets the hang-up,
+/// but phasewise itself does not always get a signal (for example under
+/// `sh -c`). It is then re-parented, and the TUI would keep polling a terminal
+/// that only returns end-of-file. A changed parent id is treated like a
+/// hang-up.
+#[derive(Debug, Clone, Copy)]
+pub struct ParentWatch {
+    initial: u32,
+}
+
+impl ParentWatch {
+    pub fn new() -> ParentWatch {
+        ParentWatch {
+            initial: std::os::unix::process::parent_id(),
+        }
+    }
+
+    /// True once the parent at creation time is no longer the parent.
+    pub fn parent_gone(&self) -> bool {
+        std::os::unix::process::parent_id() != self.initial
+    }
+}
+
+impl Default for ParentWatch {
+    fn default() -> Self {
+        ParentWatch::new()
+    }
+}
+
 /// Whether any process of the group still exists.
 fn group_exists(pgid: u32) -> bool {
     Command::new("sh")
@@ -227,6 +258,13 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         cmd
+    }
+
+    #[test]
+    fn the_parent_is_still_there() {
+        let watch = ParentWatch::new();
+        assert!(!watch.parent_gone());
+        assert_eq!(watch.initial, std::os::unix::process::parent_id());
     }
 
     fn registered(pgid: u32) -> bool {

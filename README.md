@@ -72,7 +72,19 @@ Full reference (front matter keys, defaults, validation errors): [docs/plan-form
 
 ## Commands
 
-Run `phasewise` with no arguments: with an active run in a terminal it opens the review TUI; otherwise it prints the help.
+Run `phasewise` with no arguments. On a terminal it opens the review TUI when a run is active, and the **home screen** when there is no active run and you are inside a git repository; otherwise it prints the help.
+
+The home screen shows the plan (missing, valid with its phases, or invalid with the errors and their lines) and the settings (agent, model, effort). Keys:
+
+| Key | What it does |
+|---|---|
+| `a` | Switches the agent (claude / codex); the model goes back to default. |
+| `m` | Chooses the model: `default`, the agent's list, or `custom…`. |
+| `e` | Chooses the effort: `default`, `low`, `medium`, `high`, `xhigh`, `max`. |
+| `p` | Asks what you want to do and has the agent write the plan (asks before replacing an existing `phasewise.md`); `x` cancels. |
+| `c` | Checks the plan again (for example after editing or committing it). |
+| `Enter` | Starts a run with the plan and opens the review screen. The plan must be valid and committed; phasewise never commits it for you. |
+| `?` / `q` | Help / quit. |
 
 | Command | What it does | Flags |
 |---|---|---|
@@ -109,6 +121,11 @@ Command lines phasewise uses (the prompt is sent on stdin; `agent_args` from the
 
 - Claude Code: `claude -p --output-format stream-json --verbose --permission-mode acceptEdits --permission-prompts none --allowedTools Read,Edit,Write,Bash --disallowedTools "Bash(git push *)"`; a retry in the same session adds `--resume <session-id>`.
 - Codex: `codex exec --json --sandbox workspace-write -`; a retry in the same session uses `codex exec --json --sandbox workspace-write resume <session-id> -`.
+
+`phasewise plan` uses read-only sessions:
+
+- Claude Code: `claude -p --output-format stream-json --verbose --permission-mode dontAsk --permission-prompts none --tools Read,Grep,Glob --strict-mcp-config --allowedTools Read,Grep,Glob --disallowedTools Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch` (only those three tools exist in the session, and no MCP server is loaded).
+- Codex: `codex exec --json --sandbox read-only -`.
 
 When a model or effort is set, Claude gets `--model <M> --effort <E>` after the fixed flags (before `--resume` and `agent_args`) and Codex gets `-m <M> -c model_reasoning_effort="<E>"` before the `resume` subcommand.
 

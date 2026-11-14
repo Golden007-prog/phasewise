@@ -23,8 +23,9 @@ prompt texts), `git` (the only module that runs `git`), `state` (`state.json`,
 run layout, lock, recovery), `process` (process groups), `verify` (verification
 commands), `agent/` (`mod`, `claude`, `codex`: command lines and output
 parsers), `engine` (one phase cycle), `ops` (run-level operations shared by CLI
-and TUI), `doctor`, and `tui/` (`mod` terminal loop, `app` pure key/state
-machine, `data` read-only loaders, `view` rendering).
+and TUI), `doctor`, and `tui/` (`mod` terminal loop and screen switch, `app` and
+`home` pure key/state machines for review and the home screen, `data` read-only
+loaders, `view` and `home_view` rendering).
 
 The engine and `ops` never print or draw: they emit `EngineEvent`s through an
 `mpsc` channel; the CLI and the TUI are two consumers of that channel.

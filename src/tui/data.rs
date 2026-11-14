@@ -1,12 +1,16 @@
 //! Read-only views of a run for the TUI: plain data plus the loaders that
 //! build them from a [`Run`].
 
+use std::path::{Path, PathBuf};
+
 use anyhow::Result;
 
 use crate::agent::AgentEvent;
 use crate::agent::agent_for;
 use crate::display::{EventLine, agent_event_line, failure_kind_label, first_line_short};
+use crate::git::Git;
 use crate::ops::Run;
+use crate::plan::{self, AgentKind};
 use crate::state::{PhaseStatus, RunStatus};
 
 /// One line of the Log tab.
@@ -217,5 +221,134 @@ pub fn load_verify(run: &Run, phase: usize) -> String {
     match std::fs::read(run.paths.verify_log(phase)) {
         Ok(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
         _ => NO_VERIFY.to_string(),
+    }
+}
+
+/// One phase of the plan shown on the home screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomePhase {
+    pub number: usize,
+    pub title: String,
+    /// Phase-specific checks (the `verify` blocks of the phase).
+    pub checks: usize,
+    /// Effective model and effort: the phase's block, else the plan's front matter.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// A valid plan, summarised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanSummary {
+    pub title: Option<String>,
+    pub agent: AgentKind,
+    /// `model` / `effort` of the plan's front matter.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub phases: Vec<HomePhase>,
+}
+
+/// A problem found in the plan file; `line` is 0 when it has no line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanProblem {
+    pub line: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanState {
+    Missing,
+    Valid(PlanSummary),
+    Invalid(Vec<PlanProblem>),
+}
+
+/// What the home screen shows about the repository and its plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeData {
+    /// Repository root.
+    pub root: PathBuf,
+    /// Name of the repository directory.
+    pub repo_name: String,
+    /// Current branch, or `detached HEAD`.
+    pub branch: String,
+    /// The plan file at the repository root.
+    pub plan_path: PathBuf,
+    pub plan: PlanState,
+    /// The plan file has changes that are not committed.
+    pub plan_uncommitted: bool,
+}
+
+/// Loads the home data for the repository that contains `cwd`.
+pub fn load_home(cwd: &Path) -> Result<HomeData> {
+    load_home_from(&Git::discover(cwd)?)
+}
+
+/// Like [`load_home`], with the repository handle given by the caller.
+pub fn load_home_from(git: &Git) -> Result<HomeData> {
+    let root = git.root().to_path_buf();
+    let repo_name = root.file_name().map_or_else(
+        || root.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let branch = git
+        .current_branch()?
+        .unwrap_or_else(|| "detached HEAD".to_string());
+    let plan_path = root.join(plan::DEFAULT_PLAN_FILE);
+    let plan = load_plan_state(&plan_path);
+    let plan_uncommitted = plan != PlanState::Missing
+        && git
+            .dirty_paths()?
+            .iter()
+            .any(|p| p == plan::DEFAULT_PLAN_FILE);
+    Ok(HomeData {
+        root,
+        repo_name,
+        branch,
+        plan_path,
+        plan,
+        plan_uncommitted,
+    })
+}
+
+fn load_plan_state(path: &Path) -> PlanState {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PlanState::Missing,
+        Err(e) => {
+            return PlanState::Invalid(vec![PlanProblem {
+                line: 0,
+                message: format!(
+                    "Cannot read {}: {e}. Check the file and its permissions.",
+                    path.display()
+                ),
+            }]);
+        }
+    };
+    match plan::parse(&text) {
+        Ok(plan) => PlanState::Valid(PlanSummary {
+            title: plan.title.clone(),
+            agent: plan.config.agent,
+            model: plan.config.model.clone(),
+            effort: plan.config.effort.clone(),
+            phases: plan
+                .phases
+                .iter()
+                .map(|p| HomePhase {
+                    number: p.number,
+                    title: p.title.clone(),
+                    checks: p.verify.len(),
+                    model: p.model.clone().or_else(|| plan.config.model.clone()),
+                    effort: p.effort.clone().or_else(|| plan.config.effort.clone()),
+                })
+                .collect(),
+        }),
+        Err(errors) => PlanState::Invalid(
+            errors
+                .into_iter()
+                .map(|e| PlanProblem {
+                    line: e.line,
+                    message: e.message,
+                })
+                .collect(),
+        ),
     }
 }

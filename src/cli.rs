@@ -15,8 +15,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use crate::agent::LaunchOptions;
 use crate::agent::{ModelInfo, agent_for};
 use crate::display::{
-    event_line, failure_kind_label, money, phase_header, phase_summary, plan_event_line,
-    plan_header, status_label,
+    event_line, failure_kind_label, money, phase_count, phase_header, phase_summary,
+    plan_event_line, plan_header, status_label,
 };
 use crate::engine::EngineEvent;
 use crate::git::Git;
@@ -246,9 +246,15 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         None => {
             let cwd = current_dir()?;
-            // With an active run on a terminal the TUI opens; otherwise show the help.
-            if std::io::stdout().is_terminal() && ops::load_active(&cwd).ok().flatten().is_some() {
-                return crate::tui::run(&cwd);
+            // On a terminal: the review screen for an active run, the home screen
+            // inside a git repository; otherwise show the help.
+            if std::io::stdout().is_terminal() {
+                if ops::load_active(&cwd).ok().flatten().is_some() {
+                    return crate::tui::run(&cwd);
+                }
+                if Git::discover(&cwd).is_ok() {
+                    return crate::tui::run_home(&cwd);
+                }
             }
             Cli::command().print_long_help()?;
             Ok(ExitCode::SUCCESS)
@@ -367,7 +373,10 @@ fn print_plan(plan: &plan::Plan, path: &Path) {
     outln!();
     outln!(
         "{}",
-        st.ok(&format!("{} phases. The plan is valid.", plan.phases.len()))
+        st.ok(&format!(
+            "{}. The plan is valid.",
+            phase_count(plan.phases.len())
+        ))
     );
 }
 

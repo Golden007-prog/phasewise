@@ -6,8 +6,12 @@ use std::time::Duration;
 
 use common::{TestRepo, isolated_git_env};
 use phasewise::ops::{self, Run};
+use phasewise::plan::AgentKind;
 use phasewise::state::PhaseStatus;
-use phasewise::tui::data::{LogLine, load_diff, load_log, load_run_view, load_verify};
+use phasewise::tui::data::{
+    LogLine, PlanProblem, PlanState, load_diff, load_home_from, load_log, load_run_view,
+    load_verify,
+};
 use tempfile::TempDir;
 
 const FAKE_CLAUDE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/fake-claude.sh");
@@ -143,5 +147,130 @@ fn failed_phase_shows_the_worktree_diff_and_untracked_files() {
     assert!(
         headings[1..].iter().all(|(_, resumed)| *resumed),
         "{headings:?}"
+    );
+}
+
+const HOME_PLAN: &str = "+++\nagent = \"codex\"\nmodel = \"gpt-x\"\neffort = \"low\"\n+++\n\n# Home plan\n\n\
+## Phase 1: First\n\nDo one.\n\n```verify\ntrue\ntest -f a\n```\n\n\
+## Phase 2: Second\n\nDo two.\n\n```phasewise\nmodel = \"special\"\neffort = \"high\"\n```\n";
+
+#[test]
+fn home_without_a_plan_shows_the_repository_and_a_missing_plan() {
+    let repo = TestRepo::new();
+    let home = load_home_from(&repo.git_handle()).expect("load home");
+    assert_eq!(home.plan, PlanState::Missing);
+    assert!(!home.plan_uncommitted);
+    assert_eq!(home.branch, "main");
+    let name = repo.path().file_name().expect("dir name").to_string_lossy();
+    assert_eq!(home.repo_name, name);
+    assert_eq!(
+        home.plan_path.file_name().and_then(|n| n.to_str()),
+        Some("phasewise.md")
+    );
+    assert_eq!(
+        home.root.canonicalize().ok(),
+        repo.path().canonicalize().ok()
+    );
+}
+
+#[test]
+fn home_with_a_committed_valid_plan_lists_phases_checks_and_models() {
+    let repo = TestRepo::new();
+    repo.write("phasewise.md", HOME_PLAN);
+    repo.commit_all("add plan");
+    let home = load_home_from(&repo.git_handle()).expect("load home");
+    assert!(!home.plan_uncommitted);
+    let PlanState::Valid(plan) = home.plan else {
+        panic!("expected a valid plan, got {:?}", home.plan);
+    };
+    assert_eq!(plan.title.as_deref(), Some("Home plan"));
+    assert_eq!(plan.agent, AgentKind::Codex);
+    assert_eq!(plan.model.as_deref(), Some("gpt-x"));
+    assert_eq!(plan.effort.as_deref(), Some("low"));
+    assert_eq!(plan.phases.len(), 2);
+    let first = &plan.phases[0];
+    assert_eq!(
+        (first.number, first.title.as_str(), first.checks),
+        (1, "First", 2)
+    );
+    // Effective values: the plan's, then the phase's own.
+    assert_eq!(first.model.as_deref(), Some("gpt-x"));
+    assert_eq!(first.effort.as_deref(), Some("low"));
+    let second = &plan.phases[1];
+    assert_eq!((second.number, second.checks), (2, 0));
+    assert_eq!(second.model.as_deref(), Some("special"));
+    assert_eq!(second.effort.as_deref(), Some("high"));
+}
+
+#[test]
+fn home_flags_a_plan_that_is_not_committed() {
+    let repo = TestRepo::new();
+    // Untracked.
+    repo.write("phasewise.md", HOME_PLAN);
+    let home = load_home_from(&repo.git_handle()).expect("load home");
+    assert!(matches!(home.plan, PlanState::Valid(_)));
+    assert!(home.plan_uncommitted);
+    // Committed, then modified.
+    repo.commit_all("add plan");
+    assert!(
+        !load_home_from(&repo.git_handle())
+            .expect("home")
+            .plan_uncommitted
+    );
+    repo.write("phasewise.md", &format!("{HOME_PLAN}\nMore.\n"));
+    assert!(
+        load_home_from(&repo.git_handle())
+            .expect("home")
+            .plan_uncommitted
+    );
+    // Other dirty files do not count.
+    repo.git(&["checkout", "--", "phasewise.md"]);
+    repo.write("notes.txt", "x");
+    assert!(
+        !load_home_from(&repo.git_handle())
+            .expect("home")
+            .plan_uncommitted
+    );
+}
+
+#[test]
+fn home_with_an_invalid_plan_lists_the_errors_with_their_lines() {
+    let repo = TestRepo::new();
+    repo.write(
+        "phasewise.md",
+        "+++\nbogus = 1\n+++\n\n# Bad\n\n## Phase 1: A\n\nx\n\n## Phase 2: A\n\ny\n",
+    );
+    repo.commit_all("add plan");
+    let home = load_home_from(&repo.git_handle()).expect("load home");
+    let PlanState::Invalid(problems) = home.plan else {
+        panic!("expected an invalid plan, got {:?}", home.plan);
+    };
+    assert!(!problems.is_empty());
+    assert!(
+        problems
+            .iter()
+            .all(|p: &PlanProblem| p.line >= 1 && !p.message.is_empty())
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.line == 2 && p.message.contains("bogus")),
+        "{problems:?}"
+    );
+    assert!(!home.plan_uncommitted);
+}
+
+#[test]
+fn home_names_a_detached_head_and_the_current_branch() {
+    let repo = TestRepo::new();
+    repo.git(&["switch", "-c", "feature/x"]);
+    assert_eq!(
+        load_home_from(&repo.git_handle()).expect("home").branch,
+        "feature/x"
+    );
+    repo.git(&["checkout", "--detach"]);
+    assert_eq!(
+        load_home_from(&repo.git_handle()).expect("home").branch,
+        "detached HEAD"
     );
 }

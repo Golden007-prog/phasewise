@@ -159,8 +159,8 @@ fn repository_lines(cwd: &Path, lines: &mut Vec<String>) {
     } else {
         match plan::load(&plan_path) {
             Ok(plan) => lines.push(format!(
-                "  ✓ {PLAN_FILE} is valid ({} phases)",
-                plan.phases.len()
+                "  ✓ {PLAN_FILE} is valid ({})",
+                crate::display::phase_count(plan.phases.len())
             )),
             Err(err) => {
                 let message = err.to_string();

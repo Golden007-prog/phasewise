@@ -287,6 +287,15 @@ pub fn plan_event_line(event: &PlanEvent) -> Option<EventLine> {
     })
 }
 
+/// `1 phase`, `2 phases`.
+pub fn phase_count(n: usize) -> String {
+    if n == 1 {
+        "1 phase".to_string()
+    } else {
+        format!("{n} phases")
+    }
+}
+
 pub fn money(cost: f64) -> String {
     if cost < 0.01 {
         format!("${cost:.4}")
@@ -696,5 +705,12 @@ mod tests {
             plan_header(&started, &plain).as_deref(),
             Some("▶ Planning · codex · gpt-x")
         );
+    }
+
+    #[test]
+    fn phase_count_is_singular_for_one() {
+        assert_eq!(phase_count(0), "0 phases");
+        assert_eq!(phase_count(1), "1 phase");
+        assert_eq!(phase_count(2), "2 phases");
     }
 }

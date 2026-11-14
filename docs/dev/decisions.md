@@ -331,6 +331,15 @@ deviates from the original plan, with the reason.
   resume)` instead of reusing `resume_command`, so the planning flags can never
   pick up phase permissions or the plan's `agent_args`. Claude resumes with
   `--resume <id>` after the options; Codex puts `resume <id>` before the `-`.
+- **Claude's tool set is restricted, not only its permissions.** The first
+  real planning session showed that `--allowedTools`/`--disallowedTools` leave
+  the rest of the tool set in place (`Task`, `EnterWorktree`, `CronCreate`,
+  `RemoteTrigger`, `Skill`, `SendMessage`, …, and the user's MCP servers), and
+  some of those need no permission. `--tools Read,Grep,Glob
+  --strict-mcp-config` removes them: the second real session listed only
+  `Glob`, `Grep`, `Read` and no MCP server. The allow/deny lists stay as a
+  second layer. Codex has no such switch; its `--sandbox read-only` is the
+  guard.
 - **`ops::prepare_plan`.** The checks before the agent starts (repository,
   output path, `--force`) are a separate function so the CLI can refuse before
   asking for the goal. `create_plan` calls it again; the design's signature
@@ -391,3 +400,129 @@ deviates from the original plan, with the reason.
   and answered according to `FAKE_PLAN_MODE`. The extras beyond the design are
   the modes `wrong_agent_then_valid` and `fenced` and the session ids
   `fake-plan-session` / `fake-plan-thread`, kept on resume. The non-planning paths are unchanged.
+
+## v0.2 — home screen
+
+Decisions that fill the gaps of `design-v0.2.md` section 4.
+
+- **Entry.** `phasewise` with no arguments on a terminal: an active run opens
+  review as before; else a git repository opens the home screen
+  (`tui::run_home`); else the long help. `phasewise review` is untouched.
+- **One terminal session.** `run_home` makes the one `try_init` and the one
+  `TerminalGuard`. When `Enter` starts a run, the home loop returns the `Run`
+  and the same function builds the review `Tui` (same signal flag), spawns the
+  worker exactly like review's `n` (`ops::execute(run, false, ...)` through
+  `Tui::spawn`, which loads its own copy of the run) and runs the review loop.
+- **Initial agent.** The plan's `agent` when the plan is valid, else claude. A
+  reload (`c`, or the end of a planning) keeps the user's choice of agent,
+  model and effort.
+- **Settings.** Agent shows the version, `not installed` or `checking…`; both
+  agents are probed once at startup in two background threads. Model and Effort
+  show `default`, plus a dim `(plan: X)` when the plan's front matter sets a
+  value and the selected agent is the plan's. Phase-level values appear only in
+  the plan panel, and only when the selected agent is the plan's, because a
+  model name belongs to one agent (§2).
+- **Model popup.** `default`, the cached `list_models()` of the selected agent,
+  `custom…`. The list loads in a background thread the first time the popup
+  opens (a note under the list says `loading…`); a failure keeps default and
+  custom, shows the error, and is not cached: it is tried again the next time
+  the popup opens. A list that arrives while the popup is open keeps the
+  selected row. `custom…` is a text input checked with `plan::validate_model`;
+  typing `default` there means default. Invalid input stays open with the
+  reason in the status line. Esc closes popups without changes.
+- **Effort popup.** `default` and `plan::EFFORTS`.
+- **Planning.** `p` asks `What do you want to do?` (an empty goal is refused
+  with a message and the input stays open). If the plan file exists
+  (valid or not) it asks `Replace phasewise.md? (y/N)`; only `y`/`Y` confirms and
+  sets `force`. The worker runs `ops::create_plan` with the current agent,
+  model and effort (`None` for default) and the plan path at the repository
+  root as output. An error of `ops::plan_timeout` is shown in the error popup
+  and no worker starts. The plan panel shows the heading (`display::plan_header`
+  without colour) and the `plan_event_line`s with a time column, newest at the
+  bottom; `event_spans` in `view.rs` now draws the time column when a line has
+  one (the Log tab's lines have none, so its snapshots are unchanged).
+- **Busy.** While planning, `a m e p c Enter` are refused with `Planning in
+  progress — press x to cancel`; `x` cancels the worker's own cancel flag.
+  `q` and Ctrl-C ask for confirmation while planning (same as review while a
+  phase runs); the first signal acts like a confirmed quit. In both cases the
+  worker is cancelled and phasewise exits only when it has stopped, with
+  review's message.
+- **Outcome.** When planning ends, the home data is reloaded. Success: the
+  status line says `Plan written to phasewise.md (N phases[, $cost]). Review
+  it, commit it, then press Enter.` Failure, cancel or `Err`: an error popup
+  with every problem, the last draft and the `.phasewise/plans/<id>/` directory
+  (paths relative to the repository root). Nothing is committed by phasewise.
+- **Uncommitted plan.** `HomeData::plan_uncommitted` is true when the plan path
+  relative to the root is in `Git::dirty_paths` (untracked, modified or
+  staged). The plan panel shows `not committed` in the warning style with
+  `git add phasewise.md && git commit -m "Add phasewise plan"`. When `ops::start`
+  fails and the plan is uncommitted, that hint leads the error popup.
+- **Start.** `Enter` is refused with a message when the plan is missing or
+  invalid, or while planning. Otherwise `ops::start` runs on the main thread
+  with `agent_override = Some(agent)`, the agent shown on the screen, always:
+  `ops::start` reads the plan file again, and a plan edited on disk since the
+  screen loaded it must not change the agent behind the user's back (same
+  result as no override when the agents match). `Override::Set` for a chosen
+  model or effort (nothing for default). Its error is shown in full (message lines plus `caused by:` lines).
+- **Error popup.** Closed with Esc, Enter or `q`; every other key is ignored
+  there, so `q` cannot quit while it is open. The help popup closes on any key,
+  like review's.
+- **Loader.** `data::load_home(cwd)` and `load_home_from(&Git)` (the second one
+  lets tests use an isolated git environment). The plan is read and parsed
+  directly (`plan::parse`) to keep the structured errors with their lines; an
+  unreadable file is `Invalid` with a line-less problem. A phase's check count
+  is its own `verify` blocks, as in `phasewise check`; the model and effort
+  are the effective values (phase block, else front matter).
+- **Layout.** Header, plan panel (left), settings panel (right, 38 columns), a
+  two-row status line (messages wrap) and the key bar. Same minimum size and
+  message as review (80x20).
+
+## v0.2 — closed terminal
+
+- **The problem.** When the terminal of a TUI closes, crossterm 0.29 never
+  returns from `event::poll`: it reads end-of-file from the terminal in a loop
+  and ignores it. Found while checking the home screen; v0.1's review screen had
+  the same problem. The loop then cannot see a signal (a first SIGHUP is lost)
+  and phasewise stayed at 100% CPU with its agent still running. Under `sh -c`
+  phasewise gets no signal at all: the shell gets the hang-up and dies, and
+  phasewise is re-parented.
+- **The fix.** Both TUI loops mark a heartbeat on every turn. A watchdog thread,
+  started once per process, checks every 0.5 s: if the loop has been silent for
+  30 s while a signal is pending or the parent process has changed
+  (`process::ParentWatch`, `std::os::unix::process::parent_id`), it kills the
+  agents' process groups and exits with 129, like the second signal. The loop
+  itself also treats a changed parent like a signal, for the case where it is
+  not stuck. The phase left `running` is recovered as `failed (interrupted)` by
+  the next command, through the existing crash path.
+- **Why 30 s.** Only a stuck loop is silent that long: the loop turns every
+  100 ms, and the slowest synchronous work in it (git operations of `start` and
+  `rollback`) takes far less. A shorter limit could cut such an operation after
+  an ordinary SIGTERM.
+- **Checked by hand** with `expect`: hanging up during planning and during a
+  phase leaves no phasewise or agent process after about 30 s, writes no plan,
+  and `phasewise status` then reports the phase as interrupted.
+- **Smaller fixes from the review of the home screen.** `(plan: X)` is shown
+  only next to `default` (a chosen value replaces the plan's). Phase counts say
+  `1 phase` (`display::phase_count`, also used by `check` and `doctor`).
+
+## v0.2 — review fixes
+
+An independent review of parts 3 and 4 found no serious bug. Fixed from its
+findings:
+
+- **A plan file written during planning is kept.** `create_plan` checks the
+  output again just before writing it: without `--force` (or the TUI's
+  confirmation), a file that appeared meanwhile is left as it is, the run
+  fails, and the new plan is the last draft.
+- **An agent that cannot start is not asked again.** A failure with no session
+  id and no final text (a rejected option, a missing login) ends planning at
+  once instead of costing two more sessions. Every agent failure points to
+  `attempt-K.stderr.log`.
+- **The home screen re-asks when the plan file appeared** after the screen was
+  loaded, instead of failing with the CLI's `--force` advice.
+- **Enter always passes the agent shown** (see "Start" above).
+- **Ctrl-C works from every popup and input**, in the home and the review
+  screens: it closes the popup and then acts as in the main view (quit, or ask
+  first while something runs).
+- **Waiting for a stopped worker on an error path beats the heartbeat**, so the
+  watchdog cannot cut that wait short.

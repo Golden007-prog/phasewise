@@ -84,11 +84,13 @@ impl Env {
     }
 }
 
-const READ_ONLY: [&str; 4] = [
+const READ_ONLY: [&str; 6] = [
     "--permission-mode dontAsk",
+    "--tools Read,Grep,Glob --strict-mcp-config",
     "--allowedTools Read,Grep,Glob",
     "--disallowedTools Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch",
     "--permission-prompts none",
+    "--output-format stream-json --verbose",
 ];
 
 #[test]
@@ -417,4 +419,47 @@ fn a_fence_around_the_whole_plan_is_removed() {
         assert!(stdout.contains("2 phases"), "{stdout}");
         assert_eq!(env.arg_lines().len(), 1, "no repair round needed");
     }
+}
+
+#[test]
+fn an_agent_that_cannot_start_is_not_asked_again() {
+    for agent in ["claude", "codex"] {
+        let env = Env::new();
+        let out = env.exec(&["--agent", agent, "goal"], &[("FAKE_PLAN_MODE", "crash")]);
+        assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
+        assert_eq!(env.arg_lines().len(), 1, "no repair round for {agent}");
+        assert!(
+            out.stderr
+                .contains(&format!("{agent} failed (exit code 2)")),
+            "{}",
+            out.stderr
+        );
+        assert!(
+            out.stderr.contains("attempt-1.stderr.log"),
+            "{}",
+            out.stderr
+        );
+        let log = std::fs::read_to_string(env.plan_dir().join("attempt-1.stderr.log"))
+            .expect("stderr log");
+        assert!(log.contains("fake option rejected"), "{log}");
+        assert!(!env.repo.path().join("phasewise.md").exists());
+    }
+}
+
+#[test]
+fn a_plan_file_written_meanwhile_is_kept() {
+    let env = Env::new();
+    let out = env.exec(&["goal"], &[("FAKE_PLAN_MODE", "creates_output")]);
+    assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
+    assert_eq!(env.repo.read("phasewise.md"), "mine\n");
+    assert!(
+        out.stderr
+            .contains("appeared while the agent was working and was left as it is"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("Last draft: "), "{}", out.stderr);
+    let draft = std::fs::read_to_string(env.plan_dir().join("draft-1.md")).expect("draft");
+    assert!(draft.contains("## Phase 2: Second"), "{draft}");
+    assert!(!out.stdout.contains("Written"), "{}", out.stdout);
 }

@@ -13,7 +13,9 @@ fi
 
 # Planning session (read-only flags in argv). FAKE_PLAN_MODE: valid (default),
 # invalid_then_valid (duplicate title; valid after a resume), wrong_agent_then_valid,
-# fenced (plan wrapped in a ```markdown fence), no_markers, always_invalid, fail, slow.
+# fenced (plan wrapped in a ```markdown fence), no_markers, always_invalid, fail, slow,
+# crash (exits 2 with a message on stderr and no output), creates_output (claude only:
+# writes phasewise.md itself, as if the user did, then answers a valid plan).
 # A resume keeps the same session id.
 plan_text() {
     # $1: agent line value, $2: second phase title. JSON-escaped, markers included.
@@ -74,10 +76,18 @@ fi
 
 case " $* " in
     *" Read,Grep,Glob "*)
+        if [ "${FAKE_PLAN_MODE:-valid}" = "crash" ]; then
+            echo "error: fake option rejected" >&2
+            exit 2
+        fi
         psid=${resume:-fake-plan-session}
         printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$psid"
         if [ "${FAKE_PLAN_MODE:-valid}" = "slow" ]; then
             exec sleep 600
+        fi
+        if [ "${FAKE_PLAN_MODE:-valid}" = "creates_output" ]; then
+            # The user writes the plan file by hand while the agent works.
+            printf 'mine\n' > phasewise.md
         fi
         printf '{"type":"assistant","session_id":"%s","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Reading the project."},{"type":"tool_use","id":"toolu_p","name":"Read","input":{"file_path":"README.md"}}]}}\n' "$psid"
         if [ "${FAKE_PLAN_MODE:-valid}" = "fail" ]; then

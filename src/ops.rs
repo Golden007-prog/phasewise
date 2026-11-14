@@ -903,9 +903,23 @@ PHASEWISE_PLAN_TIMEOUT_SECONDS",
             );
         }
 
+        let agent_failed = run.exit_code != Some(0) || run.finished_ok == Some(false);
         let problems = match check_plan_answer(&run, request.agent) {
             Ok((text, plan)) => {
-                save_draft(&dir, attempt, &text);
+                let draft = save_draft(&dir, attempt, &text);
+                // The output was checked before the agent started; a file that
+                // appeared since then belongs to the user and is kept.
+                if !request.force && target.output.exists() {
+                    return failed(
+                        vec![format!(
+                            "{} appeared while the agent was working and was left as it is. \
+The new plan is the last draft: compare the two and keep what you want.",
+                            target.output.display()
+                        )],
+                        draft.or(last_draft),
+                        false,
+                    );
+                }
                 write_atomic(&target.output, text.as_bytes())?;
                 emit(PlanEvent::Written {
                     path: target.output.clone(),
@@ -930,7 +944,17 @@ PHASEWISE_PLAN_TIMEOUT_SECONDS",
             }
         };
         let round = attempt;
-        if round > MAX_PLAN_REPAIRS {
+        // An agent that failed before it started a session (a rejected option,
+        // a missing login) would only fail the same way again.
+        let never_started = agent_failed && run.session_id.is_none() && run.final_text.is_none();
+        if round > MAX_PLAN_REPAIRS || never_started {
+            let mut problems = problems;
+            if agent_failed {
+                problems.push(format!(
+                    "The agent's own messages are in attempt-{attempt}.stderr.log, in the agent \
+output directory."
+                ));
+            }
             return failed(problems, last_draft, false);
         }
         emit(PlanEvent::Repairing {
