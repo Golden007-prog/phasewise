@@ -26,6 +26,34 @@ if [ "$1" = "debug" ] && [ "$2" = "models" ]; then
     exit 0
 fi
 
+
+# Planning session (read-only flags in argv). FAKE_PLAN_MODE: valid (default),
+# invalid_then_valid (duplicate title; valid after a resume), wrong_agent_then_valid,
+# fenced (plan wrapped in a ```markdown fence), no_markers, always_invalid, fail, slow.
+# A resume keeps the same session id.
+plan_text() {
+    # $1: agent line value, $2: second phase title. JSON-escaped, markers included.
+    printf '%s' '<<<PHASEWISE-PLAN\n+++\nagent = \"'"$1"'\"\n+++\n\n# Fake plan\n\nShared context.\n\n## Phase 1: First\n\nDo one.\n\n```verify\ntrue\n```\n\n## Phase 2: '"$2"'\n\nDo two.\nPHASEWISE-PLAN>>>'
+}
+
+plan_answer() {
+    # $1: this agent, $2: the other agent, $3: "resume" when resuming.
+    case "${FAKE_PLAN_MODE:-valid}" in
+        invalid_then_valid)
+            if [ -n "$3" ]; then plan_text "$1" Second; else plan_text "$1" First; fi
+            ;;
+        wrong_agent_then_valid)
+            if [ -n "$3" ]; then plan_text "$1" Second; else plan_text "$2" Second; fi
+            ;;
+        always_invalid) plan_text "$1" First ;;
+        fenced)
+            printf '%s' '<<<PHASEWISE-PLAN\n```markdown\n+++\nagent = \"'"$1"'\"\n+++\n\n## Phase 1: First\n\nDo one.\n\n```verify\ntrue\n```\n\n## Phase 2: Second\n\nDo two.\n```\nPHASEWISE-PLAN>>>'
+            ;;
+        no_markers) printf '%s' 'Here is my plan, but I forgot the markers.' ;;
+        *) plan_text "$1" Second ;;
+    esac
+}
+
 prompt=$(cat)
 
 resume=""
@@ -42,6 +70,8 @@ if [ -n "$resume" ]; then
 else
     n=$(printf '%s\n' "$prompt" | sed -n 's/^## Your task: phase \([0-9][0-9]*\) of .*/\1/p' | head -n 1)
 fi
+# Planning sessions have no phase number.
+case " $* " in *" read-only "*) n=plan ;; esac
 tid="fake-thread-$n"
 
 eval "mode=\${FAKE_MODE_$n:-}"
@@ -57,6 +87,24 @@ if [ -n "$FAKE_LOG_DIR" ]; then
         printf '%s\n' "$prompt"
     } >> "$FAKE_LOG_DIR/calls.log"
 fi
+
+case " $* " in
+    *" read-only "*)
+        ptid=${resume:-fake-plan-thread}
+        printf '{"type":"thread.started","thread_id":"%s"}\n' "$ptid"
+        echo '{"type":"turn.started"}'
+        if [ "${FAKE_PLAN_MODE:-valid}" = "slow" ]; then
+            exec sleep 600
+        fi
+        if [ "${FAKE_PLAN_MODE:-valid}" = "fail" ]; then
+            echo '{"type":"turn.failed","error":{"message":"fake planning failure"}}'
+            exit 1
+        fi
+        printf '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"%s"}}\n' "$(plan_answer codex claude "$resume")"
+        echo '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+        exit 0
+        ;;
+esac
 
 printf '{"type":"thread.started","thread_id":"%s"}\n' "$tid"
 echo '{"type":"turn.started"}'

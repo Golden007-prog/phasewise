@@ -13,6 +13,9 @@ use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, T
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Name of the plan file at the repository root.
+pub const DEFAULT_PLAN_FILE: &str = "phasewise.md";
+
 /// Coding agent that executes the phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -33,6 +33,7 @@ Requirements:
 ## Quick start
 
 ```sh
+phasewise plan "what you want to do"   # the agent writes phasewise.md for you (or: phasewise init)
 phasewise init      # creates phasewise.md; edit it, then commit it (run needs a clean tree)
 phasewise check     # validates the plan and lists phases and checks; runs nothing
 phasewise run       # starts a run on a new branch and runs phase 1
@@ -76,6 +77,7 @@ Run `phasewise` with no arguments: with an active run in a terminal it opens the
 | Command | What it does | Flags |
 |---|---|---|
 | `phasewise init` | Creates an example `phasewise.md` (never overwrites) and excludes `.phasewise/` from git. | |
+| `phasewise plan [GOAL]` | Starts a read-only agent session that reads the project and writes the plan for GOAL (asked on a terminal when missing). The plan is validated and, if needed, fixed by the same session (at most 2 rounds); it is written only when valid. The agent cannot change files. Agent output and drafts go to `.phasewise/plans/<id>/`. Time limit 20 min (`PHASEWISE_PLAN_TIMEOUT_SECONDS`). | `--agent`, `--model`, `--effort`, `--output PATH` (default `phasewise.md`), `--force` (overwrite) |
 | `phasewise check [PLAN]` | Validates the plan and lists its phases and checks; runs nothing. | `PLAN`: plan path (default `phasewise.md` at the repository root) |
 | `phasewise doctor` | Checks git, claude and codex (presence, version) and whether this directory is a suitable repository. | |
 | `phasewise run [PLAN]` | Starts a run and launches phase 1; fails if a run is already active. | `--agent claude\|codex` (overrides the plan), `--auto` (chain phases until the end or the first failure), `--model <M>`, `--effort <E>` |

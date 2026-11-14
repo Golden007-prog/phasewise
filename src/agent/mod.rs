@@ -95,6 +95,14 @@ pub trait Agent: Send + Sync {
         options: &LaunchOptions,
         extra_args: &[String],
     ) -> Command;
+    /// Read-only session for `phasewise plan`: the agent may read the project
+    /// but not change it. Never carries the plan's `agent_args`.
+    fn plan_command(
+        &self,
+        root: &Path,
+        options: &LaunchOptions,
+        resume_session: Option<&str>,
+    ) -> Command;
     /// Models the agent offers. Claude: a documented static list. Codex: asks
     /// `codex debug models`.
     fn list_models(&self) -> Result<Vec<ModelInfo>>;

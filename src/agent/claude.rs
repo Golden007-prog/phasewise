@@ -102,6 +102,34 @@ impl Agent for ClaudeAgent {
         cmd
     }
 
+    fn plan_command(
+        &self,
+        root: &Path,
+        options: &LaunchOptions,
+        resume_session: Option<&str>,
+    ) -> Command {
+        let mut cmd = Command::new(self.program());
+        cmd.current_dir(root)
+            .args(["-p", "--output-format", "stream-json", "--verbose"])
+            .args(["--permission-mode", "dontAsk"])
+            .args(["--permission-prompts", "none"])
+            .args(["--allowedTools", "Read,Grep,Glob"])
+            .args([
+                "--disallowedTools",
+                "Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch",
+            ]);
+        if let Some(model) = &options.model {
+            cmd.args(["--model", model]);
+        }
+        if let Some(effort) = &options.effort {
+            cmd.args(["--effort", effort]);
+        }
+        if let Some(session) = resume_session {
+            cmd.args(["--resume", session]);
+        }
+        cmd
+    }
+
     fn list_models(&self) -> Result<Vec<ModelInfo>> {
         Ok(CLAUDE_MODELS
             .iter()
@@ -450,6 +478,48 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn plan_command_is_read_only() {
+        let agent = ClaudeAgent;
+        let root = Path::new("/work/repo");
+        let fixed = [
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            "dontAsk",
+            "--permission-prompts",
+            "none",
+            "--allowedTools",
+            "Read,Grep,Glob",
+            "--disallowedTools",
+            "Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch",
+        ];
+        let both = LaunchOptions {
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+        };
+        let none = LaunchOptions::default();
+        let new = agent.plan_command(root, &none, None);
+        assert_eq!(argv(&new), fixed);
+        assert_eq!(new.get_current_dir(), Some(root));
+        let mut expected: Vec<&str> = fixed.to_vec();
+        expected.extend(["--model", "opus", "--effort", "high"]);
+        assert_eq!(argv(&agent.plan_command(root, &both, None)), expected);
+        expected.extend(["--resume", "sid"]);
+        assert_eq!(
+            argv(&agent.plan_command(root, &both, Some("sid"))),
+            expected
+        );
+        let mut expected: Vec<&str> = fixed.to_vec();
+        expected.extend(["--resume", "sid"]);
+        assert_eq!(
+            argv(&agent.plan_command(root, &none, Some("sid"))),
+            expected
+        );
     }
 
     #[test]

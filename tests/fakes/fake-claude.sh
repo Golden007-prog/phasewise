@@ -10,6 +10,34 @@ if [ "$1" = "--version" ]; then
     exit 0
 fi
 
+
+# Planning session (read-only flags in argv). FAKE_PLAN_MODE: valid (default),
+# invalid_then_valid (duplicate title; valid after a resume), wrong_agent_then_valid,
+# fenced (plan wrapped in a ```markdown fence), no_markers, always_invalid, fail, slow.
+# A resume keeps the same session id.
+plan_text() {
+    # $1: agent line value, $2: second phase title. JSON-escaped, markers included.
+    printf '%s' '<<<PHASEWISE-PLAN\n+++\nagent = \"'"$1"'\"\n+++\n\n# Fake plan\n\nShared context.\n\n## Phase 1: First\n\nDo one.\n\n```verify\ntrue\n```\n\n## Phase 2: '"$2"'\n\nDo two.\nPHASEWISE-PLAN>>>'
+}
+
+plan_answer() {
+    # $1: this agent, $2: the other agent, $3: "resume" when resuming.
+    case "${FAKE_PLAN_MODE:-valid}" in
+        invalid_then_valid)
+            if [ -n "$3" ]; then plan_text "$1" Second; else plan_text "$1" First; fi
+            ;;
+        wrong_agent_then_valid)
+            if [ -n "$3" ]; then plan_text "$1" Second; else plan_text "$2" Second; fi
+            ;;
+        always_invalid) plan_text "$1" First ;;
+        fenced)
+            printf '%s' '<<<PHASEWISE-PLAN\n```markdown\n+++\nagent = \"'"$1"'\"\n+++\n\n## Phase 1: First\n\nDo one.\n\n```verify\ntrue\n```\n\n## Phase 2: Second\n\nDo two.\n```\nPHASEWISE-PLAN>>>'
+            ;;
+        no_markers) printf '%s' 'Here is my plan, but I forgot the markers.' ;;
+        *) plan_text "$1" Second ;;
+    esac
+}
+
 prompt=$(cat)
 
 resume=""
@@ -26,6 +54,8 @@ if [ -n "$resume" ]; then
 else
     n=$(printf '%s\n' "$prompt" | sed -n 's/^## Your task: phase \([0-9][0-9]*\) of .*/\1/p' | head -n 1)
 fi
+# Planning sessions have no phase number.
+case " $* " in *" Read,Grep,Glob "*) n=plan ;; esac
 sid="fake-session-$n"
 
 eval "mode=\${FAKE_MODE_$n:-}"
@@ -41,6 +71,23 @@ if [ -n "$FAKE_LOG_DIR" ]; then
         printf '%s\n' "$prompt"
     } >> "$FAKE_LOG_DIR/calls.log"
 fi
+
+case " $* " in
+    *" Read,Grep,Glob "*)
+        psid=${resume:-fake-plan-session}
+        printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$psid"
+        if [ "${FAKE_PLAN_MODE:-valid}" = "slow" ]; then
+            exec sleep 600
+        fi
+        printf '{"type":"assistant","session_id":"%s","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Reading the project."},{"type":"tool_use","id":"toolu_p","name":"Read","input":{"file_path":"README.md"}}]}}\n' "$psid"
+        if [ "${FAKE_PLAN_MODE:-valid}" = "fail" ]; then
+            printf '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"fake planning failure","session_id":"%s","total_cost_usd":0.001}\n' "$psid"
+            exit 1
+        fi
+        printf '{"type":"result","subtype":"success","is_error":false,"result":"%s","session_id":"%s","total_cost_usd":0.02}\n' "$(plan_answer claude codex "$resume")" "$psid"
+        exit 0
+        ;;
+esac
 
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$sid"
 

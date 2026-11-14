@@ -131,6 +131,29 @@ impl Agent for CodexAgent {
         cmd
     }
 
+    fn plan_command(
+        &self,
+        root: &Path,
+        options: &LaunchOptions,
+        resume_session: Option<&str>,
+    ) -> Command {
+        let mut cmd = Command::new(self.program());
+        cmd.current_dir(root)
+            .args(["exec", "--json", "--sandbox", "read-only"]);
+        if let Some(model) = &options.model {
+            cmd.args(["-m", model]);
+        }
+        if let Some(effort) = &options.effort {
+            cmd.arg("-c")
+                .arg(format!("model_reasoning_effort=\"{effort}\""));
+        }
+        if let Some(session) = resume_session {
+            cmd.args(["resume", session]);
+        }
+        cmd.arg("-");
+        cmd
+    }
+
     fn list_models(&self) -> Result<Vec<ModelInfo>> {
         let output = run_listing(
             &self.program(),
@@ -506,6 +529,41 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn plan_command_is_read_only() {
+        let agent = CodexAgent;
+        let root = Path::new("/work/repo");
+        let fixed = ["exec", "--json", "--sandbox", "read-only"];
+        let both = LaunchOptions {
+            model: Some("gpt-fast".into()),
+            effort: Some("high".into()),
+        };
+        let none = LaunchOptions::default();
+        let new = agent.plan_command(root, &none, None);
+        let mut expected: Vec<&str> = fixed.to_vec();
+        expected.push("-");
+        assert_eq!(argv(&new), expected);
+        assert_eq!(new.get_current_dir(), Some(root));
+        let opts = ["-m", "gpt-fast", "-c", "model_reasoning_effort=\"high\""];
+        let mut expected: Vec<&str> = fixed.to_vec();
+        expected.extend(opts);
+        expected.push("-");
+        assert_eq!(argv(&agent.plan_command(root, &both, None)), expected);
+        let mut expected: Vec<&str> = fixed.to_vec();
+        expected.extend(opts);
+        expected.extend(["resume", "tid", "-"]);
+        assert_eq!(
+            argv(&agent.plan_command(root, &both, Some("tid"))),
+            expected
+        );
+        let mut expected: Vec<&str> = fixed.to_vec();
+        expected.extend(["resume", "tid", "-"]);
+        assert_eq!(
+            argv(&agent.plan_command(root, &none, Some("tid"))),
+            expected
+        );
     }
 
     #[test]

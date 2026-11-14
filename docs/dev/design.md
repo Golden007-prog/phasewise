@@ -19,8 +19,8 @@ with the code, and record the reason in `decisions.md`.
 | `verify.rs` | Runs verification commands with a timeout, appends to `verify.log`. |
 | `agent/mod.rs` | `Agent` trait, `AgentEvent`, `AgentParser`, `agent_for(kind)`. |
 | `agent/claude.rs`, `agent/codex.rs` | Command building and stdout translation per agent. |
-| `engine.rs` | One phase cycle: agent → verify → retries → checkpoint. Emits `EngineEvent`s. |
-| `ops.rs` | Run-level operations shared by CLI and TUI: start, approve/next, retry, rollback, abort, load active run. |
+| `engine.rs` | One phase cycle: agent → verify → retries → checkpoint. Emits `EngineEvent`s. `run_agent_session` (spawn, stdin, reader thread, logs, timeout, cancel, leftovers) is shared with `ops::create_plan`. |
+| `ops.rs` | Run-level operations shared by CLI and TUI: start, approve/next, retry, rollback, abort, load active run, `create_plan` (`phasewise plan`, emits `PlanEvent`s). |
 | `display.rs` | The one place that turns events into text: structured `EventLine`s (time, icon, label, detail, role), phase header and summary, status labels. Rendered by the CLI (via `Styler`) and the TUI (ratatui styles). See `design-v0.2.md` §1. |
 | `style.rs` | `Styler` and `Role`: ANSI colour for the CLI output, only on a terminal with `NO_COLOR` unset or empty and `TERM` not `dumb`. |
 | `doctor.rs` | `phasewise doctor`: presence and version of git, claude and codex, repository suitability. |
@@ -65,6 +65,7 @@ pub fn load(path: &Path) -> anyhow::Result<Plan>;             // errors rendered
 - `verify_failure_report(command, exit_code: Option<i32>, timed_out, timeout_secs, output_tail) -> String`.
 - `resume_prompt(report) -> String`: sent when continuing the same session after a failed verification.
 - `fresh_retry_prompt(phase_prompt, report) -> String`: phase prompt + `## Previous attempt failed verification` + report (used when no session id is known).
+- `plan_prompt(goal, agent, models: Option<&[ModelInfo]>)`, `plan_repair_prompt(problems)`, `plan_retry_prompt(original, problems)`, `extract_plan(text)`, `unwrap_fence(text)` and the marker constants: see `design-v0.2.md` section 3.
 - `one_line_summary(summary: Option<&str>) -> String`: first non-empty line, at most 200 chars, or `(no summary)`.
 
 ## Git (`git.rs`)

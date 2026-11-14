@@ -2,6 +2,7 @@
 
 use crate::agent::AgentEvent;
 use crate::engine::EngineEvent;
+use crate::ops::PlanEvent;
 use crate::state::{FailureKind, PhaseStatus};
 use crate::style::{Role, Styler};
 
@@ -221,7 +222,72 @@ pub fn phase_header(event: &EngineEvent, agent: &str, styler: &Styler) -> Option
     ))
 }
 
-fn money(cost: f64) -> String {
+/// Heading of a planning session: `▶ Planning · claude · opus · high`.
+pub fn plan_header(event: &PlanEvent, styler: &Styler) -> Option<String> {
+    let PlanEvent::Started {
+        agent,
+        model,
+        effort,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let mut parts = vec!["▶ Planning".to_string(), agent.to_string()];
+    parts.extend(model.clone());
+    parts.extend(effort.clone());
+    Some(styler.heading(&parts.join(" · ")))
+}
+
+/// Line for a planning event; `None` for the heading (see [`plan_header`]) and
+/// for agent events with nothing to show.
+pub fn plan_event_line(event: &PlanEvent) -> Option<EventLine> {
+    Some(match event {
+        PlanEvent::Started { .. } => return None,
+        PlanEvent::Agent { event } => {
+            // The answer that carries the plan would show as its marker line.
+            if let AgentEvent::Message { text, .. } = event
+                && let Some(plan) = crate::prompt::extract_plan(text)
+            {
+                let lines = plan.lines().count();
+                return Some(EventLine::new(
+                    "›",
+                    "",
+                    format!("Plan draft ({lines} lines)"),
+                    Role::Default,
+                ));
+            }
+            return agent_event_line(event);
+        }
+        PlanEvent::AttemptFinished { exit_code, .. } => {
+            return event_line(
+                &EngineEvent::AgentExited {
+                    phase: 0,
+                    exit_code: *exit_code,
+                },
+                0,
+            );
+        }
+        PlanEvent::Repairing { round, problems } => EventLine::new(
+            "!",
+            "Repair",
+            format!(
+                "round {round}: {}",
+                problems
+                    .iter()
+                    .map(|p| first_line_short(p))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Role::Warn,
+        ),
+        PlanEvent::Written { path } => {
+            EventLine::new("✓", "Written", path.display().to_string(), Role::Ok)
+        }
+    })
+}
+
+pub fn money(cost: f64) -> String {
     if cost < 0.01 {
         format!("${cost:.4}")
     } else {
@@ -570,6 +636,65 @@ mod tests {
         assert_eq!(text(&failed), "✗ Phase 2 failed (verify_failed)");
         assert!(
             phase_summary(&failed, &Styler { color: true }).is_some_and(|s| s.contains("\x1b["))
+        );
+    }
+
+    #[test]
+    fn plan_event_lines() {
+        let plain = Styler { color: false };
+        let render = |e: PlanEvent| plan_event_line(&e).map(|l| l.render(&plain));
+        let message = |text: &str| PlanEvent::Agent {
+            event: AgentEvent::Message {
+                text: text.into(),
+                subagent: false,
+            },
+        };
+        assert_eq!(
+            render(message("<<<PHASEWISE-PLAN\n## A\n\nDo.\nPHASEWISE-PLAN>>>")).as_deref(),
+            Some("  › Plan draft (3 lines)")
+        );
+        assert_eq!(
+            render(message("Reading the project.")).as_deref(),
+            Some("  › Reading the project.")
+        );
+        // An unfinished draft is only an ordinary message.
+        assert_eq!(
+            render(message("<<<PHASEWISE-PLAN\n## A")).as_deref(),
+            Some("  › <<<PHASEWISE-PLAN")
+        );
+        assert_eq!(
+            render(PlanEvent::Repairing {
+                round: 2,
+                problems: vec!["first\nmore".into(), "second".into()],
+            })
+            .as_deref(),
+            Some("  ! Repair   round 2: first; second")
+        );
+        assert_eq!(
+            render(PlanEvent::Written {
+                path: "phasewise.md".into(),
+            })
+            .as_deref(),
+            Some("  ✓ Written  phasewise.md")
+        );
+        assert_eq!(
+            render(PlanEvent::AttemptFinished {
+                attempt: 1,
+                exit_code: Some(0),
+            })
+            .as_deref(),
+            Some("  ✓ Agent finished")
+        );
+        let started = PlanEvent::Started {
+            plan_id: "id".into(),
+            agent: crate::plan::AgentKind::Codex,
+            model: Some("gpt-x".into()),
+            effort: None,
+        };
+        assert!(plan_event_line(&started).is_none());
+        assert_eq!(
+            plan_header(&started, &plain).as_deref(),
+            Some("▶ Planning · codex · gpt-x")
         );
     }
 }

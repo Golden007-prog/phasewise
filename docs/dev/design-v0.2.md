@@ -289,7 +289,8 @@ The prompt is in English. It tells the agent:
 - how to choose models. The prompt includes the agent's model list and says to
   leave the model unset unless a phase clearly needs a stronger or cheaper
   model;
-- to read the project first and never modify files;
+- to read the project first and never modify files (read-only commands such
+  as `ls`, `cat` or `rg` are allowed where the agent's tools allow them);
 - **the output protocol:** the final answer must contain the complete plan
   between a line `<<<PHASEWISE-PLAN` and a line `PHASEWISE-PLAN>>>`.
 
@@ -299,9 +300,11 @@ The prompt is in English. It tells the agent:
    This is `Finished.summary`, which the parsers keep in full.
 2. Take the content between the last `<<<PHASEWISE-PLAN` line and the next
    `PHASEWISE-PLAN>>>` line. Marker lines are matched after trimming.
-3. Validate it with `plan::parse`, and check that its agent equals the chosen
+3. If its first and last non-empty lines are one code fence (```` ``` ````,
+   ```` ```markdown ````, ```` ```md ```` or `~~~`), remove that fence.
+4. Validate it with `plan::parse`, and check that its agent equals the chosen
    agent.
-4. If the agent failed, the markers are missing or the plan is invalid, run a
+5. If the agent failed, the markers are missing or the plan is invalid, run a
    repair round: resume the same session (Codex with `--sandbox read-only`),
    send the list of problems, and ask for the complete corrected plan between
    the markers. At most two repair rounds.

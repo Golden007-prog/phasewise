@@ -1,7 +1,7 @@
 //! Run-level operations shared by the CLI and the TUI. Never prints; progress
 //! goes through `EngineEvent`s.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
@@ -9,10 +9,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use jiff::Timestamp;
 
-use crate::agent::agent_for;
-use crate::engine::{EngineEvent, PhaseContext, PhaseSettings, run_phase};
+use crate::agent::{AgentEvent, LaunchOptions, agent_for};
+use crate::engine::{
+    AgentSession, EngineEvent, PhaseContext, PhaseSettings, run_agent_session, run_phase,
+};
 use crate::git::Git;
 use crate::plan::{self, AgentKind, Plan};
+use crate::prompt;
 use crate::state::{
     LockGuard, PhaseStatus, PhasewiseDir, RunPaths, RunState, RunStatus, load_locked,
     load_with_recovery, lock_holder, new_run_id, run_branch_name, write_atomic,
@@ -21,6 +24,10 @@ use crate::state::{
 const KILL_GRACE: Duration = Duration::from_secs(5);
 const MAX_DIRTY_LISTED: usize = 10;
 const PHASE_TIMEOUT_ENV: &str = "PHASEWISE_PHASE_TIMEOUT_SECONDS";
+const PLAN_TIMEOUT_ENV: &str = "PHASEWISE_PLAN_TIMEOUT_SECONDS";
+const PLAN_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// Repair rounds after the first answer of `phasewise plan`.
+const MAX_PLAN_REPAIRS: u32 = 2;
 
 /// A loaded run: repository, files, state and the plan copy it was started with.
 pub struct Run {
@@ -668,6 +675,324 @@ fn execute_locked(
             return Ok(status);
         }
         approve(run)?;
+    }
+}
+
+/// What `phasewise plan` asks for.
+#[derive(Debug, Clone)]
+pub struct PlanRequest {
+    pub goal: String,
+    pub agent: AgentKind,
+    pub options: LaunchOptions,
+    /// Where to write the plan; `None` is the default plan path.
+    pub output: Option<PathBuf>,
+    /// Overwrite an existing output file.
+    pub force: bool,
+    /// Limit for each agent session.
+    pub timeout: Duration,
+}
+
+/// What `create_plan` reports while it works.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanEvent {
+    Started {
+        plan_id: String,
+        agent: AgentKind,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    Agent {
+        event: AgentEvent,
+    },
+    /// One agent session ended (`attempt` starts at 1).
+    AttemptFinished {
+        attempt: u32,
+        exit_code: Option<i32>,
+    },
+    /// The answer was unusable; the agent is asked again (`round` starts at 1).
+    Repairing {
+        round: u32,
+        problems: Vec<String>,
+    },
+    Written {
+        path: PathBuf,
+    },
+}
+
+/// How `create_plan` ended.
+#[derive(Debug)]
+pub enum PlanResult {
+    Written {
+        path: PathBuf,
+        plan: Plan,
+    },
+    Failed {
+        problems: Vec<String>,
+        /// Last draft the agent produced, if any.
+        last_draft: Option<PathBuf>,
+        cancelled: bool,
+    },
+}
+
+#[derive(Debug)]
+pub struct PlanOutcome {
+    pub plan_id: String,
+    /// Where the agent's output and the drafts are.
+    pub dir: PathBuf,
+    /// Sum of the costs the agent reported, when it reported any.
+    pub cost_usd: Option<f64>,
+    pub result: PlanResult,
+}
+
+/// Repository and output path of a `phasewise plan` call.
+#[derive(Debug)]
+pub struct PlanTarget {
+    pub git: Git,
+    pub output: PathBuf,
+}
+
+/// Checks that can fail before the agent starts: the repository and the
+/// output path (relative paths are relative to `cwd`; the default is the
+/// default plan path). An existing output is refused without `force`.
+pub fn prepare_plan(cwd: &Path, output: Option<&Path>, force: bool) -> Result<PlanTarget> {
+    let git = Git::discover(cwd)?;
+    let output = match output {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => cwd.join(path),
+        None => git.root().join(plan::DEFAULT_PLAN_FILE),
+    };
+    if output.exists() && !force {
+        bail!(
+            "{} already exists. Choose another path with `--output`, or pass `--force` to overwrite it.",
+            output.display()
+        );
+    }
+    if output.is_dir() {
+        bail!(
+            "{} is a directory. Choose a file path with `--output`.",
+            output.display()
+        );
+    }
+    Ok(PlanTarget { git, output })
+}
+
+/// Timeout of one planning session: 20 minutes, or `PHASEWISE_PLAN_TIMEOUT_SECONDS`.
+pub fn plan_timeout() -> Result<Duration> {
+    match std::env::var(PLAN_TIMEOUT_ENV) {
+        Ok(value) => value.trim().parse().map(Duration::from_secs).map_err(|_| {
+            anyhow!(
+                "{PLAN_TIMEOUT_ENV} must be a whole number of seconds, got `{value}`. \
+Unset it or fix the value."
+            )
+        }),
+        Err(_) => Ok(PLAN_TIMEOUT),
+    }
+}
+
+/// Asks the agent (read-only) to write a plan for the goal, checks it and, if
+/// it is valid, writes it to the output path. Unusable answers are sent back
+/// to the same session, at most twice. Nothing is written to the output path
+/// on failure. Never prints; progress goes through `events`.
+pub fn create_plan(
+    cwd: &Path,
+    request: &PlanRequest,
+    events: &Sender<PlanEvent>,
+    cancel: &AtomicBool,
+) -> Result<PlanOutcome> {
+    let target = prepare_plan(cwd, request.output.as_deref(), request.force)?;
+    let git = &target.git;
+    git.ensure_excluded(".phasewise/")?;
+    let plan_id = new_run_id(Timestamp::now());
+    let dir = PhasewiseDir::new(git.root())
+        .dir()
+        .join("plans")
+        .join(&plan_id);
+    std::fs::create_dir_all(&dir).with_context(|| format!("Cannot create {}", dir.display()))?;
+
+    let agent = agent_for(request.agent);
+    let models = agent.list_models().ok();
+    let base_prompt = prompt::plan_prompt(&request.goal, request.agent, models.as_deref());
+    let emit = |event: PlanEvent| {
+        let _ = events.send(event);
+    };
+    emit(PlanEvent::Started {
+        plan_id: plan_id.clone(),
+        agent: request.agent,
+        model: request.options.model.clone(),
+        effort: request.options.effort.clone(),
+    });
+
+    let mut cost_usd: Option<f64> = None;
+    let mut last_draft: Option<PathBuf> = None;
+    let mut session: Option<String> = None;
+    let mut next_prompt = base_prompt.clone();
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let command = agent.plan_command(git.root(), &request.options, session.as_deref());
+        let stdout_log = dir.join(format!("attempt-{attempt}.jsonl"));
+        let stderr_log = dir.join(format!("attempt-{attempt}.stderr.log"));
+        let run = run_agent_session(
+            AgentSession {
+                command,
+                prompt: next_prompt.clone(),
+                stdout_log: &stdout_log,
+                stderr_log: &stderr_log,
+                parser: agent.parser(git.root()),
+                timeout: request.timeout,
+                kill_grace: KILL_GRACE,
+                cancel,
+            },
+            &mut |event| {
+                emit(PlanEvent::Agent { event });
+                Ok(())
+            },
+        )?;
+        if run.spawn_error.is_none() {
+            emit(PlanEvent::AttemptFinished {
+                attempt,
+                exit_code: run.exit_code,
+            });
+        }
+        if let Some(cost) = run.cost_usd {
+            cost_usd = Some(cost_usd.unwrap_or(0.0) + cost);
+        }
+        if run.session_id.is_some() {
+            session = run.session_id.clone();
+        }
+        let failed = |problems: Vec<String>, last_draft: Option<PathBuf>, cancelled: bool| {
+            Ok(PlanOutcome {
+                plan_id: plan_id.clone(),
+                dir: dir.clone(),
+                cost_usd,
+                result: PlanResult::Failed {
+                    problems,
+                    last_draft,
+                    cancelled,
+                },
+            })
+        };
+
+        // Timeouts, cancellation and a missing binary are not worth another round.
+        let name = request.agent;
+        if let Some(error) = &run.spawn_error {
+            return failed(
+                vec![format!(
+                    "Cannot start {name}: {error}. Install it or run `phasewise doctor`."
+                )],
+                last_draft,
+                false,
+            );
+        }
+        if run.cancelled {
+            return failed(
+                vec!["interrupted by the user (Ctrl-C)".into()],
+                last_draft,
+                true,
+            );
+        }
+        if run.timed_out {
+            return failed(
+                vec![format!(
+                    "{name} did not finish within {} s and was stopped. Try again, or raise \
+PHASEWISE_PLAN_TIMEOUT_SECONDS",
+                    request.timeout.as_secs()
+                )],
+                last_draft,
+                false,
+            );
+        }
+
+        let problems = match check_plan_answer(&run, request.agent) {
+            Ok((text, plan)) => {
+                save_draft(&dir, attempt, &text);
+                write_atomic(&target.output, text.as_bytes())?;
+                emit(PlanEvent::Written {
+                    path: target.output.clone(),
+                });
+                return Ok(PlanOutcome {
+                    plan_id,
+                    dir,
+                    cost_usd,
+                    result: PlanResult::Written {
+                        path: target.output.clone(),
+                        plan,
+                    },
+                });
+            }
+            Err((draft, problems)) => {
+                if let Some(text) = draft
+                    && let Some(path) = save_draft(&dir, attempt, &text)
+                {
+                    last_draft = Some(path);
+                }
+                problems
+            }
+        };
+        let round = attempt;
+        if round > MAX_PLAN_REPAIRS {
+            return failed(problems, last_draft, false);
+        }
+        emit(PlanEvent::Repairing {
+            round,
+            problems: problems.clone(),
+        });
+        next_prompt = if session.is_some() {
+            prompt::plan_repair_prompt(&problems)
+        } else {
+            prompt::plan_retry_prompt(&base_prompt, &problems)
+        };
+    }
+}
+
+/// Writes `draft-K.md`; a failure only loses the draft, so it is ignored.
+fn save_draft(dir: &Path, attempt: u32, text: &str) -> Option<PathBuf> {
+    let path = dir.join(format!("draft-{attempt}.md"));
+    write_atomic(&path, text.as_bytes()).ok().map(|()| path)
+}
+
+type Draft = Option<String>;
+
+/// The valid plan text of an agent answer, or the draft found (if any) and the
+/// problems to send back.
+fn check_plan_answer(
+    run: &crate::engine::AgentRun,
+    agent: AgentKind,
+) -> Result<(String, Plan), (Draft, Vec<String>)> {
+    if run.exit_code != Some(0) || run.finished_ok == Some(false) {
+        let code = run
+            .exit_code
+            .map_or_else(|| "no exit code".to_string(), |c| format!("exit code {c}"));
+        let mut problem = format!("{agent} failed ({code})");
+        if let Some(text) = &run.error_text {
+            problem.push_str(&format!(": {text}"));
+        }
+        return Err((None, vec![problem]));
+    }
+    let Some(text) = run.final_text.as_deref().and_then(prompt::extract_plan) else {
+        return Err((
+            None,
+            vec![format!(
+                "the answer has no plan between a line `{}` and a line `{}`",
+                prompt::PLAN_START,
+                prompt::PLAN_END
+            )],
+        ));
+    };
+    // A fence around the whole plan is removed. It must not be parsed as part
+    // of the plan: an inner ```verify fence does not close it, but the inner
+    // closing fence does, so the wrapped text can parse as a shorter plan.
+    let text = prompt::unwrap_fence(&text).unwrap_or(text);
+    match plan::parse(&text) {
+        Ok(plan) if plan.config.agent == agent => Ok((text, plan)),
+        Ok(plan) => Err((
+            Some(text),
+            vec![format!(
+                "the front matter sets agent = \"{}\" but it must set agent = \"{agent}\"",
+                plan.config.agent
+            )],
+        )),
+        Err(errors) => Err((Some(text), errors.iter().map(ToString::to_string).collect())),
     }
 }
 

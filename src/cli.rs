@@ -12,11 +12,15 @@ use anyhow::{Context, Result, anyhow};
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
+use crate::agent::LaunchOptions;
 use crate::agent::{ModelInfo, agent_for};
-use crate::display::{event_line, failure_kind_label, phase_header, phase_summary, status_label};
+use crate::display::{
+    event_line, failure_kind_label, money, phase_header, phase_summary, plan_event_line,
+    plan_header, status_label,
+};
 use crate::engine::EngineEvent;
 use crate::git::Git;
-use crate::ops::{self, NextOutcome, Overrides, Run};
+use crate::ops::{self, NextOutcome, Overrides, PlanEvent, PlanRequest, PlanResult, Run};
 use crate::plan::{self, AgentKind};
 use crate::process;
 use crate::state::{PhaseStatus, RunStatus};
@@ -41,7 +45,7 @@ macro_rules! out {
 }
 
 const INTERRUPT_NOTICE: &str = "Interrupting… (press Ctrl-C again to quit immediately)";
-const PLAN_FILE: &str = "phasewise.md";
+const PLAN_FILE: &str = plan::DEFAULT_PLAN_FILE;
 const PLAN_TEMPLATE: &str = include_str!("templates/phasewise.md");
 
 /// Agent selectable from the command line.
@@ -120,6 +124,30 @@ pub enum Command {
         auto: bool,
         #[command(flatten)]
         settings: SettingsArgs,
+    },
+
+    /// Ask the agent to write a plan for a goal (read-only; the agent changes nothing)
+    #[command(
+        after_help = "Examples:\n  phasewise plan \"Add a stats subcommand\"\n  phasewise plan \"Migrate to clap 4\" --agent codex --output docs/plan.md"
+    )]
+    Plan {
+        /// What you want to do (asked on a terminal when missing)
+        goal: Option<String>,
+        /// Agent that writes the plan and will run it (default: claude)
+        #[arg(long, value_enum)]
+        agent: Option<AgentArg>,
+        /// Model for the planning session and the plan's agent line
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Effort for the planning session: low, medium, high, xhigh or max
+        #[arg(long, value_name = "EFFORT")]
+        effort: Option<String>,
+        /// Where to write the plan (default: phasewise.md at the repository root)
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Overwrite the output file if it exists
+        #[arg(long)]
+        force: bool,
     },
 
     /// Approve the phase awaiting review and launch the next one
@@ -234,6 +262,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             auto,
             settings,
         }) => run_command(plan, agent, auto, &settings),
+        Some(Command::Plan {
+            goal,
+            agent,
+            model,
+            effort,
+            output,
+            force,
+        }) => plan_command(goal, agent, model, effort, output, force),
         Some(Command::Next { auto, settings }) => next_command(auto, &settings),
         Some(Command::Retry { note, settings }) => retry_command(note, &settings),
         Some(Command::Models { agent }) => models_command(agent),
@@ -490,6 +526,172 @@ fn run_command(
     drive(run, move |run, events, cancel| {
         ops::execute(run, auto, events, cancel).map(NextOutcome::Ran)
     })
+}
+
+/// `--model` / `--effort` of `plan`; `default` means no flag.
+fn plan_options(model: Option<String>, effort: Option<String>) -> Result<LaunchOptions> {
+    let pick = |value: Option<String>, check: fn(&str) -> Result<(), String>, flag: &str| {
+        value
+            .filter(|v| v != "default")
+            .map(|v| {
+                check(&v)
+                    .map(|()| v)
+                    .map_err(|e| anyhow!("Invalid --{flag}: {e}."))
+            })
+            .transpose()
+    };
+    Ok(LaunchOptions {
+        model: pick(model, plan::validate_model, "model")?,
+        effort: pick(effort, plan::validate_effort, "effort")?,
+    })
+}
+
+/// The goal from the command line, or asked on a terminal.
+fn read_goal(goal: Option<String>) -> Result<String> {
+    let goal = match goal {
+        Some(goal) => goal,
+        None => {
+            if !std::io::stdin().is_terminal() {
+                return Err(anyhow!(
+                    "No goal given and stdin is not a terminal. Pass it as an argument: \
+`phasewise plan \"what you want to do\"`."
+                ));
+            }
+            out!("What do you want to do? ");
+            let _ = std::io::stdout().flush();
+            let mut answer = String::new();
+            std::io::stdin()
+                .read_line(&mut answer)
+                .context("Cannot read the goal from stdin. Pass it as an argument.")?;
+            answer
+        }
+    };
+    let goal = goal.trim().to_string();
+    if goal.is_empty() {
+        return Err(anyhow!(
+            "The goal is empty. Say what you want to do: `phasewise plan \"what you want to do\"`."
+        ));
+    }
+    Ok(goal)
+}
+
+fn plan_command(
+    goal: Option<String>,
+    agent: Option<AgentArg>,
+    model: Option<String>,
+    effort: Option<String>,
+    output: Option<PathBuf>,
+    force: bool,
+) -> Result<ExitCode> {
+    let options = plan_options(model, effort)?;
+    let timeout = ops::plan_timeout()?;
+    let cwd = current_dir()?;
+    // Refuse an existing output before asking anything.
+    let target = ops::prepare_plan(&cwd, output.as_deref(), force)?;
+    let goal = read_goal(goal)?;
+    let request = PlanRequest {
+        goal,
+        agent: agent.map_or(AgentKind::Claude, AgentKind::from),
+        options,
+        output: Some(target.output.clone()),
+        force,
+        timeout,
+    };
+    let default_output = target.git.root().join(plan::DEFAULT_PLAN_FILE);
+    let cancel = process::install_signal_handler(Some(INTERRUPT_NOTICE))?;
+    let (tx, rx) = mpsc::channel::<PlanEvent>();
+    let shown_from = cwd.clone();
+    // Paths inside the current directory are shown relative to it.
+    let shown = |path: &Path| path.strip_prefix(&shown_from).unwrap_or(path).to_path_buf();
+    let worker = thread::spawn(move || ops::create_plan(&cwd, &request, &tx, &cancel));
+    let started = Instant::now();
+    let st = Styler::for_stdout();
+    for event in rx {
+        let event = match event {
+            PlanEvent::Written { path } => PlanEvent::Written { path: shown(&path) },
+            other => other,
+        };
+        if let Some(header) = plan_header(&event, &st) {
+            outln!("{header}");
+        } else if let Some(line) = plan_event_line(&event) {
+            outln!("{}", line.at(started.elapsed().as_secs()).render(&st));
+        }
+    }
+    let outcome = worker
+        .join()
+        .map_err(|_| anyhow!("The planning thread panicked. This is a bug; please report it."))??;
+    let cost = outcome
+        .cost_usd
+        .map(|c| st.dim(&format!("Cost: {}", money(c))));
+    match outcome.result {
+        PlanResult::Written { path, plan } => {
+            let is_default = path == default_output;
+            let path = shown(&path);
+            outln!();
+            print_plan(&plan, &path);
+            if let Some(cost) = cost {
+                outln!("{cost}");
+            }
+            let run_cmd = if is_default {
+                "phasewise run".to_string()
+            } else {
+                format!("phasewise run {}", shell_arg(&path))
+            };
+            outln!();
+            outln!("Next steps:");
+            outln!("  1. Review and edit {}.", path.display());
+            outln!("  2. Commit it (`phasewise run` needs a clean working tree).");
+            outln!("  3. {run_cmd}");
+            Ok(ExitCode::SUCCESS)
+        }
+        PlanResult::Failed {
+            problems,
+            last_draft,
+            cancelled,
+        } => {
+            outln!();
+            let head = if cancelled {
+                "Planning was interrupted. No plan was written."
+            } else {
+                "phasewise could not get a valid plan. Nothing was written to the output path."
+            };
+            eprintln!("{head}");
+            for problem in &problems {
+                eprintln!("  - {problem}");
+            }
+            if let Some(draft) = last_draft {
+                let draft = shown(&draft);
+                eprintln!(
+                    "Last draft: {} (fix it by hand and check it with `phasewise check {}`).",
+                    draft.display(),
+                    shell_arg(&draft)
+                );
+            }
+            eprintln!(
+                "Agent output and drafts: {}. Run `phasewise plan` again to retry.",
+                shown(&outcome.dir).display()
+            );
+            if let Some(cost) = cost {
+                eprintln!("{cost}");
+            }
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
+/// A path as one shell word, in single quotes when it has other characters
+/// than letters, digits and `_ . / -`.
+fn shell_arg(path: &Path) -> String {
+    let text = path.display().to_string();
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'));
+    if plain {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 fn next_command(auto: bool, settings: &SettingsArgs) -> Result<ExitCode> {
@@ -924,5 +1126,18 @@ fn colorize(line: &str, color: bool) -> String {
     match code {
         Some(code) => format!("\x1b[{code}m{line}\x1b[0m"),
         None => line.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_arg_quotes_only_when_needed() {
+        assert_eq!(shell_arg(Path::new("docs/plan-2.md")), "docs/plan-2.md");
+        assert_eq!(shell_arg(Path::new("my plan.md")), "'my plan.md'");
+        assert_eq!(shell_arg(Path::new("it's.md")), "'it'\\''s.md'");
+        assert_eq!(shell_arg(Path::new("")), "''");
     }
 }

@@ -318,3 +318,76 @@ deviates from the original plan, with the reason.
 - **Fakes.** `fake-codex.sh` answers `debug models` with the synthetic catalog;
   `FAKE_MODELS_MODE=fail|invalid` makes it fail. The catalog fixture is
   unchanged. Both fakes already logged their full argv.
+
+## v0.2 — phasewise plan
+
+- **Shared loop.** `engine::run_agent_session(AgentSession, on_event)` owns
+  everything about one agent process. It returns an `AgentRun` that now also
+  carries the session id, the full final text and the summed cost. The phase
+  code keeps its bookkeeping in the `on_event` callback and emits
+  `AgentExited` itself after the call (not when the agent could not start, as
+  before), so the event order is unchanged.
+- **Read-only command lines.** A new `Agent::plan_command(root, options,
+  resume)` instead of reusing `resume_command`, so the planning flags can never
+  pick up phase permissions or the plan's `agent_args`. Claude resumes with
+  `--resume <id>` after the options; Codex puts `resume <id>` before the `-`.
+- **`ops::prepare_plan`.** The checks before the agent starts (repository,
+  output path, `--force`) are a separate function so the CLI can refuse before
+  asking for the goal. `create_plan` calls it again; the design's signature
+  `create_plan(cwd, request, events, cancel)` is kept, with the output path
+  inside the request.
+- **Result type.** Failures of the work itself (invalid plan, agent error,
+  timeout, cancel) are `PlanResult::Failed`, not `Err`, so the caller can print
+  the problems, the last draft and the cost. `Err` is for problems before or
+  around the run (no repository, existing output, cannot write).
+- **What is repaired.** A non-zero exit or an error from the agent, missing
+  markers, a plan that does not parse and a plan for another agent each cost a
+  repair round (2 at most). A timeout, a cancel and a binary that cannot start
+  are final: another round would only wait again.
+- **Session id.** The latest id seen is used to resume. Without one, the
+  repair is a fresh read-only session whose prompt is the original one plus the
+  problems (`plan_retry_prompt`).
+- **Extraction.** The last start line wins, then the first end line after it.
+  Lines are matched after trimming; CRLF is turned into LF; the plan ends with
+  one newline. Start without end is "no plan".
+- **Fence around the plan.** If the first and last non-empty lines of the
+  extracted text are one code fence (three or more backticks or tildes, info
+  empty, `markdown` or `md`), the fence is removed before parsing
+  (`prompt::unwrap_fence`). Always, not only when the wrapped text is invalid:
+  an inner `` ```verify `` line does not close the outer fence but the inner
+  closing fence does, so the wrapped text can parse as a shorter, valid plan
+  and phases would be lost without any error.
+- **Read-only wording.** The prompt forbids creating, editing or deleting files
+  and building, testing or installing, and allows read-only commands such as
+  `ls`, `cat` or `rg` where the agent's tools allow them. Codex in
+  `--sandbox read-only` explores only through shell commands, so "never run
+  commands" would have left it blind; Claude has no `Bash` tool in this mode
+  anyway.
+- **Model list.** `list_models` runs in the planning flow (Codex runs `codex
+  debug models`). `None` means it failed, and the prompt says that any model
+  name accepted by the CLI works.
+- **Models in the prompt.** The prompt tells the agent to leave `model` unset
+  unless a phase needs a different one, to keep the plan portable.
+- **`--model default` / `--effort default`** mean "no flag", like in section 2.
+  They are not written into the plan: the planning flags only configure the
+  planning session.
+- **Output.** A relative `--output` is relative to the current directory. A
+  directory is refused. The file is written with `state::write_atomic`. Nothing
+  is committed and no branch is created; only `.phasewise/` gets excluded.
+- **Plan id** uses `new_run_id`; the files are `attempt-K.jsonl`,
+  `attempt-K.stderr.log` and `draft-K.md` (a draft exists once markers were
+  found, valid or not).
+- **Display.** `display::plan_header` and `plan_event_line` map `PlanEvent` to
+  the part 1 `EventLine`s: `▶ Planning · agent · model · effort`, `Repair`
+  lines, `Written`. An agent message that carries a complete plan is shown as
+  `› Plan draft (N lines)` instead of its marker line. After success the CLI
+  prints `check`'s summary (`print_plan`), the cost and the next steps
+  (`phasewise run <path>` when the output is not the default). Paths inside the
+  current directory are shown relative to it, and paths in suggested commands
+  are quoted when they contain spaces or other special characters.
+- **Exit codes.** 0 written; 1 any failure, including a first Ctrl-C; 130 on the
+  second signal (the shared handler).
+- **Fakes.** Planning is detected from argv (`Read,Grep,Glob` / `read-only`)
+  and answered according to `FAKE_PLAN_MODE`. The extras beyond the design are
+  the modes `wrong_agent_then_valid` and `fenced` and the session ids
+  `fake-plan-session` / `fake-plan-thread`, kept on resume. The non-planning paths are unchanged.

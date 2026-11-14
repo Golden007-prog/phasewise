@@ -3,7 +3,8 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::process::Stdio;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -172,22 +173,44 @@ struct Launch {
 }
 
 /// Result of one agent process.
-#[derive(Default)]
-struct AgentRun {
-    exit_code: Option<i32>,
-    timed_out: bool,
-    cancelled: bool,
+#[derive(Debug, Default)]
+pub struct AgentRun {
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub cancelled: bool,
     /// `ok` flag of the agent's final event, if it sent one.
-    finished_ok: Option<bool>,
+    pub finished_ok: Option<bool>,
     /// Error text reported by the agent (final error preferred).
-    error_text: Option<String>,
-    spawn_error: Option<String>,
+    pub error_text: Option<String>,
+    pub spawn_error: Option<String>,
+    /// Session (thread) id the agent announced.
+    pub session_id: Option<String>,
+    /// Complete final text of the agent (`Finished.summary`), untruncated.
+    pub final_text: Option<String>,
+    /// Sum of the costs the agent reported, when it reported any.
+    pub cost_usd: Option<f64>,
 }
 
 /// Messages from the stdout reader thread.
 enum Reader {
     Event(AgentEvent),
     Eof,
+}
+
+/// Everything `run_agent_session` needs to launch and follow one agent process.
+pub struct AgentSession<'a> {
+    /// Command line, with the working directory set; stdio is configured here.
+    pub command: Command,
+    /// Written to the agent's stdin.
+    pub prompt: String,
+    /// Raw stdout lines go here.
+    pub stdout_log: &'a Path,
+    pub stderr_log: &'a Path,
+    pub parser: Box<dyn AgentParser>,
+    pub timeout: Duration,
+    /// Grace period between `TERM` and `KILL` when stopping the agent.
+    pub kill_grace: Duration,
+    pub cancel: &'a AtomicBool,
 }
 
 /// Runs one phase until it is `awaiting_review` or `failed`. The caller must
@@ -368,7 +391,7 @@ Run `git switch {run_branch}`, then `phasewise retry` or `phasewise rollback {}`
     Ok(None)
 }
 
-/// Launches the agent, feeds it the prompt and follows it until it ends.
+/// Launches the phase's agent and reports what it does as engine events.
 fn run_agent(
     ctx: &mut PhaseContext,
     phase: usize,
@@ -378,20 +401,59 @@ fn run_agent(
 ) -> Result<AgentRun> {
     let root = ctx.git.root().to_path_buf();
     let extra = &ctx.settings.agent_args;
-    let mut cmd = match &launch.resume_session {
+    let command = match &launch.resume_session {
         Some(session) => ctx.agent.resume_command(&root, session, options, extra),
         None => ctx.agent.new_session_command(&root, options, extra),
     };
-    let stderr_path = ctx.paths.agent_stderr_log(phase, attempt);
-    let stderr_file = File::create(&stderr_path)
-        .with_context(|| format!("Cannot create {}", stderr_path.display()))?;
-    let stdout_path = ctx.paths.agent_stdout_log(phase, attempt);
-    let stdout_file = File::create(&stdout_path)
-        .with_context(|| format!("Cannot create {}", stdout_path.display()))?;
-    cmd.stdin(Stdio::piped())
+    let stdout_log = ctx.paths.agent_stdout_log(phase, attempt);
+    let stderr_log = ctx.paths.agent_stderr_log(phase, attempt);
+    let session = AgentSession {
+        command,
+        prompt: launch.prompt.clone(),
+        stdout_log: &stdout_log,
+        stderr_log: &stderr_log,
+        parser: ctx.agent.parser(&root),
+        timeout: ctx.settings.phase_timeout,
+        kill_grace: ctx.settings.kill_grace,
+        cancel: ctx.cancel,
+    };
+    let run = run_agent_session(session, &mut |event| handle_agent_event(ctx, phase, event))?;
+    if run.spawn_error.is_none() {
+        ctx.emit(EngineEvent::AgentExited {
+            phase,
+            exit_code: run.exit_code,
+        });
+    }
+    Ok(run)
+}
+
+/// Spawns the agent in its own process group, feeds it the prompt, follows it
+/// until it ends (or the timeout or the cancel flag stops it) and returns what
+/// happened. Every parsed event goes to `on_event`, in order, before the next
+/// one is read. Shared by phases and by `phasewise plan`.
+pub fn run_agent_session(
+    session: AgentSession,
+    on_event: &mut dyn FnMut(AgentEvent) -> Result<()>,
+) -> Result<AgentRun> {
+    let AgentSession {
+        mut command,
+        prompt,
+        stdout_log,
+        stderr_log,
+        parser,
+        timeout,
+        kill_grace,
+        cancel,
+    } = session;
+    let stderr_file = File::create(stderr_log)
+        .with_context(|| format!("Cannot create {}", stderr_log.display()))?;
+    let stdout_file = File::create(stdout_log)
+        .with_context(|| format!("Cannot create {}", stdout_log.display()))?;
+    command
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr_file));
-    let mut child = match spawn_in_group(&mut cmd) {
+    let mut child = match spawn_in_group(&mut command) {
         Ok(child) => child,
         Err(e) => {
             return Ok(AgentRun {
@@ -402,7 +464,6 @@ fn run_agent(
     };
 
     if let Some(mut stdin) = child.take_stdin() {
-        let prompt = launch.prompt.clone();
         // A broken pipe only means the agent stopped reading; its exit status tells the rest.
         thread::spawn(move || {
             let _ = stdin.write_all(prompt.as_bytes());
@@ -410,12 +471,11 @@ fn run_agent(
     }
     let (tx, rx) = mpsc::channel();
     if let Some(stdout) = child.take_stdout() {
-        let parser = ctx.agent.parser(&root);
         thread::spawn(move || read_stdout(stdout, stdout_file, parser, tx));
     } else {
         let _ = tx.send(Reader::Eof);
     }
-    follow_agent(ctx, phase, &mut child, &rx)
+    follow_agent(&mut child, &rx, timeout, kill_grace, cancel, on_event)
 }
 
 /// Reader thread: raw lines to the log, parsed events to the engine loop.
@@ -448,12 +508,14 @@ fn read_stdout(
     let _ = tx.send(Reader::Eof);
 }
 
-/// Engine loop of one attempt: forwards events and watches timeout, cancel and exit.
+/// Loop of one agent process: forwards events and watches timeout, cancel and exit.
 fn follow_agent(
-    ctx: &mut PhaseContext,
-    phase: usize,
     child: &mut GroupChild,
     rx: &Receiver<Reader>,
+    timeout: Duration,
+    kill_grace: Duration,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(AgentEvent) -> Result<()>,
 ) -> Result<AgentRun> {
     let mut run = AgentRun::default();
     let started = Instant::now();
@@ -465,21 +527,21 @@ fn follow_agent(
             thread::sleep(POLL);
         } else {
             match rx.recv_timeout(POLL) {
-                Ok(Reader::Event(event)) => handle_agent_event(ctx, phase, event, &mut run)?,
+                Ok(Reader::Event(event)) => track_event(&mut run, event, on_event)?,
                 Ok(Reader::Eof) | Err(RecvTimeoutError::Disconnected) => eof = true,
                 Err(RecvTimeoutError::Timeout) => {}
             }
         }
         if !stopped {
-            if ctx.cancel.load(Ordering::SeqCst) {
+            if cancel.load(Ordering::SeqCst) {
                 run.cancelled = true;
                 stopped = true;
-            } else if started.elapsed() >= ctx.settings.phase_timeout {
+            } else if started.elapsed() >= timeout {
                 run.timed_out = true;
                 stopped = true;
             }
             if stopped {
-                let status = child.terminate(ctx.settings.kill_grace)?;
+                let status = child.terminate(kill_grace)?;
                 run.exit_code = status.code();
                 exited = true;
             }
@@ -503,28 +565,21 @@ fn follow_agent(
             break;
         }
         match rx.recv_timeout(left) {
-            Ok(Reader::Event(event)) => handle_agent_event(ctx, phase, event, &mut run)?,
+            Ok(Reader::Event(event)) => track_event(&mut run, event, on_event)?,
             Ok(Reader::Eof) | Err(_) => eof = true,
         }
     }
-    ctx.emit(EngineEvent::AgentExited {
-        phase,
-        exit_code: run.exit_code,
-    });
     Ok(run)
 }
 
-fn handle_agent_event(
-    ctx: &mut PhaseContext,
-    phase: usize,
-    event: AgentEvent,
+/// Records what the run needs from an event, then hands the event on.
+fn track_event(
     run: &mut AgentRun,
+    event: AgentEvent,
+    on_event: &mut dyn FnMut(AgentEvent) -> Result<()>,
 ) -> Result<()> {
     match &event {
-        AgentEvent::SessionStarted { session_id } => {
-            ctx.phase_state(phase)?.session_id = Some(session_id.clone());
-            ctx.save()?;
-        }
+        AgentEvent::SessionStarted { session_id } => run.session_id = Some(session_id.clone()),
         AgentEvent::Error { detail } => {
             if run.finished_ok != Some(false) {
                 run.error_text = first_line(detail);
@@ -539,6 +594,26 @@ fn handle_agent_event(
             if !ok && let Some(line) = first_line(summary) {
                 run.error_text = Some(line);
             }
+            run.final_text = Some(summary.clone());
+            if let Some(cost) = cost_usd {
+                run.cost_usd = Some(run.cost_usd.unwrap_or(0.0) + cost);
+            }
+        }
+        _ => {}
+    }
+    on_event(event)
+}
+
+/// Phase bookkeeping for one agent event, then the event for the consumers.
+fn handle_agent_event(ctx: &mut PhaseContext, phase: usize, event: AgentEvent) -> Result<()> {
+    match &event {
+        AgentEvent::SessionStarted { session_id } => {
+            ctx.phase_state(phase)?.session_id = Some(session_id.clone());
+            ctx.save()?;
+        }
+        AgentEvent::Finished {
+            summary, cost_usd, ..
+        } => {
             let state = ctx.phase_state(phase)?;
             state.summary = Some(truncate_summary(summary));
             if let Some(cost) = cost_usd {
