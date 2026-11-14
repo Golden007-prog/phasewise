@@ -9,7 +9,7 @@ use phasewise::ops::{self, Run};
 use phasewise::plan::AgentKind;
 use phasewise::state::PhaseStatus;
 use phasewise::tui::data::{
-    LogLine, PlanProblem, PlanState, load_diff, load_home_from, load_log, load_run_view,
+    LogLine, PlanProblem, PlanState, load_diff, load_home, load_home_from, load_log, load_run_view,
     load_verify,
 };
 use tempfile::TempDir;
@@ -171,6 +171,17 @@ fn home_without_a_plan_shows_the_repository_and_a_missing_plan() {
         home.root.canonicalize().ok(),
         repo.path().canonicalize().ok()
     );
+}
+
+#[test]
+fn home_shows_the_plan_path_relative_to_the_directory_it_started_in() {
+    let repo = TestRepo::new();
+    repo.write("phasewise.md", HOME_PLAN);
+    repo.write("src/lib.rs", "");
+    let at_root = load_home(repo.path()).expect("load home");
+    assert_eq!(at_root.plan_rel, "phasewise.md");
+    let in_src = load_home(&repo.path().join("src")).expect("load home");
+    assert_eq!(in_src.plan_rel, "../phasewise.md");
 }
 
 #[test]

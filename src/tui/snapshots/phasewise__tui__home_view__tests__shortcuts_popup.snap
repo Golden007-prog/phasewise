@@ -1,0 +1,28 @@
+---
+source: src/tui/home_view.rs
+expression: render(&home).backend()
+---
+" ╭──────────────────────────────────────────╮                                                       "
+" │ ✻ phasewise 0.3.0                        │                                                       "
+" │   demo · main                            │                                                       "
+" ╰─────────────────────╭───────────────────────────────────────────────────╮                        "
+"                       │ Shortcuts                                         │                        "
+" Demo plan             │                                                   │                        "
+" phasewise.md · 3 phase│ Run                                               │                        "
+"    1  Scaffold the pro│ enter       start the run, or open the active one │                        "
+"    2  Add the parser  │ o           open the last run                     │                        "
+"    3  Write the docs a│                                                   │                        "
+"                       │ Plan                                              │                        "
+" Agent   Claude Code 2.│ p           write a new plan with the agent       │                        "
+" Model   sonnet · from │ c           commit the plan                       │                        "
+" Effort  Default · Clau│                                                   │                        "
+"                       │ Settings                                          │                        "
+" any key close         │ a           switch the agent (resets the model)   │                        "
+"                       │ m           choose the model                      │                        "
+"                       │ e           choose the effort                     │                        "
+"                       │                                                   │                        "
+"                       │ General                                           │                        "
+"                       │ esc         stop the plan being written           │                        "
+"                       │ ?           show or hide the shortcuts            │                        "
+"                       │ q / Ctrl-C  quit                                  │                        "
+"                       ╰───────────────────────────────────────────────────╯                        "

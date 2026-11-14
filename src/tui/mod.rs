@@ -4,8 +4,11 @@ pub mod app;
 pub mod data;
 pub mod home;
 mod home_view;
+#[cfg(test)]
+mod screenshot;
 pub mod shared;
 pub mod view;
+pub mod widgets;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};

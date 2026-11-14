@@ -460,6 +460,10 @@ mod tests {
             has_checkpoint: checkpoint,
             model: None,
             effort: None,
+            cost_usd: None,
+            started_at: None,
+            failure_kind: None,
+            failure_detail: None,
         }
     }
 

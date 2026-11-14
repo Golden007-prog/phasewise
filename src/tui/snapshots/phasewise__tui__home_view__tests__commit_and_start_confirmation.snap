@@ -1,0 +1,28 @@
+---
+source: src/tui/home_view.rs
+expression: render(&home).backend()
+---
+" ╭──────────────────────────────────────────╮                                                       "
+" │ ✻ phasewise 0.3.0                        │                                                       "
+" │   demo · main                            │                                                       "
+" ╰──────────────────────────────────────────╯                                                       "
+"                                                                                                    "
+" Demo plan                                                                                          "
+" phasewise.md · 3 ╭──────────────────────────────────────────────────────────────╮                  "
+"    1  Scaffold th│ phasewise.md is not committed                                │                  "
+"    2  Add the par│ A run needs a clean working tree. Commit the plan and start  │                  "
+"    3  Write the d│ the run?                                                     │                  "
+"                  │                                                              │                  "
+" Agent   Claude Co│ ❯ 1. Commit and start                                        │                  "
+" Model   sonnet · │   2. Cancel                                                  │                  "
+" Effort  Default ·╰──────────────────────────────────────────────────────────────╯                  "
+"                                                                                                    "
+" ! phasewise.md is not committed                                                                    "
+"   git add phasewise.md && git commit -m "Add phasewise plan"                                       "
+"                                                                                                    "
+" enter choose · 1–2 jump · esc cancel                                                               "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "
+"                                                                                                    "

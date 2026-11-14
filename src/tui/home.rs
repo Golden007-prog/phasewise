@@ -23,14 +23,6 @@ const NO_PLAN: &str =
     "There is no plan: press p to write one with the agent, or run `phasewise init`.";
 const INVALID_PLAN: &str = "The plan is invalid: fix it in your editor (this screen updates on its own), press p to write one with the agent, or run `phasewise init`.";
 
-/// The commit command for a plan that is not committed yet.
-pub fn commit_hint() -> String {
-    format!(
-        "git add {} && git commit -m \"Add phasewise plan\"",
-        plan::DEFAULT_PLAN_FILE
-    )
-}
-
 /// Result of looking for an agent's version in the background.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe {
@@ -147,6 +139,8 @@ pub struct Home {
     pub mode: Mode,
     pub message: Option<Notice>,
     pub planning: Option<Planning>,
+    /// When the planning started.
+    pub planning_started: Option<Instant>,
     /// When the plan commit started, while it runs.
     pub committing: Option<Instant>,
     /// A phase of the current run is running (set by the loop every turn).
@@ -174,6 +168,7 @@ impl Home {
             mode: Mode::Normal,
             message: None,
             planning: None,
+            planning_started: None,
             committing: None,
             run_busy: false,
             frame: 0,
@@ -193,9 +188,18 @@ impl Home {
         self.data.run.as_ref().filter(|run| run.active())
     }
 
-    /// The plan file name as shown: relative to the repository root.
+    /// The plan file as shown: relative to the directory phasewise started in.
     pub fn plan_name(&self) -> String {
-        shown(&self.data.plan_path, &self.data.root)
+        self.data.plan_rel.clone()
+    }
+
+    /// The copyable command that commits an uncommitted plan; it works when
+    /// pasted in the terminal phasewise was started from.
+    pub fn commit_hint(&self) -> String {
+        format!(
+            "git add {} && git commit -m \"Add phasewise plan\"",
+            crate::cli::shell_arg(Path::new(&self.data.plan_rel))
+        )
     }
 
     pub fn probe(&self, kind: AgentKind) -> &Probe {
@@ -279,6 +283,7 @@ impl Home {
     /// The agent worker started: from now on the plan panel shows its events.
     pub fn begin_planning(&mut self) {
         self.planning = Some(Planning::default());
+        self.planning_started = Some(Instant::now());
     }
 
     /// Adds what a planning event shows: the heading and/or a line.
@@ -300,6 +305,7 @@ impl Home {
     /// The planning ended: reports its outcome.
     pub fn plan_finished(&mut self, report: PlanReport) {
         self.planning = None;
+        self.planning_started = None;
         match report {
             PlanReport::Success(text) => {
                 self.mode = Mode::Normal;
@@ -330,7 +336,7 @@ impl Home {
                 lines.extend(error.lines().map(str::to_string));
                 lines.push(String::new());
                 lines.push("Commit it yourself:".to_string());
-                lines.push(format!("  {}", commit_hint()));
+                lines.push(format!("  {}", self.commit_hint()));
                 self.mode = Mode::Error(lines);
                 false
             }
@@ -346,7 +352,7 @@ impl Home {
                 "{} is not committed. Commit it first:",
                 self.plan_name()
             ));
-            lines.push(format!("  {}", commit_hint()));
+            lines.push(format!("  {}", self.commit_hint()));
             lines.push(String::new());
         }
         lines.extend(error_lines(err));
@@ -931,6 +937,7 @@ mod tests {
             plan_path: PathBuf::from("/work/demo/phasewise.md"),
             plan,
             plan_uncommitted: false,
+            plan_rel: "phasewise.md".into(),
             run: None,
         }
     }
@@ -1550,6 +1557,23 @@ mod tests {
     }
 
     #[test]
+    fn the_commit_command_is_relative_to_the_directory_phasewise_started_in() {
+        let mut h = valid();
+        assert_eq!(
+            h.commit_hint(),
+            "git add phasewise.md && git commit -m \"Add phasewise plan\""
+        );
+        h.data.plan_rel = "../phasewise.md".into();
+        assert_eq!(
+            h.commit_hint(),
+            "git add ../phasewise.md && git commit -m \"Add phasewise plan\""
+        );
+        assert_eq!(h.plan_name(), "../phasewise.md");
+        h.data.plan_rel = "../my plan.md".into();
+        assert!(h.commit_hint().starts_with("git add '../my plan.md' &&"));
+    }
+
+    #[test]
     fn commit_result_is_reported_as_a_notice_or_an_error_popup() {
         let mut h = valid();
         h.begin_commit();
@@ -1567,7 +1591,7 @@ mod tests {
                 "second line".into(),
                 String::new(),
                 "Commit it yourself:".into(),
-                format!("  {}", commit_hint()),
+                format!("  {}", h.commit_hint()),
             ])
         );
     }

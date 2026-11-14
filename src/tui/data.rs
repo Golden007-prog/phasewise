@@ -8,7 +8,8 @@ use anyhow::Result;
 use crate::agent::AgentEvent;
 use crate::agent::agent_for;
 use crate::display::{
-    EventLine, agent_event_line, failure_kind_label, first_line_short, model_name,
+    EventLine, agent_event_line, failure_kind_label, failure_kind_words, first_line_short,
+    model_name,
 };
 use crate::git::Git;
 use crate::ops::Run;
@@ -40,7 +41,7 @@ impl LogLine {
 
 const NO_VERIFY: &str = "No verification output yet.";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PhaseView {
     pub number: usize,
     pub title: String,
@@ -52,6 +53,13 @@ pub struct PhaseView {
     /// reported, else the requested one. Effort is the requested one.
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Cost of the phase so far, when the agent reported it.
+    pub cost_usd: Option<f64>,
+    /// When the phase started (for the elapsed time of a running one).
+    pub started_at: Option<Timestamp>,
+    /// Failure in plain words (`Checks failed`) and its full detail.
+    pub failure_kind: Option<String>,
+    pub failure_detail: Option<String>,
 }
 
 /// Diff of one phase. `files` holds the path and the added/removed line
@@ -64,7 +72,7 @@ pub struct DiffView {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RunView {
     pub run_id: String,
     pub plan_title: String,
@@ -99,6 +107,13 @@ pub fn load_run_view(run: &Run) -> RunView {
                 .or(p.model.as_ref())
                 .map(|m| model_name(state.agent, m)),
             effort: p.effort.clone(),
+            cost_usd: p.cost_usd,
+            started_at: p.started_at,
+            failure_kind: p
+                .failure
+                .as_ref()
+                .map(|f| failure_kind_words(f.kind).to_string()),
+            failure_detail: p.failure.as_ref().map(|f| f.detail.clone()),
         })
         .collect();
     RunView {
@@ -309,17 +324,43 @@ pub struct HomeData {
     pub plan: PlanState,
     /// The plan file has changes that are not committed.
     pub plan_uncommitted: bool,
+    /// The plan file as written in the terminal phasewise was started from
+    /// (relative to the current directory, e.g. `../phasewise.md`).
+    pub plan_rel: String,
     /// The current run (any status), if the repository has one.
     pub run: Option<RunSummary>,
 }
 
 /// Loads the home data for the repository that contains `cwd`.
 pub fn load_home(cwd: &Path) -> Result<HomeData> {
-    load_home_from(&Git::discover(cwd)?)
+    load_home_in(&Git::discover(cwd)?, cwd)
 }
 
-/// Like [`load_home`], with the repository handle given by the caller.
+/// Like [`load_home`], with the repository handle given by the caller (the
+/// directory is the repository root).
 pub fn load_home_from(git: &Git) -> Result<HomeData> {
+    load_home_in(git, git.root())
+}
+
+/// `path` as seen from the directory `base`: `src/a.md`, `../phasewise.md`.
+/// Both are made absolute and resolved when they exist.
+pub fn relative_path(base: &Path, path: &Path) -> PathBuf {
+    let resolve = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let (base, path) = (resolve(base), resolve(path));
+    let base: Vec<_> = base.components().collect();
+    let target: Vec<_> = path.components().collect();
+    let common = base.iter().zip(&target).take_while(|(a, b)| a == b).count();
+    let mut out = PathBuf::new();
+    for _ in common..base.len() {
+        out.push("..");
+    }
+    for part in &target[common..] {
+        out.push(part.as_os_str());
+    }
+    out
+}
+
+fn load_home_in(git: &Git, cwd: &Path) -> Result<HomeData> {
     let root = git.root().to_path_buf();
     let repo_name = root.file_name().map_or_else(
         || root.display().to_string(),
@@ -329,6 +370,7 @@ pub fn load_home_from(git: &Git) -> Result<HomeData> {
         .current_branch()?
         .unwrap_or_else(|| "detached HEAD".to_string());
     let plan_path = root.join(plan::DEFAULT_PLAN_FILE);
+    let plan_rel = relative_path(cwd, &plan_path).display().to_string();
     let plan = load_plan_state(&plan_path);
     let plan_uncommitted = plan != PlanState::Missing
         && git
@@ -363,6 +405,7 @@ pub fn load_home_from(git: &Git) -> Result<HomeData> {
         plan_path,
         plan,
         plan_uncommitted,
+        plan_rel,
         run,
     })
 }
@@ -408,5 +451,31 @@ fn load_plan_state(path: &Path) -> PlanState {
                 })
                 .collect(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_path_goes_up_from_a_subdirectory() {
+        let rel = |base: &str, path: &str| {
+            relative_path(Path::new(base), Path::new(path))
+                .display()
+                .to_string()
+        };
+        assert_eq!(
+            rel("/nonexistent/r", "/nonexistent/r/phasewise.md"),
+            "phasewise.md"
+        );
+        assert_eq!(
+            rel("/nonexistent/r/src", "/nonexistent/r/phasewise.md"),
+            "../phasewise.md"
+        );
+        assert_eq!(
+            rel("/nonexistent/r/src/a/b", "/nonexistent/r/phasewise.md"),
+            "../../../phasewise.md"
+        );
     }
 }

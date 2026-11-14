@@ -399,6 +399,17 @@ pub fn failure_kind_label(kind: FailureKind) -> &'static str {
     }
 }
 
+/// A failure kind in plain words, for the run screen.
+pub fn failure_kind_words(kind: FailureKind) -> &'static str {
+    match kind {
+        FailureKind::AgentError => "Agent error",
+        FailureKind::VerifyFailed => "Checks failed",
+        FailureKind::Timeout => "Timed out",
+        FailureKind::Interrupted => "Interrupted",
+        FailureKind::CheckpointFailed => "Checkpoint failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

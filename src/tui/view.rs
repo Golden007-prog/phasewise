@@ -1,25 +1,29 @@
-//! Rendering of the TUI. Deterministic: the output depends only on the `App`.
+//! Rendering of the run screen. Deterministic: the output depends only on
+//! the `App`.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use super::app::{App, Mode, Tab};
-use super::data::{DiffView, LogLine};
-use super::shared::{Level, Notice, ShortcutGroups, item};
-use crate::display::{EventLine, status_label};
+use super::data::{DiffView, LogLine, PhaseView};
+use super::shared::spinner;
+use super::widgets::{
+    MIN_HEIGHT, MIN_WIDTH, accent, accent_bold, bold, confirm_popup, dim, dim_join, draw_too_small,
+    elapsed_since, event_spans, footer_line, input_popup, line_width, margin, notice_line,
+    render_popup, role_style, shortcuts_popup, text_width, truncate, wrap_text,
+};
+use crate::display::{money, status_label};
 use crate::state::PhaseStatus;
 use crate::style::Role;
 
-pub const MIN_WIDTH: u16 = 80;
-pub const MIN_HEIGHT: u16 = 20;
-/// The phase panel takes 30 % of the width, within these limits.
-const LIST_PERCENT: u16 = 30;
+/// The phase list is at most this share of the width, and at least `LIST_MIN`.
+const LIST_PERCENT: u16 = 40;
 const LIST_MIN: u16 = 24;
-const LIST_MAX: u16 = 48;
-const POPUP_WIDTH: u16 = 56;
+/// Lines of a failure's detail shown before it is cut.
+const FAILURE_LINES: usize = 8;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -27,201 +31,263 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_too_small(frame, area);
         return;
     }
-    let [header, body, bottom] = Layout::vertical([
+    let [header, _, body, message, footer] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
+        Constraint::Length(1),
     ])
     .areas(area);
-    let [left, right] = Layout::horizontal([
-        Constraint::Length(list_width(area.width)),
+    let body = margin(body);
+    let list_width = list_width(app, body.width);
+    let [list, rule, detail] = Layout::horizontal([
+        Constraint::Length(list_width),
+        Constraint::Length(3),
         Constraint::Min(1),
     ])
     .areas(body);
-    draw_header(frame, app, header);
-    draw_phases(frame, app, left);
-    draw_detail(frame, app, right);
-    draw_bottom(frame, app, bottom);
+    draw_header(frame, app, margin(header));
+    draw_phases(frame, app, list);
+    draw_rule(frame, rule);
+    draw_detail(frame, app, detail);
+    if let Some(notice) = &app.message {
+        frame.render_widget(Paragraph::new(notice_line(notice)), margin(message));
+    }
+    let footer_area = margin(footer);
+    let keys = app.footer();
+    frame.render_widget(
+        Paragraph::new(footer_line(
+            &keys,
+            app.mode == Mode::Normal,
+            usize::from(footer_area.width),
+        )),
+        footer_area,
+    );
     draw_popup(frame, app, area);
 }
 
-pub(super) fn draw_too_small(frame: &mut Frame, area: Rect) {
-    let text = format!(
-        "phasewise needs a terminal of at least {MIN_WIDTH}×{MIN_HEIGHT} (now {}×{}). Enlarge the window.",
-        area.width, area.height
-    );
-    let height = 3.min(area.height);
-    let [_, middle, _] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(height),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
-    frame.render_widget(
-        Paragraph::new(text)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true }),
-        middle,
-    );
+/// Width of the phase list: the longest row plus two, within 24 columns and
+/// 40 % of the width.
+fn list_width(app: &App, total: u16) -> u16 {
+    let rows = app
+        .view
+        .phases
+        .iter()
+        .map(|p| row_prefix_width(app) + text_width(&p.title))
+        .max()
+        .unwrap_or(0);
+    let wanted = u16::try_from(rows + 2).unwrap_or(u16::MAX);
+    wanted.clamp(LIST_MIN, (total * LIST_PERCENT / 100).max(LIST_MIN))
 }
 
-/// Width of the phase panel for a terminal `total` columns wide.
-pub fn list_width(total: u16) -> u16 {
-    (total * LIST_PERCENT / 100).clamp(LIST_MIN, LIST_MAX)
+/// Digits of the widest phase number, at least two.
+fn number_width(app: &App) -> usize {
+    app.view
+        .phases
+        .iter()
+        .map(|p| p.number.to_string().len())
+        .max()
+        .unwrap_or(2)
+        .max(2)
 }
 
-/// `text` cut to at most `max` characters, ending with `…` when it was cut.
-pub fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let keep = max.saturating_sub(1);
-    let mut out: String = text.chars().take(keep).collect();
-    if max > 0 {
-        out.push('…');
-    }
-    out
+/// `  ◆ 12  ` in front of a title.
+fn row_prefix_width(app: &App) -> usize {
+    2 + 2 + number_width(app) + 2
 }
 
-/// ratatui style for a role; the same roles the CLI paints with ANSI codes.
-pub(super) fn role_style(role: Role) -> Style {
-    match role {
-        Role::Default => Style::new(),
-        Role::Heading => Style::new().add_modifier(Modifier::BOLD),
-        Role::Dim => Style::new().fg(Color::DarkGray),
-        Role::Ok => Style::new().fg(Color::Green),
-        Role::Fail => Style::new().fg(Color::Red),
-        Role::Warn => Style::new().fg(Color::Yellow),
-        Role::Accent => Style::new().fg(Color::Cyan),
-        Role::Tool => Style::new().fg(Color::Blue),
+fn agent_title(agent: &str) -> &str {
+    match agent {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        other => other,
     }
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let v = &app.view;
-    let dim = role_style(Role::Dim);
-    let mut spans = vec![Span::styled("phasewise", role_style(Role::Heading))];
-    // The model and effort are those of the selected phase's last attempt.
-    let selected = v.phases.get(app.selected);
-    let model = selected.and_then(|p| p.model.as_deref());
-    let effort = selected.and_then(|p| p.effort.as_deref());
-    let mut fields = vec![
-        ("run", v.run_id.as_str()),
-        ("plan", v.plan_title.as_str()),
-        ("agent", v.agent.as_str()),
+    let right = format!("{} · {}", agent_title(&v.agent), v.run_branch);
+    let room = usize::from(area.width).saturating_sub(text_width(&right) + 2);
+    let mut left = vec![
+        Span::styled("✻", accent()),
+        Span::styled(" phasewise", bold()),
     ];
-    if let Some(model) = model {
-        fields.push(("model", model));
+    if !v.plan_title.is_empty() {
+        left.push(Span::styled(
+            format!(" · {}", truncate(&v.plan_title, room.saturating_sub(12))),
+            dim(),
+        ));
     }
-    if let Some(effort) = effort {
-        fields.push(("effort", effort));
-    }
-    fields.push(("branch", v.run_branch.as_str()));
-    for (label, value) in fields {
-        spans.push(Span::styled(format!("  {label} "), dim));
-        spans.push(Span::raw(value.to_string()));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(Paragraph::new(Line::from(left)), area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(right, dim())).alignment(Alignment::Right),
+        area,
+    );
 }
 
-fn symbol(status: PhaseStatus) -> (&'static str, Role) {
+/// Status glyph of a phase; the spinner for work in progress.
+fn glyph(status: PhaseStatus, frame: usize) -> (&'static str, Style) {
     match status {
-        PhaseStatus::Pending => ("·", Role::Dim),
-        PhaseStatus::Running | PhaseStatus::Verifying => ("●", Role::Warn),
-        PhaseStatus::AwaitingReview => ("◆", Role::Accent),
-        PhaseStatus::Done => ("✓", Role::Ok),
-        PhaseStatus::Failed => ("✗", Role::Fail),
+        PhaseStatus::Pending => ("·", dim()),
+        PhaseStatus::Running | PhaseStatus::Verifying => (spinner(frame), accent()),
+        PhaseStatus::AwaitingReview => ("◆", role_style(Role::Warn)),
+        PhaseStatus::Done => ("✓", role_style(Role::Ok)),
+        PhaseStatus::Failed => ("✗", role_style(Role::Fail)),
     }
 }
 
 fn draw_phases(frame: &mut Frame, app: &App, area: Rect) {
-    // Border (2) and highlight symbol (2) take columns from the row.
-    let row_width = usize::from(area.width).saturating_sub(4);
-    let items: Vec<ListItem> = app
+    let numw = number_width(app);
+    let room = usize::from(area.width).saturating_sub(row_prefix_width(app));
+    let height = usize::from(area.height).max(1);
+    // Keep the selected phase in view.
+    let first = (app.selected + 1).saturating_sub(height);
+    let lines: Vec<Line> = app
         .view
         .phases
         .iter()
-        .map(|p| {
-            let (sym, role) = symbol(p.status);
-            let prefix = format!(" {} ", p.number);
-            let room = row_width.saturating_sub(1 + prefix.chars().count());
-            ListItem::new(Line::from(vec![
-                Span::styled(sym, role_style(role)),
-                Span::raw(format!("{prefix}{}", truncate(&p.title, room))),
-            ]))
+        .enumerate()
+        .skip(first)
+        .take(height)
+        .map(|(i, p)| {
+            let selected = i == app.selected;
+            let (mark, style) = glyph(p.status, app.frame);
+            let title_style = if selected { bold() } else { Style::new() };
+            Line::from(vec![
+                Span::styled(if selected { "❯" } else { " " }, accent()),
+                Span::raw(" "),
+                Span::styled(mark, style),
+                Span::raw(format!(" {:>numw$}  ", p.number)),
+                Span::styled(truncate(&p.title, room), title_style),
+            ])
         })
         .collect();
-    let list = List::new(items)
-        .block(Block::new().borders(Borders::ALL).title(" Phases "))
-        .highlight_symbol("> ")
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default().with_selected(Some(app.selected));
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The dim `│` column between the list and the detail pane.
+fn draw_rule(frame: &mut Frame, area: Rect) {
+    let lines: Vec<Line> = (0..area.height)
+        .map(|_| Line::styled(" │", dim()))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// `Phase 2 · awaiting review · attempt 1 · 2 files · $0.04 · Sonnet 5.5`.
+fn meta_line(app: &App, p: &PhaseView, width: usize) -> Line<'static> {
+    let mut parts = vec![format!("Phase {}", p.number)];
+    let working = matches!(p.status, PhaseStatus::Running | PhaseStatus::Verifying);
+    parts.push(match (working, p.started_at) {
+        (true, Some(at)) => format!("{} {}", status_label(p.status), elapsed_since(at)),
+        _ => status_label(p.status).to_string(),
+    });
+    if p.attempts > 0 {
+        parts.push(format!("attempt {}", p.attempts));
+    }
+    if !working {
+        let files = app.diff.files.len();
+        if files > 0 {
+            parts.push(format!(
+                "{files} {}",
+                if files == 1 { "file" } else { "files" }
+            ));
+        }
+        parts.extend(p.cost_usd.map(money));
+        parts.extend(p.model.clone());
+    }
+    // Whole parts are dropped from the end rather than cut.
+    while parts.len() > 2 && text_width(&parts.join(" · ")) > width {
+        parts.pop();
+    }
+    Line::from(dim_join(&parts))
+}
+
+/// The failure block: red `✗` and the kind in words, then the detail wrapped
+/// to the pane, at most `FAILURE_LINES` lines (the last one ends with `…`).
+fn failure_lines(p: &PhaseView, width: usize) -> Vec<Line<'static>> {
+    let Some(kind) = &p.failure_kind else {
+        return Vec::new();
+    };
+    let mut lines = vec![Line::styled(format!("✗ {kind}"), role_style(Role::Fail))];
+    let mut detail: Vec<String> =
+        wrap_text(p.failure_detail.as_deref().unwrap_or("").trim(), width);
+    if detail.len() > FAILURE_LINES {
+        detail.truncate(FAILURE_LINES);
+        if let Some(last) = detail.last_mut() {
+            *last = format!("{}…", truncate(last, width.saturating_sub(1)));
+        }
+    }
+    lines.extend(detail.into_iter().map(Line::raw));
+    lines
+}
+
+fn tab_line(active: Tab, position: Option<String>, width: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, tab) in Tab::ALL.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        let style = if tab == active {
+            accent_bold().add_modifier(Modifier::UNDERLINED)
+        } else {
+            dim()
+        };
+        spans.push(Span::styled(tab.title(), style));
+    }
+    if let Some(position) = position {
+        let used = line_width(&Line::from(spans.clone()));
+        let pad = width.saturating_sub(used + text_width(&position));
+        spans.push(Span::raw(" ".repeat(pad.max(2))));
+        spans.push(Span::styled(position, dim()));
+    }
+    Line::from(spans)
 }
 
 fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
-    let title = match app.view.phases.get(app.selected) {
-        Some(p) => match &p.failure {
-            Some(f) => format!(" Phase {}: {f} ", p.number),
-            None => format!(
-                " Phase {}: {} (attempt {}) ",
-                p.number,
-                status_label(p.status),
-                p.attempts
-            ),
-        },
-        None => " No phases ".to_string(),
-    };
-    let block = Block::new().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height == 0 {
+    let Some(p) = app.view.phases.get(app.selected).cloned() else {
+        frame.render_widget(Paragraph::new(Line::styled("No phases", dim())), area);
         return;
+    };
+    let width = usize::from(area.width);
+    let mut head = vec![
+        Line::styled(truncate(&p.title, width), bold()),
+        meta_line(app, &p, width),
+    ];
+    let failure = failure_lines(&p, width);
+    if !failure.is_empty() {
+        head.push(Line::raw(""));
+        head.extend(failure);
     }
-    let [tabs, content] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
-    frame.render_widget(Paragraph::new(tab_line(app.tab)), tabs);
-
+    head.push(Line::raw(""));
+    // The tab bar and the rule follow the head.
+    let used = u16::try_from(head.len() + 2).unwrap_or(u16::MAX);
+    let content_height = area.height.saturating_sub(used);
     let lines = match app.tab {
         Tab::Diff => diff_lines(&app.diff),
         Tab::Log => app.log.iter().map(log_line).collect(),
         Tab::Verify => verify_lines(&app.verify),
     };
-    app.page = content.height.max(1);
-    let max_scroll = u16::try_from(lines.len())
+    app.page = content_height.max(1);
+    let total = lines.len();
+    let max_scroll = u16::try_from(total)
         .unwrap_or(u16::MAX)
-        .saturating_sub(content.height);
+        .saturating_sub(content_height);
     app.scroll = app.scroll.min(max_scroll);
+    let position = (total > usize::from(content_height) && content_height > 0).then(|| {
+        let first = usize::from(app.scroll) + 1;
+        let last = (usize::from(app.scroll) + usize::from(content_height)).min(total);
+        format!("{first}–{last} of {total}")
+    });
+    head.push(tab_line(app.tab, position, width));
+    head.push(Line::styled("─".repeat(width), dim()));
+    let head_height = u16::try_from(head.len())
+        .unwrap_or(area.height)
+        .min(area.height);
+    let [top, content] =
+        Layout::vertical([Constraint::Length(head_height), Constraint::Min(0)]).areas(area);
+    frame.render_widget(Paragraph::new(head), top);
     frame.render_widget(Paragraph::new(lines).scroll((app.scroll, 0)), content);
-}
-
-/// Spans of an event line: the time column when the line has one (the Log tab
-/// has none), the icon, the label and the detail.
-pub(super) fn event_spans(line: &EventLine) -> Vec<Span<'static>> {
-    let style = role_style(line.role);
-    let mut spans = Vec::new();
-    if let Some(secs) = line.time {
-        spans.push(Span::styled(
-            format!("{:02}:{:02}  ", secs / 60, secs % 60),
-            role_style(Role::Dim),
-        ));
-    }
-    spans.push(Span::styled(line.icon, style));
-    if !line.label.is_empty() {
-        let label = if line.detail.is_empty() {
-            line.label.clone()
-        } else {
-            line.label_column()
-        };
-        spans.push(Span::styled(format!(" {label}"), style));
-    }
-    if !line.detail.is_empty() {
-        spans.push(Span::styled(
-            format!(" {}", line.detail),
-            role_style(line.detail_role()),
-        ));
-    }
-    spans
 }
 
 fn log_line(line: &LogLine) -> Line<'static> {
@@ -275,22 +341,6 @@ fn verify_lines(text: &str) -> Vec<Line<'static>> {
         }
     }
     out
-}
-
-fn tab_line(active: Tab) -> Line<'static> {
-    let mut spans = Vec::new();
-    for (i, tab) in Tab::ALL.into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" | "));
-        }
-        let style = if tab == active {
-            Style::new().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            Style::new()
-        };
-        spans.push(Span::styled(tab.title(), style));
-    }
-    Line::from(spans)
 }
 
 fn diff_lines(diff: &DiffView) -> Vec<Line<'static>> {
@@ -354,224 +404,73 @@ fn diff_line(line: &str) -> Line<'static> {
     Line::styled(line.to_string(), style)
 }
 
-fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
-    let mut keys = app.footer();
-    if app.mode == Mode::Normal {
-        keys.push(item("?", "shortcuts"));
-    }
-    // The message comes first so that a narrow terminal cuts the footer.
-    let mut spans = Vec::new();
-    if let Some(notice) = &app.message {
-        spans.push(notice_span(notice));
-        spans.push(Span::raw("  "));
-    }
-    spans.extend(footer_spans(&keys));
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-/// `key action` pairs for a footer line.
-pub(super) fn footer_spans(keys: &[(String, String)]) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    for (key, what) in keys {
-        spans.push(Span::styled(key.clone(), role_style(Role::Heading)));
-        spans.push(Span::styled(format!(" {what}  "), role_style(Role::Dim)));
-    }
-    spans
-}
-
-/// A message with its glyph, in the colour of its level.
-pub(super) fn notice_span(notice: &Notice) -> Span<'static> {
-    let (glyph, role) = match notice.level {
-        Level::Ok => ("✓ ", Role::Ok),
-        Level::Warn => ("! ", Role::Warn),
-        Level::Error => ("✗ ", Role::Fail),
-        Level::Info => ("", Role::Default),
-    };
-    Span::styled(format!("{glyph}{}", notice.text), role_style(role))
-}
-
-/// Body of a two-row confirmation: description, blank, then the rows with
-/// the highlighted one marked.
-pub(super) fn confirm_body(
-    description: &str,
-    action: &str,
-    cancel: &str,
-    row: usize,
-) -> Vec<Line<'static>> {
-    let mark = |n: usize, label: &str| {
-        let (pointer, style) = if row == n - 1 {
-            ("❯", role_style(Role::Accent).add_modifier(Modifier::BOLD))
-        } else {
-            (" ", Style::new())
-        };
-        Line::from(vec![
-            Span::styled(pointer, role_style(Role::Accent)),
-            Span::styled(format!(" {n}. {label}"), style),
-        ])
-    };
-    let mut lines = Vec::new();
-    if !description.is_empty() {
-        lines.push(Line::raw(description.to_string()));
-        lines.push(Line::raw(""));
-    }
-    lines.push(mark(1, action));
-    lines.push(mark(2, cancel));
-    lines
-}
-
-/// Body of the shortcuts popup: the groups with their keys.
-pub(super) fn shortcut_lines(groups: &ShortcutGroups) -> Vec<Line<'static>> {
-    let width = groups
-        .iter()
-        .flat_map(|(_, rows)| rows.iter().map(|(key, _)| key.chars().count()))
-        .max()
-        .unwrap_or(0);
-    let mut lines = Vec::new();
-    for (i, (group, rows)) in groups.iter().enumerate() {
-        if i > 0 {
-            lines.push(Line::raw(""));
-        }
-        lines.push(Line::styled(group.to_string(), role_style(Role::Heading)));
-        for (key, what) in rows {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{key:<width$}"), role_style(Role::Accent)),
-                Span::raw(format!("  {what}")),
-            ]));
-        }
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "Press any key to close.",
-        role_style(Role::Dim),
-    ));
-    lines
-}
-
 fn draw_popup(frame: &mut Frame, app: &App, area: Rect) {
     let view = &app.view;
-    let (title, body): (String, Vec<Line>) = match &app.mode {
+    let popup = match &app.mode {
         Mode::Normal => return,
-        Mode::ConfirmRollback(n, row) => (
-            if *n == 0 {
+        Mode::ConfirmRollback(n, row) => confirm_popup(
+            &if *n == 0 {
                 "Roll back to the start?".to_string()
             } else {
                 format!("Roll back to phase {n}?")
             },
-            confirm_body(
-                "Later phases are reset and their changes discarded.",
-                "Roll back",
-                "Cancel",
-                *row,
-            ),
+            "Later phases are reset and their changes discarded.",
+            "Roll back",
+            "Cancel",
+            *row,
         ),
-        Mode::ConfirmInterrupt(row) => (
-            app.running.map_or("Interrupt the phase?".to_string(), |n| {
+        Mode::ConfirmInterrupt(row) => confirm_popup(
+            &app.running.map_or("Interrupt the phase?".to_string(), |n| {
                 format!("Interrupt phase {n}?")
             }),
-            confirm_body("", "Interrupt", "Keep running", *row),
+            "",
+            "Interrupt",
+            "Keep running",
+            *row,
         ),
-        Mode::ConfirmQuit(row) => (
-            "Quit phasewise?".to_string(),
-            confirm_body(
-                if app.running.is_some() {
-                    "The running phase is interrupted."
-                } else {
-                    "The plan being written is discarded."
-                },
-                "Quit",
-                "Keep working",
-                *row,
+        Mode::ConfirmQuit(row) => confirm_popup(
+            "Quit phasewise?",
+            if app.running.is_some() {
+                "The running phase is interrupted."
+            } else {
+                "The plan being written is discarded."
+            },
+            "Quit",
+            "Keep working",
+            *row,
+        ),
+        Mode::ConfirmAbandon(row) => confirm_popup(
+            &format!("Abandon run {}?", view.run_id),
+            &format!(
+                "The run stops for good. Uncommitted changes are saved in a commit on {}, which is kept, and the repository goes back to {}.",
+                view.run_branch, view.original_branch
             ),
+            "Abandon it",
+            "Cancel",
+            *row,
         ),
-        Mode::ConfirmAbandon(row) => (
-            format!("Abandon run {}?", view.run_id),
-            confirm_body(
-                &format!(
-                    "The run stops for good. Uncommitted changes are saved in a commit on {}, which is kept, and the repository goes back to {}.",
-                    view.run_branch, view.original_branch
-                ),
-                "Abandon it",
-                "Cancel",
-                *row,
-            ),
-        ),
-        Mode::Help => ("Shortcuts".to_string(), shortcut_lines(&App::shortcuts())),
-        Mode::Note(buffer) => (
-            "Retry".to_string(),
-            vec![
-                Line::raw("Note for the agent (optional):"),
-                Line::raw(format!("> {buffer}_")),
-                Line::raw(""),
-                Line::raw("Enter: retry   Esc: cancel"),
-            ],
+        Mode::Help => shortcuts_popup(&App::shortcuts()),
+        Mode::Note(buffer) => input_popup(
+            &format!("Retry phase {}", retry_target(app)),
+            "Optional note for the agent, added to the prompt.",
+            buffer,
+            area.width,
         ),
     };
-    render_popup(frame, area, &format!(" {title} "), body, POPUP_WIDTH);
+    render_popup(frame, area, &popup);
 }
 
-/// Rows a line takes when wrapped at `width` columns (greedy, by words).
-fn wrapped_rows(line: &Line, width: usize) -> usize {
-    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let mut rows = 1;
-    let mut used = 0;
-    for word in text.split(' ') {
-        let len = word.chars().count();
-        if used == 0 || used + 1 + len > width {
-            if used != 0 {
-                rows += 1;
-            }
-            used = len;
-        } else {
-            used += 1 + len;
-        }
-        // A word longer than the width continues on the next rows.
-        while used > width {
-            rows += 1;
-            used -= width;
-        }
-    }
-    rows
-}
-
-/// A centred, bordered popup `width` columns wide (less on a narrow screen).
-/// Long lines wrap; the height follows the wrapped text, within the screen.
-pub(super) fn render_popup(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    body: Vec<Line<'_>>,
-    width: u16,
-) {
-    let width = width.min(area.width);
-    let inner = usize::from(width.saturating_sub(2)).max(1);
-    let text_rows: usize = body.iter().map(|l| wrapped_rows(l, inner)).sum();
-    let height = u16::try_from(text_rows)
-        .unwrap_or(u16::MAX)
-        .saturating_add(2)
-        .min(area.height);
-    let [_, row, _] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(height),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
-    let [_, popup, _] = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(width),
-        Constraint::Fill(1),
-    ])
-    .areas(row);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(body)
-            .wrap(Wrap { trim: false })
-            .block(Block::new().borders(Borders::ALL).title(title.to_string())),
-        popup,
-    );
+/// The phase a retry applies to: the failed one, else the one in review.
+fn retry_target(app: &App) -> usize {
+    let find = |status| app.view.phases.iter().find(|p| p.status == status);
+    find(PhaseStatus::Failed)
+        .or_else(|| find(PhaseStatus::AwaitingReview))
+        .or_else(|| app.view.phases.get(app.selected))
+        .map_or(0, |p| p.number)
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -579,8 +478,9 @@ mod tests {
     use crate::agent::AgentEvent;
     use crate::display::agent_event_line;
     use crate::tui::data::{PhaseView, RunView};
+    use crate::tui::shared::Notice;
 
-    fn app() -> App {
+    pub(in crate::tui) fn app() -> App {
         let phase = |number, title: &str, status, checkpoint| PhaseView {
             number,
             title: title.to_string(),
@@ -590,6 +490,10 @@ mod tests {
             has_checkpoint: checkpoint,
             model: None,
             effort: None,
+            cost_usd: None,
+            started_at: None,
+            failure_kind: None,
+            failure_detail: None,
         };
         let mut app = App::new(RunView {
             run_id: "20260101-120000".into(),
@@ -600,16 +504,24 @@ mod tests {
             active: true,
             phases: vec![
                 phase(1, "Scaffold the project", PhaseStatus::Done, true),
-                phase(2, "Add the parser", PhaseStatus::AwaitingReview, true),
+                PhaseView {
+                    cost_usd: Some(0.04),
+                    model: Some("Sonnet 5.5".into()),
+                    ..phase(2, "Add the parser", PhaseStatus::AwaitingReview, true)
+                },
                 phase(3, "Write the docs", PhaseStatus::Pending, false),
-                phase(4, "Release", PhaseStatus::Failed, false),
+                PhaseView {
+                    failure_kind: Some("Checks failed".into()),
+                    failure_detail: Some("cargo test failed".into()),
+                    ..phase(4, "Release", PhaseStatus::Failed, false)
+                },
             ],
         });
         app.selected = 1;
         app
     }
 
-    fn render(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
+    pub(in crate::tui) fn render(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal.draw(|f| draw(f, app)).expect("draw");
         terminal
@@ -617,7 +529,7 @@ mod tests {
 
     const DIFF: &str = "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,4 @@\n fn main() {\n-    old();\n+    new();\n+    more();\n }\n";
 
-    fn with_diff(app: &mut App) {
+    pub(in crate::tui) fn with_diff(app: &mut App) {
         app.diff = DiffView {
             files: vec![
                 ("src/lib.rs".into(), Some(2), Some(1)),
@@ -633,8 +545,7 @@ mod tests {
     fn phase_list_and_diff_tab() {
         let mut app = app();
         with_diff(&mut app);
-        let terminal = render(&mut app, 100, 30);
-        insta::assert_snapshot!(terminal.backend());
+        insta::assert_snapshot!(render(&mut app, 100, 30).backend());
     }
 
     #[test]
@@ -677,8 +588,7 @@ mod tests {
                 .expect("retry line"),
             ),
         ];
-        let terminal = render(&mut app, 100, 30);
-        insta::assert_snapshot!(terminal.backend());
+        insta::assert_snapshot!(render(&mut app, 100, 30).backend());
     }
 
     #[test]
@@ -686,50 +596,68 @@ mod tests {
         let mut app = app();
         app.tab = Tab::Verify;
         app.verify = "=== attempt 1 ===\n$ cargo test\nrunning 3 tests\nexit code: 0\n$ test -f a.md\nexit code: 1\n$ sleep 9\ntimed out after 1 s\n".to_string();
+        insta::assert_snapshot!(render(&mut app, 100, 30).backend());
+    }
+
+    #[test]
+    fn failed_phase_wraps_and_cuts_a_long_failure() {
+        let mut app = app();
+        app.selected = 3;
+        let detail = (1..=40)
+            .map(|i| format!("error line {i} with some text to fill the width of the pane"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.view.phases[3].failure_detail = Some(detail);
         let terminal = render(&mut app, 100, 30);
+        let text = format!("{}", terminal.backend());
+        assert!(text.contains("✗ Checks failed"), "{text}");
+        assert!(
+            !text.contains("error line 9 "),
+            "cut at eight lines\n{text}"
+        );
         insta::assert_snapshot!(terminal.backend());
     }
 
     #[test]
-    fn help_popup() {
+    fn running_phase_shows_the_spinner_and_a_short_meta_line() {
+        let mut app = app();
+        app.view.phases[2].status = PhaseStatus::Running;
+        app.selected = 2;
+        app.running = Some(3);
+        app.frame = 2;
+        insta::assert_snapshot!(render(&mut app, 100, 30).backend());
+    }
+
+    #[test]
+    fn scroll_position_shows_when_the_content_is_longer_than_the_pane() {
+        let mut app = app();
+        app.tab = Tab::Verify;
+        app.verify = (1..=60).map(|i| format!("line {i}\n")).collect();
+        app.scroll = 10;
+        let text = format!("{}", render(&mut app, 100, 30).backend());
+        assert!(text.contains(" of 60"), "{text}");
+        assert!(text.contains("11–"), "{text}");
+    }
+
+    #[test]
+    fn shortcuts_popup() {
         let mut app = app();
         app.mode = Mode::Help;
-        let terminal = render(&mut app, 100, 30);
-        insta::assert_snapshot!(terminal.backend());
+        insta::assert_snapshot!(render(&mut app, 100, 30).backend());
     }
 
     #[test]
     fn long_titles_are_truncated_with_an_ellipsis() {
         let mut app = app();
-        app.view.phases[0].title = "A very long phase title that cannot possibly fit".into();
-        let terminal = render(&mut app, 80, 20);
-        insta::assert_snapshot!(terminal.backend());
-    }
-
-    #[test]
-    fn truncate_cuts_on_characters_and_marks_the_cut() {
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("exactly10!", 10), "exactly10!");
-        assert_eq!(truncate("0123456789ab", 10), "012345678…");
-        assert_eq!(truncate("ñandú ñandú ñandú", 6), "ñandú…");
-        assert_eq!(truncate("abc", 0), "");
-        assert_eq!(truncate("abc", 1), "…");
-    }
-
-    #[test]
-    fn phase_panel_is_30_percent_clamped_to_24_and_48() {
-        assert_eq!(list_width(80), 24);
-        assert_eq!(list_width(100), 30);
-        assert_eq!(list_width(120), 36);
-        assert_eq!(list_width(160), 48);
-        assert_eq!(list_width(400), 48);
+        app.view.phases[0].title =
+            "A very long phase title that cannot possibly fit in the list".into();
+        insta::assert_snapshot!(render(&mut app, 80, 20).backend());
     }
 
     #[test]
     fn small_terminal_shows_only_the_message() {
         let mut app = app();
-        let terminal = render(&mut app, 60, 15);
-        insta::assert_snapshot!(terminal.backend());
+        insta::assert_snapshot!(render(&mut app, 60, 15).backend());
     }
 
     #[test]
@@ -737,39 +665,42 @@ mod tests {
         let mut app = app();
         with_diff(&mut app);
         app.mode = Mode::ConfirmRollback(2, 0);
-        let terminal = render(&mut app, 100, 30);
-        insta::assert_snapshot!(terminal.backend());
+        insta::assert_snapshot!(render(&mut app, 100, 30).backend());
     }
 
     #[test]
-    fn abandon_confirmation_names_the_branches_and_marks_the_row() {
+    fn abandon_confirmation_popup() {
         let mut app = app();
         app.mode = Mode::ConfirmAbandon(1);
-        let text = format!("{}", render(&mut app, 100, 30).backend());
-        assert!(text.contains("Abandon run 20260101-120000?"), "{text}");
-        assert!(text.contains("goes back to main"), "{text}");
+        let terminal = render(&mut app, 100, 30);
+        let text = format!("{}", terminal.backend());
         assert!(text.contains("❯ 2. Cancel"), "{text}");
-    }
-
-    #[test]
-    fn footer_and_notice_are_drawn_on_the_last_row() {
-        let mut app = app();
-        app.message = Some(Notice::warn("Interrupt the running phase first (x)."));
-        let text = format!("{}", render(&mut app, 100, 30).backend());
-        assert!(
-            text.contains("! Interrupt the running phase first (x).  n approve  r retry"),
-            "{text}"
-        );
-        app.message = None;
-        let text = format!("{}", render(&mut app, 100, 30).backend());
-        assert!(text.contains("esc home  q quit  ? shortcuts"), "{text}");
+        insta::assert_snapshot!(terminal.backend());
     }
 
     #[test]
     fn note_input_popup() {
         let mut app = app();
         app.mode = Mode::Note("handle empty input".into());
-        let terminal = render(&mut app, 100, 30);
+        insta::assert_snapshot!(render(&mut app, 100, 30).backend());
+    }
+
+    #[test]
+    fn message_and_footer_are_separate_rows_and_the_footer_drops_items() {
+        let mut app = app();
+        app.message = Some(Notice::ok("Phase 2 is ready for review."));
+        let terminal = render(&mut app, 80, 24);
+        let rows: Vec<String> = format!("{}", terminal.backend())
+            .lines()
+            .map(|l| l.trim_matches('"').trim_end().to_string())
+            .collect();
+        let n = rows.len();
+        assert!(
+            rows[n - 2].contains("✓ Phase 2 is ready for review."),
+            "{rows:#?}"
+        );
+        assert!(rows[n - 1].ends_with("? shortcuts"), "{rows:#?}");
+        assert!(!rows[n - 1].contains('✓'), "{rows:#?}");
         insta::assert_snapshot!(terminal.backend());
     }
 
@@ -780,6 +711,20 @@ mod tests {
         app.scroll = 500;
         render(&mut app, 100, 30);
         assert!(app.scroll < 30);
-        assert_eq!(app.page, 25);
+        assert_eq!(app.page, 21);
+    }
+
+    #[test]
+    fn the_list_is_at_least_24_columns_and_at_most_40_percent() {
+        let app = app();
+        assert_eq!(list_width(&app, 98), 30);
+        let mut short = app.clone();
+        for p in &mut short.view.phases {
+            p.title = "x".into();
+        }
+        assert_eq!(list_width(&short, 98), 24);
+        let mut long = app.clone();
+        long.view.phases[0].title = "x".repeat(200);
+        assert_eq!(list_width(&long, 98), 39);
     }
 }

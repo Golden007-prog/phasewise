@@ -715,7 +715,7 @@ fn plan_command(
 
 /// A path as one shell word, in single quotes when it has other characters
 /// than letters, digits and `_ . / -`.
-fn shell_arg(path: &Path) -> String {
+pub(crate) fn shell_arg(path: &Path) -> String {
     let text = path.display().to_string();
     let plain = !text.is_empty()
         && text
