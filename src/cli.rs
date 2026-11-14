@@ -1,14 +1,24 @@
 //! Command-line interface: clap definitions, dispatch and exit codes.
 
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
+use crate::agent::AgentEvent;
+use crate::engine::EngineEvent;
 use crate::git::Git;
+use crate::ops::{self, NextOutcome, Run};
 use crate::plan::{self, AgentKind};
+use crate::state::{FailureKind, PhaseStatus, RunStatus};
 
 const PLAN_FILE: &str = "phasewise.md";
 const PLAN_TEMPLATE: &str = include_str!("templates/phasewise.md");
@@ -161,12 +171,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Some(Command::Init) => init(),
         Some(Command::Check { plan }) => check(plan),
         Some(Command::Doctor) => not_implemented("doctor"),
-        Some(Command::Run { .. }) => not_implemented("run"),
-        Some(Command::Next { .. }) => not_implemented("next"),
+        Some(Command::Run { plan, agent, auto }) => run_command(plan, agent, auto),
+        Some(Command::Next { auto }) => next_command(auto),
         Some(Command::Retry { .. }) => not_implemented("retry"),
         Some(Command::Rollback { .. }) => not_implemented("rollback"),
-        Some(Command::Status) => not_implemented("status"),
-        Some(Command::Diff { .. }) => not_implemented("diff"),
+        Some(Command::Status) => status(),
+        Some(Command::Diff { n }) => diff(n),
         Some(Command::Review) => not_implemented("review"),
         Some(Command::Abort) => not_implemented("abort"),
     }
@@ -264,4 +274,428 @@ fn init() -> Result<ExitCode> {
     println!("  3. phasewise check");
     println!("  4. phasewise run");
     Ok(ExitCode::SUCCESS)
+}
+
+const MAX_MESSAGE_CHARS: usize = 160;
+const NO_RUN: &str = "No run yet. Start one with `phasewise run`.";
+const EXIT_PHASE_FAILED: u8 = 3;
+
+fn current_dir() -> Result<PathBuf> {
+    std::env::current_dir().context("Cannot read the current directory")
+}
+
+fn run_command(plan: Option<PathBuf>, agent: Option<AgentArg>, auto: bool) -> Result<ExitCode> {
+    let path = resolve_plan_path(plan)?;
+    let run = ops::start(&current_dir()?, &path, agent.map(AgentKind::from))?;
+    println!(
+        "Run {} on branch {} (original branch: {}, agent: {})",
+        run.state.run_id, run.state.run_branch, run.state.original_branch, run.state.agent
+    );
+    drive(run, move |run, events, cancel| {
+        ops::execute(run, auto, events, cancel).map(NextOutcome::Ran)
+    })
+}
+
+fn next_command(auto: bool) -> Result<ExitCode> {
+    let run = ops::load_current(&current_dir()?)?.ok_or_else(|| anyhow!(NO_RUN))?;
+    drive(run, move |run, events, cancel| {
+        ops::next(run, auto, events, cancel)
+    })
+}
+
+/// The shared cancel flag; the first Ctrl-C sets it, the second one exits.
+fn install_ctrlc() -> Result<Arc<AtomicBool>> {
+    static CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    if let Some(flag) = CANCEL.get() {
+        return Ok(Arc::clone(flag));
+    }
+    let flag = Arc::new(AtomicBool::new(false));
+    let handler_flag = Arc::clone(&flag);
+    ctrlc::set_handler(move || {
+        if handler_flag.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        println!("Interrupting… (press Ctrl-C again to quit immediately)");
+    })
+    .context("Cannot install the Ctrl-C handler")?;
+    let _ = CANCEL.set(Arc::clone(&flag));
+    Ok(flag)
+}
+
+/// Runs the engine work in a thread that owns the run and prints its events here.
+fn drive<F>(run: Run, work: F) -> Result<ExitCode>
+where
+    F: FnOnce(&mut Run, &Sender<EngineEvent>, &AtomicBool) -> Result<NextOutcome> + Send + 'static,
+{
+    let cancel = install_ctrlc()?;
+    let verify_secs = ops::settings(&run)?.verify_timeout.as_secs();
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut run = run;
+        let result = work(&mut run, &tx, &cancel);
+        (run, result)
+    });
+    let started = Instant::now();
+    for event in rx {
+        if let Some(line) = describe_event(&event, verify_secs) {
+            let secs = started.elapsed().as_secs();
+            // A closed stdout (for example `| head`) must not abort the run.
+            let _ = writeln!(
+                std::io::stdout(),
+                "[{:02}:{:02}] {line}",
+                secs / 60,
+                secs % 60
+            );
+        }
+    }
+    let (run, result) = worker
+        .join()
+        .map_err(|_| anyhow!("The engine thread panicked. This is a bug; please report it."))?;
+    Ok(report_outcome(&run, result?))
+}
+
+fn first_line_short(text: &str) -> String {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty());
+    line.unwrap_or("").chars().take(MAX_MESSAGE_CHARS).collect()
+}
+
+fn describe_event(event: &EngineEvent, verify_secs: u64) -> Option<String> {
+    Some(match event {
+        EngineEvent::PhaseStarted {
+            phase,
+            total,
+            title,
+            attempt,
+            resumed,
+        } => {
+            let how = if *resumed {
+                ", resuming the session"
+            } else {
+                ""
+            };
+            format!("Phase {phase}/{total}: {title} (attempt {attempt}{how})")
+        }
+        EngineEvent::Agent { event, .. } => return describe_agent_event(event),
+        EngineEvent::AgentExited { exit_code, .. } => match exit_code {
+            Some(code) => format!("Agent exited with code {code}"),
+            None => "Agent stopped".to_string(),
+        },
+        EngineEvent::VerifyStarted { command, .. } => format!("Checking: {command}"),
+        EngineEvent::VerifyFinished {
+            command,
+            ok,
+            exit_code,
+            timed_out,
+            ..
+        } => {
+            if *ok {
+                format!("✓ {command}")
+            } else if *timed_out {
+                format!("✗ {command} (timed out after {verify_secs} s)")
+            } else {
+                match exit_code {
+                    Some(code) => format!("✗ {command} (exit code {code})"),
+                    None => format!("✗ {command} (stopped)"),
+                }
+            }
+        }
+        EngineEvent::Retrying { reason, .. } => format!("Retrying: {reason}"),
+        EngineEvent::CheckpointCreated { sha, .. } => {
+            format!("Checkpoint {}", sha.chars().take(7).collect::<String>())
+        }
+        EngineEvent::PhaseFinished {
+            phase,
+            status,
+            failure,
+        } => match failure {
+            Some(failure) => format!(
+                "Phase {phase} failed ({})",
+                failure_kind_label(failure.kind)
+            ),
+            None => format!("Phase {phase}: {}", status_label(*status)),
+        },
+    })
+}
+
+fn describe_agent_event(event: &AgentEvent) -> Option<String> {
+    let tag = |subagent: &bool| if *subagent { "[subagent] " } else { "" };
+    match event {
+        AgentEvent::SessionStarted { .. } => None,
+        AgentEvent::Message { text, subagent } => {
+            let line = first_line_short(text);
+            (!line.is_empty()).then(|| format!("{}{line}", tag(subagent)))
+        }
+        AgentEvent::ToolCall {
+            name,
+            detail,
+            subagent,
+        } => Some(
+            format!("{}{name} {detail}", tag(subagent))
+                .trim_end()
+                .to_string(),
+        ),
+        AgentEvent::Retry { detail } => Some(format!("Agent is retrying: {detail}")),
+        AgentEvent::PermissionDenied { detail } => Some(format!("Permission denied: {detail}")),
+        AgentEvent::Error { detail } => Some(format!("Agent error: {}", first_line_short(detail))),
+        AgentEvent::Finished { .. } => None,
+    }
+}
+
+fn status_label(status: PhaseStatus) -> &'static str {
+    match status {
+        PhaseStatus::Pending => "pending",
+        PhaseStatus::Running => "running",
+        PhaseStatus::Verifying => "verifying",
+        PhaseStatus::AwaitingReview => "awaiting review",
+        PhaseStatus::Done => "done",
+        PhaseStatus::Failed => "failed",
+    }
+}
+
+fn failure_kind_label(kind: FailureKind) -> &'static str {
+    match kind {
+        FailureKind::AgentError => "agent_error",
+        FailureKind::VerifyFailed => "verify_failed",
+        FailureKind::Timeout => "timeout",
+        FailureKind::Interrupted => "interrupted",
+    }
+}
+
+fn report_outcome(run: &Run, outcome: NextOutcome) -> ExitCode {
+    match outcome {
+        NextOutcome::Completed => {
+            let state = &run.state;
+            println!("All phases done.");
+            println!("To integrate the work:");
+            println!(
+                "  git switch {} && git merge --squash {} && git commit",
+                state.original_branch, state.run_branch
+            );
+            ExitCode::SUCCESS
+        }
+        NextOutcome::Ran(PhaseStatus::Failed) => {
+            print_failure(run);
+            ExitCode::from(EXIT_PHASE_FAILED)
+        }
+        NextOutcome::Ran(_) => {
+            let number = run
+                .state
+                .phases
+                .iter()
+                .rev()
+                .find(|p| p.status == PhaseStatus::AwaitingReview)
+                .map_or(0, |p| p.number);
+            println!();
+            println!("Phase {number} is ready for review.");
+            println!("  phasewise diff      show what changed");
+            println!("  phasewise review    inspect it interactively");
+            println!("  phasewise next      approve it and continue");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+fn print_failure(run: &Run) {
+    let Some(phase) = run
+        .state
+        .phases
+        .iter()
+        .find(|p| p.status == PhaseStatus::Failed)
+    else {
+        return;
+    };
+    println!();
+    if let Some(failure) = &phase.failure {
+        println!(
+            "Phase {} failed ({}): {}",
+            phase.number,
+            failure_kind_label(failure.kind),
+            failure.detail
+        );
+    } else {
+        println!("Phase {} failed.", phase.number);
+    }
+    println!("Options:");
+    println!("  phasewise retry [--note \"...\"]   rerun the phase in a new session");
+    println!(
+        "  phasewise rollback {}              go back to the previous checkpoint",
+        phase.number - 1
+    );
+    println!("  or inspect the working tree; it was left as the agent left it");
+}
+
+fn status() -> Result<ExitCode> {
+    let Some(run) = ops::load_current(&current_dir()?)? else {
+        println!("{NO_RUN}");
+        return Ok(ExitCode::SUCCESS);
+    };
+    let state = &run.state;
+    let run_status = match state.status {
+        RunStatus::Active => "active",
+        RunStatus::Completed => "completed",
+        RunStatus::Aborted => "aborted",
+    };
+    println!("Run:    {} ({run_status})", state.run_id);
+    println!(
+        "Plan:   {}",
+        state.plan_title.as_deref().unwrap_or("(untitled)")
+    );
+    println!("Agent:  {}", state.agent);
+    println!(
+        "Branch: {} (from {})",
+        state.run_branch, state.original_branch
+    );
+    println!();
+
+    let rows: Vec<[String; 5]> = state
+        .phases
+        .iter()
+        .map(|p| {
+            let files = match (state.checkpoint(p.number - 1), p.checkpoint_sha.as_deref()) {
+                (Some(from), Some(to)) => run
+                    .git
+                    .changed_file_count(from, to)
+                    .map_or_else(|_| "-".to_string(), |n| n.to_string()),
+                _ => "-".to_string(),
+            };
+            let cost = p
+                .cost_usd
+                .map_or_else(|| "-".to_string(), |c| format!("${c:.4}"));
+            [
+                p.number.to_string(),
+                status_label(p.status).to_string(),
+                p.attempts.to_string(),
+                files,
+                cost,
+            ]
+        })
+        .collect();
+    let headers = ["#", "STATUS", "TRIES", "FILES", "COST"];
+    let mut widths = headers.map(str::len);
+    for row in &rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let line = |cells: [&str; 5], title: &str| {
+        let mut out = String::new();
+        for (cell, width) in cells.iter().zip(widths) {
+            out.push_str(&format!("{cell:<width$}  "));
+        }
+        out.push_str(title);
+        println!("{out}");
+    };
+    line(headers, "TITLE");
+    for (row, phase) in rows.iter().zip(&state.phases) {
+        line([&row[0], &row[1], &row[2], &row[3], &row[4]], &phase.title);
+        if let (PhaseStatus::Failed, Some(failure)) = (phase.status, &phase.failure) {
+            println!(
+                "    {}: {}",
+                failure_kind_label(failure.kind),
+                failure.detail
+            );
+        }
+    }
+    println!();
+    println!("{}", next_step_hint(&run));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn next_step_hint(run: &Run) -> String {
+    let state = &run.state;
+    match state.status {
+        RunStatus::Completed => format!(
+            "Run completed. To integrate: git switch {} && git merge --squash {} && git commit",
+            state.original_branch, state.run_branch
+        ),
+        RunStatus::Aborted => "Run aborted. Start a new one with `phasewise run`.".to_string(),
+        RunStatus::Active => {
+            let find = |status| state.phases.iter().find(|p| p.status == status);
+            if let Some(p) = find(PhaseStatus::Failed) {
+                format!(
+                    "Next: `phasewise retry` or `phasewise rollback {}` (phase {} failed).",
+                    p.number - 1,
+                    p.number
+                )
+            } else if let Some(p) = find(PhaseStatus::AwaitingReview) {
+                format!(
+                    "Next: review phase {} (`phasewise diff`, `phasewise review`), then `phasewise next`.",
+                    p.number
+                )
+            } else if find(PhaseStatus::Running).is_some() || find(PhaseStatus::Verifying).is_some()
+            {
+                "A phase is running.".to_string()
+            } else {
+                "Next: `phasewise next` runs the next phase.".to_string()
+            }
+        }
+    }
+}
+
+fn diff(n: Option<u32>) -> Result<ExitCode> {
+    let run = ops::load_current(&current_dir()?)?.ok_or_else(|| anyhow!(NO_RUN))?;
+    let state = &run.state;
+    let number = match n {
+        Some(n) => {
+            let n = n as usize;
+            if n == 0 || n > state.phases.len() {
+                return Err(anyhow!(
+                    "Phase {n} does not exist; this run has phases 1 to {}. Run `phasewise status`.",
+                    state.phases.len()
+                ));
+            }
+            n
+        }
+        None => state
+            .phases
+            .iter()
+            .rev()
+            .find(|p| p.checkpoint_sha.is_some())
+            .map(|p| p.number)
+            .ok_or_else(|| {
+                anyhow!(
+                    "No phase has a checkpoint yet. Run `phasewise run` or `phasewise next` first."
+                )
+            })?,
+    };
+    let (Some(from), Some(to)) = (state.checkpoint(number - 1), state.checkpoint(number)) else {
+        return Err(anyhow!(
+            "Phase {number} has no checkpoint yet. Run `phasewise status` to see which phases have one."
+        ));
+    };
+    let text = run.git.diff(from, to)?;
+    if text.trim().is_empty() {
+        println!("Phase {number} made no changes.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let color = std::io::stdout().is_terminal();
+    let mut out = String::new();
+    for line in text.lines() {
+        out.push_str(&colorize(line, color));
+        out.push('\n');
+    }
+    // A closed stdout (for example `| head`) is not an error worth reporting.
+    let _ = std::io::stdout().write_all(out.as_bytes());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn colorize(line: &str, color: bool) -> String {
+    if !color {
+        return line.to_string();
+    }
+    let code = if line.starts_with("+++") || line.starts_with("---") {
+        None
+    } else if line.starts_with('+') {
+        Some("32")
+    } else if line.starts_with('-') {
+        Some("31")
+    } else if line.starts_with("@@") {
+        Some("36")
+    } else {
+        None
+    };
+    match code {
+        Some(code) => format!("\x1b[{code}m{line}\x1b[0m"),
+        None => line.to_string(),
+    }
 }

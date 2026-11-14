@@ -64,10 +64,10 @@ fn no_arguments_prints_usage_and_succeeds() {
 #[test]
 fn stub_command_reports_not_implemented() {
     phasewise()
-        .arg("status")
+        .arg("review")
         .assert()
         .code(1)
         .stderr(predicate::str::contains(
-            "error: `phasewise status` is not implemented yet",
+            "error: `phasewise review` is not implemented yet",
         ));
 }

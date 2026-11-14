@@ -76,3 +76,25 @@ deviates from the original plan, with the reason.
   line written by phasewise itself.
 - **`fresh_retry_prompt` / `resume_prompt` / `verify_failure_report` wording**
   is not fixed by the spec; the texts live in `prompt.rs`.
+
+## Build phase 4b
+
+- **`ctrlc` crate:** Ctrl-C must stop the agent's process group cleanly and
+  record the phase as `interrupted`. Agents run in their own process group, so
+  the terminal's SIGINT only reaches phasewise; without a handler it would die
+  and leave the agent running. The handler only sets the shared cancel flag
+  (the engine then calls `terminate_group`); a second Ctrl-C exits with 130.
+  Installing a signal handler without `unsafe` needs a crate.
+- **`PHASEWISE_PHASE_TIMEOUT_SECONDS`** (whole seconds, invalid value is an
+  error) overrides `phase_timeout_minutes`; documented as a testing/advanced knob.
+- **Engine context:** `run_phase(&mut PhaseContext, phase, note)` takes a
+  context struct (git, paths, `&mut RunState`, plan, agent, settings, sender,
+  cancel flag). `run_phase` clears `session_id` at the start (fresh session).
+- **Agent exit without `Finished`:** exit code 0 and no final event counts as
+  success; a missing exit code (killed by a signal) is an `agent_error`.
+- **Dirty check ignores `.phasewise/`** in `ops` in case the exclude line was removed.
+- **`ops::execute`** launches the first pending phase (with the `--auto` loop);
+  both `run` and `next` use it. `ops::next` refuses on a failed phase, a live
+  lock, a dirty tree, or when not on the run branch.
+- **`status` columns:** `#`, `STATUS`, `TRIES`, `FILES`, `COST`, `TITLE`.
+- `tests/cli.rs` stub test now uses `review` (`status` is implemented).

@@ -6,7 +6,9 @@
 
 pub mod agent;
 pub mod cli;
+pub mod engine;
 pub mod git;
+pub mod ops;
 pub mod plan;
 pub mod process;
 pub mod prompt;

@@ -115,3 +115,9 @@ Print a summary, or one JSON object with `--json`.
 ````
 
 More plans are in `examples/plans/`.
+
+## Environment variables (testing and advanced use)
+
+- `PHASEWISE_PHASE_TIMEOUT_SECONDS`: whole seconds; overrides
+  `phase_timeout_minutes` for every phase. An invalid value is an error.
+- `PHASEWISE_CLAUDE_BIN` / `PHASEWISE_CODEX_BIN`: replace the agent binary.
