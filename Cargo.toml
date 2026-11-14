@@ -2,6 +2,7 @@
 name = "phasewise"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Run big plans with Claude Code or Codex one phase at a time — verified, checkpointed, and reviewable."
 license = "MIT"
 repository = "https://github.com/userfypp/phasewise"

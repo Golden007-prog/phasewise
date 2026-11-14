@@ -1,181 +1,78 @@
+<div align="center">
+
 # phasewise
 
-Run big plans with Claude Code or Codex one phase at a time — verified, checkpointed, and reviewable.
+**Run big plans with Claude Code or Codex one phase at a time:<br>verified by your checks, saved as git commits, reviewed by you.**
 
-<!-- demo: demo/demo.gif, not recorded yet; see demo/demo.tape -->
+[![CI](https://img.shields.io/github/actions/workflow/status/userfypp/phasewise/ci.yml?label=CI)](https://github.com/userfypp/phasewise/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-## The problem
+</div>
 
-Handing a large plan to a coding agent in one go gives you one huge, unreviewable change, and no safe point to go back to when step 7 breaks step 3.
-phasewise splits the plan into phases. It runs the agent headless for one phase, runs your checks, saves a git checkpoint on its own branch, and stops.
-You look at what changed, then continue, retry with a note, or roll back.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/home-dark.svg">
+  <img src="assets/readme/home-light.svg" alt="The phasewise home screen: a plan with four phases and their checks, Claude Code with its model and effort, and a notice to commit the plan before starting.">
+</picture>
 
-## Installation
+Hand a coding agent a big plan in one go and you get one huge change to review,
+with no safe point to return to when step 7 breaks step 3. phasewise runs the
+plan one phase at a time: the agent works on a single phase, your checks prove
+it, a git commit saves it, and nothing continues until you have looked at it.
 
-From a clone of this repository:
+Your branch is never touched while a run is in progress. Every phase is a commit
+you can inspect, retry with a note or roll back to. phasewise itself never
+pushes and makes no network connections.
 
-```sh
-cargo install --path .
-```
+### How it works
 
-After the first release (not published yet):
-
-```sh
-cargo install phasewise
-```
-
-Requirements:
-
-- `git`.
-- macOS or Linux (Windows is not supported).
-- Claude Code (`claude`) or Codex (`codex`) installed and logged in. phasewise never logs in for you; `phasewise doctor` checks that the CLIs are present, not that you are logged in.
-
-## Quick start
-
-```sh
-phasewise plan "what you want to do"   # the agent writes phasewise.md for you (or: phasewise init)
-phasewise init      # creates phasewise.md; edit it, then commit it (run needs a clean tree)
-phasewise check     # validates the plan and lists phases and checks; runs nothing
-phasewise run       # starts a run on a new branch and runs phase 1
-phasewise review    # inspect the phase in a TUI (or: phasewise diff)
-phasewise next      # approve the phase and run the next one
-```
-
-## Plan format
-
-A plan is one Markdown file (default `phasewise.md`) with optional TOML front matter. Every `##` heading is a phase; a fenced block tagged `verify` lists the commands that must pass for that phase.
-
-````markdown
-+++
-agent = "claude"
-verify = ["cargo test"]
-+++
-
-# Add a stats subcommand
-
-Shared context sent in every phase. Do not add dependencies.
-
-## Phase 1: Define the subcommand
-
-Add `stats` with a `--json` flag that prints `not implemented`.
-
-```verify
-cargo run -q -- stats --help
-```
-
-## Phase 2: Implement it
-
-Print a summary, or one JSON object with `--json`.
-````
-
-Full reference (front matter keys, defaults, validation errors): [docs/plan-format.md](docs/plan-format.md). Examples: [examples/plans/](examples/plans/).
-
-## Commands
-
-Run `phasewise` with no arguments. On a terminal it opens the review TUI when a run is active, and the **home screen** when there is no active run and you are inside a git repository; otherwise it prints the help.
-
-The home screen shows the plan (missing, valid with its phases, or invalid with the errors and their lines) and the settings (agent, model, effort). Keys:
-
-| Key | What it does |
+| | |
 |---|---|
-| `a` | Switches the agent (claude / codex); the model goes back to default. |
-| `m` | Chooses the model: `default`, the agent's list, or `custom…`. |
-| `e` | Chooses the effort: `default`, `low`, `medium`, `high`, `xhigh`, `max`. |
-| `p` | Asks what you want to do and has the agent write the plan (asks before replacing an existing `phasewise.md`); `x` cancels. |
-| `c` | Checks the plan again (for example after editing or committing it). |
-| `Enter` | Starts a run with the plan and opens the review screen. The plan must be valid and committed; phasewise never commits it for you. |
-| `?` / `q` | Help / quit. |
+| **1. Plan** | Describe the goal in one sentence. The agent reads your project, without changing it, and writes `phasewise.md`. Or write the plan yourself. |
+| **2. Run** | Each phase runs headless on the branch `phasewise/<run-id>`, then your checks run. A failure goes back to the agent with the output. |
+| **3. Review** | Read the diff, the agent's log and the checks. Approve the phase, retry it with a note, or roll back. |
+| **4. Merge** | When the last phase is approved, merge the run branch into yours. |
 
-| Command | What it does | Flags |
-|---|---|---|
-| `phasewise init` | Creates an example `phasewise.md` (never overwrites) and excludes `.phasewise/` from git. | |
-| `phasewise plan [GOAL]` | Starts a read-only agent session that reads the project and writes the plan for GOAL (asked on a terminal when missing). The plan is validated and, if needed, fixed by the same session (at most 2 rounds); it is written only when valid. The agent cannot change files. Agent output and drafts go to `.phasewise/plans/<id>/`. Time limit 20 min (`PHASEWISE_PLAN_TIMEOUT_SECONDS`). | `--agent`, `--model`, `--effort`, `--output PATH` (default `phasewise.md`), `--force` (overwrite) |
-| `phasewise check [PLAN]` | Validates the plan and lists its phases and checks; runs nothing. | `PLAN`: plan path (default `phasewise.md` at the repository root) |
-| `phasewise doctor` | Checks git, claude and codex (presence, version) and whether this directory is a suitable repository. | |
-| `phasewise run [PLAN]` | Starts a run and launches phase 1; fails if a run is already active. | `--agent claude\|codex` (overrides the plan), `--auto` (chain phases until the end or the first failure), `--model <M>`, `--effort <E>` |
-| `phasewise next` | Approves the phase awaiting review and launches the next one. | `--auto`, `--model`, `--effort` |
-| `phasewise retry` | Goes back to the checkpoint before the current phase and reruns it in a new session. | `--note <TEXT>` (appended to the phase prompt), `--model`, `--effort` |
-| `phasewise rollback <N>` | Goes back to the checkpoint of phase N (0 = initial state); later phases become pending again. | `--yes` (skip the confirmation prompt) |
-| `phasewise status` | Shows a table of phases: state, attempts, changed files, cost if known and model. | |
-| `phasewise models [--agent claude\|codex]` | Lists the models each agent offers (Codex: from `codex debug models`; Claude: the documented aliases). | `--agent` (default: both) |
-| `phasewise diff [N]` | Prints the diff of phase N (default: the last one with a checkpoint). | |
-| `phasewise review` | Opens the review TUI: phase list, Diff / Log / Verify tabs. | |
-| `phasewise abort` | Marks the run as abandoned and returns to the original branch; the run branch is kept. | |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/run-dark.svg">
+  <img src="assets/readme/run-light.svg" alt="The run screen: the phase list on the left, and on the right phase 2 awaiting review with its diff.">
+</picture>
 
-Model and effort: `--model <M>` and `--effort low|medium|high|xhigh|max` on `run`, `next` and `retry` are stored in the run and apply from then on; `default` removes the stored value. The plan can set `model` and `effort` in its front matter and per phase in a `phasewise` block (see `docs/plan-format.md`). Precedence, highest first: the flags, the phase block, the front matter, nothing (the agent's own default). The plan's values apply only when the run uses the plan's agent.
+### Quick start
 
-Exit codes: `0` success, `1` usage or environment error, `3` a phase ended failed, `130` second Ctrl-C.
+You need git, macOS or Linux, [Rust](https://rustup.rs) 1.88 or later, and
+[Claude Code](https://code.claude.com/docs) or
+[Codex](https://github.com/openai/codex) installed and logged in.
 
-Review TUI keys: `j`/`k` or arrows select a phase, `Tab` switches tab, `PageUp`/`PageDown` scroll, `n` approve and run the next phase, `r` retry (asks for an optional note), `b` roll back to the selected phase's checkpoint (asks to confirm), `x` interrupt the running phase, `q` quit.
+```sh
+cargo install --path .      # from a clone of this repository
+cd your-project
+phasewise                   # opens the home screen
+```
 
-## Supported agents
+Press `p` and describe what you want. Read the plan the agent writes, press `c`
+to commit it and `enter` to start. Every step is also a command:
+`phasewise plan "…"`, `phasewise run`, `phasewise next`.
 
-| Agent | Status |
-|---|---|
-| Claude Code | tested — smoke test passed with Claude Code 2.1.325 (2026-11-14) |
-| Codex | tested — smoke test passed with Codex CLI 0.160.0 (2026-11-14) |
+The [user guide](docs/user-guide.md) covers the screens, plans, models, every
+command and what to do when a phase fails.
 
-The test suite uses fake agents and synthetic output captures only. The real smoke test (`docs/dev/smoke-test.md`, two trivial phases) has passed with both agents. Agent CLIs change often; if a newer version breaks a run, please open an issue with the raw output from `.phasewise/runs/<id>/`.
+### Good to know
 
-Command lines phasewise uses (the prompt is sent on stdin; `agent_args` from the plan are appended at the end):
+- The agent works without permission prompts, as your user and with your
+  environment. The run branch protects your history, not your machine: read
+  [Security](SECURITY.md) before running a plan you did not write.
+- Agents cost money. phasewise shows Claude Code's cost per phase; Codex does
+  not report one.
+- Tested with Claude Code 2.1.325 and Codex CLI 0.160.0. Agent CLIs change
+  often: [Agents](docs/agents.md) lists the exact command lines phasewise uses.
+- Windows is not supported.
 
-- Claude Code: `claude -p --output-format stream-json --verbose --permission-mode acceptEdits --permission-prompts none --allowedTools Read,Edit,Write,Bash --disallowedTools "Bash(git push *)"`; a retry in the same session adds `--resume <session-id>`.
-- Codex: `codex exec --json --sandbox workspace-write -`; a retry in the same session uses `codex exec --json --sandbox workspace-write resume <session-id> -`.
+### Documentation
 
-`phasewise plan` uses read-only sessions:
+[User guide](docs/user-guide.md) · [Plan format](docs/plan-format.md) ·
+[Agents](docs/agents.md) · [Architecture](docs/ARCHITECTURE.md) ·
+[Decisions](docs/decisions.md) · [Roadmap](docs/ROADMAP.md) ·
+[Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) ·
+[Security](SECURITY.md) · [Code of conduct](CODE_OF_CONDUCT.md)
 
-- Claude Code: `claude -p --output-format stream-json --verbose --permission-mode dontAsk --permission-prompts none --tools Read,Grep,Glob --strict-mcp-config --allowedTools Read,Grep,Glob --disallowedTools Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch` (only those three tools exist in the session, and no MCP server is loaded).
-- Codex: `codex exec --json --sandbox read-only -`.
-
-When a model or effort is set, Claude gets `--model <M> --effort <E>` after the fixed flags (before `--resume` and `agent_args`) and Codex gets `-m <M> -c model_reasoning_effort="<E>"` before the `resume` subcommand.
-
-Set `PHASEWISE_CLAUDE_BIN` or `PHASEWISE_CODEX_BIN` to use a different binary.
-
-## How a run works
-
-1. `phasewise run` requires a git repository with at least one commit, a checked-out branch (not detached) and a clean working tree. It creates the branch `phasewise/<run-id>` from your current commit and switches to it. Your original branch is not touched.
-2. State lives in `.phasewise/` at the repository root (plan copy, `state.json`, agent output, verification logs). It is added to `.git/info/exclude` and never committed.
-3. For each phase the agent runs headless, then the global `verify` commands and the phase's own checks run. If they fail, phasewise retries up to `max_retries` times, telling the agent what failed.
-4. When checks pass, phasewise commits everything as a checkpoint with a message like:
-
-   ```text
-   phasewise: phase 1 — Define the subcommand
-
-   Phasewise-Run: 20261114-101500-a1b2
-   Phasewise-Phase: 1
-   ```
-
-5. It stops with the phase awaiting review. Look at it with `phasewise diff` or `phasewise review`, then `phasewise next`, `phasewise retry --note "..."` or `phasewise rollback N`.
-6. When every phase is done, phasewise prints how to bring the work into your branch:
-
-   ```sh
-   git switch <original-branch> && git merge --squash phasewise/<run-id> && git commit
-   ```
-
-   phasewise does not run this for you.
-
-## Security model
-
-phasewise runs the agent unattended, with permission to edit files and run shell commands in your repository, and the agent inherits your environment variables. The protection is the dedicated branch and the checkpoints, not a sandbox. Read [docs/security.md](docs/security.md) before pointing it at a plan you did not write.
-
-## FAQ
-
-**Does phasewise touch my branch?**
-No. It works on `phasewise/<run-id>`. Your original branch is only changed by you, when you merge. phasewise never pushes, never deletes branches and never uses `--force`. `phasewise abort` returns you to the original branch and keeps the run branch.
-
-**What happens if a phase fails?**
-If verification fails, phasewise retries up to `max_retries` times (default 1). If it still fails, or the agent errors, times out or is interrupted, the phase is marked `failed`, the working tree is left as the agent left it, and the command exits with code 3. Then you can inspect it, `phasewise retry --note "..."` (goes back to the previous checkpoint and starts a new session) or `phasewise rollback N`.
-
-**How much does it cost?**
-phasewise itself is free; the agents are not. Claude's reported `total_cost_usd` is shown per phase in `phasewise status`. Codex reports tokens only, so phasewise shows no cost for it. There are no spending limits in v0.1; for Claude you can pass `--max-budget-usd` through `agent_args` in the plan front matter.
-
-**What does Ctrl-C do?**
-In `run`, `next` and `retry`, the first Ctrl-C stops the agent and marks the phase failed (interrupted); a second one kills the agent's processes and exits with 130. SIGTERM and SIGHUP (for example closing the terminal) are handled like Ctrl-C. If phasewise dies some other way, the next command that reads the run marks the orphaned phase as failed (interrupted). In the TUI, Ctrl-C works like `q`.
-
-## Roadmap
-
-See [docs/ROADMAP.md](docs/ROADMAP.md). Changes are listed in [CHANGELOG.md](CHANGELOG.md).
-
-## License
-
-MIT, © userfypp. See [LICENSE](LICENSE).
+<sub>MIT licensed. © userfypp.</sub>

@@ -1,0 +1,35 @@
+name: Bug report
+description: Something does not work as the documentation says.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: A minimal plan and repository help most.
+      placeholder: |
+        1. phasewise plan "…"
+        2. …
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: phasewise --version and phasewise doctor
+      description: Paste both outputs. They show the agent versions and your setup.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Agent output or logs
+      description: For a failed phase, the relevant files from .phasewise/runs/<run-id>/. Remove paths, account names, tokens and anything private first.
+      render: text

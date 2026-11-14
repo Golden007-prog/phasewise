@@ -1,5 +1,5 @@
 #!/bin/sh
-# Real smoke test with a real agent (plan section 8).
+# Smoke test with a real agent CLI.
 #
 # Spends a little: one run of two trivial phases. Run it only with an agent CLI
 # that is installed and logged in. It works in a new temporary repository and

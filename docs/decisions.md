@@ -1,7 +1,12 @@
 # Decisions
 
-Minor decisions taken while building v0.1, and every place where the build
-deviates from the original plan, with the reason.
+Why phasewise is the way it is: the choices someone would question, oldest
+first, each with its reason. Add an entry when you make one.
+
+Entries before v0.3 mention the internal design documents (`design.md`,
+`design-v0.2.md`, `agent-cli-notes.md`) and the original build plan. In v0.3
+the documents were merged into [Architecture](ARCHITECTURE.md) and
+[Agents](agents.md); git history keeps the originals.
 
 ## Build phase 0
 
@@ -33,7 +38,7 @@ deviates from the original plan, with the reason.
 - **CI actions:** `actions/checkout@v7` and `Swatinem/rust-cache@v2` (latest
   releases according to the GitHub API on 2026-11-14),
   `dtolnay/rust-toolchain@stable`.
-- **Internal design** fixed in `docs/dev/design.md` before implementation,
+- **Internal design** fixed in `design.md` before implementation,
   with two modules not in the original layout: `ops.rs` (run-level operations
   shared by the CLI and the TUI, so the TUI does not depend on the CLI) and
   `process.rs` (process groups and termination). `AgentEvent` gains an
@@ -109,8 +114,9 @@ deviates from the original plan, with the reason.
   development session's environment carries host-provided credentials of the
   desktop app; they were not used (rule: never use or copy tokens). The
   shell's `OPENAI_API_KEY` belongs to another provider and was not sent to
-  OpenAI. Both agents stay "experimental". `scripts/smoke-test.sh` and
-  `docs/dev/smoke-test.md` let the maintainer run the test after logging in.
+  OpenAI. Both agents stay "experimental". `scripts/smoke-test.sh` lets the
+  maintainer run the test after logging in (see
+  [Contributing](../CONTRIBUTING.md)).
 - **Event formats without real captures:** Codex checked against its source
   at tag `rust-v0.160.0` (`exec_events.rs`); Claude Code against the Agent SDK
   TypeScript reference. Fixtures stay `.synthetic.jsonl`.
@@ -570,3 +576,111 @@ findings:
 - **Codex** reports no model in its JSON events (checked in real captures), so
   `agent_model` stays empty for Codex and its requested model is shown as
   written.
+
+## v0.3 — one session for both screens
+
+- **One loop, two screens.** v0.2 switched from the home screen to the review
+  screen once and could not go back. Now one event loop owns the terminal and
+  both screens: the home state always exists, and the run state exists while
+  the repository has a current run. The run keeps its worker, channel and
+  caches while the home screen is shown, so a phase keeps running and no event
+  is lost. `esc` goes home; `enter` (active run) or `o` (any current run) goes
+  back. `phasewise` opens the run screen when the current run is active and the
+  home screen otherwise; `phasewise review` is unchanged.
+- **`c` commits the plan.** Starting a run needs a committed plan, and v0.2
+  only showed the command to copy. `c` runs `ops::commit_plan` in a thread:
+  only the plan file, with the message `Add phasewise plan`, keeping the user's
+  hooks and signing because it is their commit on their branch. The copyable
+  command stays in the notice for people who prefer the shell. `enter` on an
+  uncommitted plan asks "Commit and start?" instead of failing.
+- **The home screen reloads by itself** every 2 seconds while idle, so an edit
+  made in another window shows up without a key. A quiet reload redraws only
+  when the data changed and reports no error; the old "check again" key is
+  gone, which freed `c`.
+- **`A` abandons the run** from the run screen, after a confirmation, through
+  the same `ops::abort` as `phasewise abort`. A capital letter, because it ends
+  the run.
+- **Confirmations and inputs** follow Claude Code: two numbered rows answered
+  with `y`/`n`, `1`/`2` or arrows and `enter`; stray keys are ignored instead
+  of cancelling. Pickers are numbered and a digit chooses. Text inputs accept
+  Ctrl-U (clear) and Ctrl-W (delete a word). Stopping a planning session asks
+  first, because it throws away paid work.
+
+## v0.3 — the look of the TUI
+
+- **Claude Code as the model.** The v0.2 screens were full-height panels with
+  borders, labels and hints everywhere, which read as "a lot of text piled
+  up". The people who use phasewise use Claude Code every day, so its visual
+  language was copied: quiet chrome, a rounded box only for the header card
+  and popups, metadata in dim text joined with `·`, `❯` for the selection, `✔`
+  for the current choice, and one footer line of `key action` pairs ending in
+  `? shortcuts`. Colours are limited to cyan (accent), dark grey (dim), green,
+  red and yellow.
+- **Content-sized layout.** The home screen is top-aligned and its footer
+  follows the content after one blank line; columns are as wide as their
+  content (the phase title column is capped at 40) so metadata stays next to
+  what it describes. Popups are exactly as tall and wide as their content.
+- **Footer by priority.** When the terminal is narrow, the footer drops whole
+  items from the least important end and always keeps `? shortcuts`, so it is
+  never cut in the middle of a word. On the run screen the message has its own
+  row above the footer.
+- **No hint repeated.** A key shown in the footer is not explained again in a
+  notice or a status line.
+- **README screenshots from the real rendering.** An ignored test renders the
+  screens with ratatui's `TestBackend` and writes SVGs to `assets/readme/`: no
+  extra tool, no real agent, always in step with the code, and readable in
+  diffs. Every non-ASCII glyph gets its own positioned `<tspan>` so a fallback
+  font cannot shift the columns, and trailing empty rows are cut.
+
+## v0.3 — review fixes
+
+- **Localized title prefixes come from a word list.** Accepting any word before
+  the phase number cut real titles ("Python 3.12 upgrade" in phase 3 became
+  "12 upgrade"). Only words for "phase", "step", "stage" or "part" in common
+  languages count, `.` and `)` need a space after them, and English
+  `Phase <n>:` keeps working at any number. A missed language only leaves the
+  number in the title; a wrong match would lose words, so the list errs on the
+  side of keeping text.
+- **Lock contention is git's fatal exit (128) plus `index.lock`.** A failing
+  pre-commit hook exits 1 and may print anything, and must not be re-run seven
+  times. The lock path comes from `git rev-parse --git-path index.lock`, which
+  also handles linked worktrees and paths with quotes; parsing git's localized
+  message is only the fallback.
+- **No commits or runs from a run branch.** Committing the plan or starting a
+  run while a `phasewise/` branch is checked out would stack work on an old
+  run's branch and make the final merge hint name it. Both are refused with
+  the `git switch` command back to the original branch when it is known.
+- **A forced quit.** Quitting waits for every worker to stop, so a hook that
+  hangs or a child that ignores `TERM` would keep the user on "Stopping…".
+  A second Ctrl-C or `q` there does what a second signal does in commands:
+  it kills every process group and exits with 130, and the next command
+  recovers the phase as interrupted.
+- **The periodic home reload runs on a thread.** Loading the home data runs
+  git and reads the plan, which froze the keys every 2 seconds in a big
+  repository. The result is applied only if the home screen is shown with no
+  popup open, no commit running and no explicit reload since it started, so it
+  never replaces newer data or a question on screen.
+- **The running phase is selected.** After `n`, the selection stayed on the
+  approved phase and the screen kept showing its diff while the next one ran.
+  The phase that starts is selected; a retry of the same phase leaves the
+  user's selection alone.
+- **Widths are terminal columns.** Counting characters pushed CJK titles and
+  emoji out of their columns; ratatui's width is used instead.
+
+## v0.3 — documentation
+
+- **One file for coding agents: `AGENTS.md`.** Codex and most other agents read
+  `AGENTS.md`. Claude Code 2.1.325 loads a project's `AGENTS.md` when it has no
+  `CLAUDE.md` (its default "claude-md-or-agents-md" setting), so a `CLAUDE.md`
+  that only imported `AGENTS.md` was redundant and was removed.
+- **Fewer, binding documents.** The v0.1 and v0.2 design documents became
+  [Architecture](ARCHITECTURE.md), which describes the code as it is and must
+  change with it, and [Agents](agents.md), which holds the exact command lines.
+  The build log and the acceptance checklist of v0.1 were removed; git history
+  keeps them.
+- **Community files at the root** (`CONTRIBUTING.md`, `SECURITY.md`,
+  `CODE_OF_CONDUCT.md`), where GitHub looks for them, and issue and pull request
+  templates in `.github/`.
+- **`rust-version = "1.88"`** in `Cargo.toml`: the code uses let chains,
+  stable since Rust 1.88, and ratatui 0.30 needs the same version.
+

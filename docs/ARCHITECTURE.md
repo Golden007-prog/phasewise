@@ -1,0 +1,287 @@
+# Architecture
+
+How phasewise is built. This page is binding: a change to module boundaries,
+on-disk formats or the invariants below updates it in the same commit, and the
+reason goes to [decisions](decisions.md). For what users see, read the
+[user guide](user-guide.md); for the exact agent command lines,
+[agents](agents.md).
+
+## The big picture
+
+```text
+          phasewise <command>              phasewise (no command)
+               cli.rs                              tui/
+                  │                                  │
+                  └────────────────┬─────────────────┘
+                                   ▼
+                                ops.rs            start, next, retry, rollback,
+                                   │              abort, commit the plan, plan
+                                   ▼
+                              engine.rs           one phase: agent → checks → checkpoint
+                                   │
+      ┌──────────────┬─────────────┼─────────────┬──────────────┐
+      ▼              ▼             ▼             ▼              ▼
+   agent/        verify.rs      git.rs       state.rs      process.rs
+   the agent     the plan's     the only     state.json,   process groups,
+   CLIs          checks         git caller   lock          signals
+```
+
+Below these sit pure helpers with no I/O worth mentioning: `plan` (parser),
+`prompt` (every prompt text), `display` and `style` (text shared by the CLI and
+the TUI).
+
+The engine and `ops` never print or draw. They report through a
+`std::sync::mpsc::Sender` of `EngineEvent` (a phase) or `PlanEvent` (a planning
+session). The CLI turns the events into lines on stdout; the TUI turns the same
+events into its screens. Both use `display` for the words, so they always say
+the same thing.
+
+There is no async runtime: long work runs on plain threads, and every agent or
+check runs as a child process in its own process group.
+
+## Modules
+
+| Module | Responsibility |
+|---|---|
+| `main.rs` | Only calls `cli::main()`. |
+| `cli.rs` | clap definitions, dispatch, printing events, exit codes. |
+| `ops.rs` | Run-level operations shared by the CLI and the TUI: `start`, `next`, `approve`, `retry`, `rollback`, `abort`, `execute`, `commit_plan`, loading the current run, and `create_plan` for `phasewise plan`. |
+| `engine.rs` | One phase cycle (`run_phase`) and the agent-following loop shared with planning (`run_agent_session`): spawn, stdin, reader thread, logs, timeout, cancel, leftovers. |
+| `plan.rs` | The plan model and parser (`pulldown-cmark` and `toml`), validation with line numbers, model and effort values. |
+| `prompt.rs` | Every text sent to an agent, and the extraction of a plan from an answer. Pure functions. |
+| `agent/mod.rs` | The `Agent` and `AgentParser` traits, `AgentEvent`, `LaunchOptions`, `ModelInfo`. |
+| `agent/claude.rs`, `agent/codex.rs` | Command lines, model lists and output parsers, one file per agent. |
+| `verify.rs` | Runs the checks with a timeout and writes `verify.log`. |
+| `git.rs` | The only module that runs git. |
+| `state.rs` | `state.json`, the `.phasewise` layout, atomic writes, the run lock and recovery. |
+| `process.rs` | Process groups, termination, signals, the panic hook, the closed-terminal watch. |
+| `display.rs` | Events into text: `EventLine`s, phase headers and summaries, status and failure labels, model names, paths. |
+| `style.rs` | `Styler`: ANSI colour for the CLI, only on a terminal with `NO_COLOR` unset and `TERM` not `dumb`. |
+| `doctor.rs` | `phasewise doctor`. |
+| `tui/mod.rs` | The TUI's event loop: terminal setup and restore, the two screens, worker threads, refreshes. |
+| `tui/home.rs`, `tui/app.rs` | Pure state machines for the home and run screens: a key in, a command out, no I/O. |
+| `tui/shared.rs` | State and helpers both screens use (popups, footer items, spinner timing). |
+| `tui/data.rs` | Read-only loaders: home data, run, diff, log and checks. |
+| `tui/home_view.rs`, `tui/view.rs`, `tui/widgets.rs` | Rendering with ratatui: the home screen, the run screen, and the pieces they share. Covered by `insta` snapshots. |
+
+Library code returns `anyhow::Result`, or a `thiserror` type where the caller
+must tell errors apart (plan errors). Every message that reaches the user says
+what happened and what to do next.
+
+## A run, step by step
+
+### Starting
+
+`ops::start` loads and validates the plan, refuses if a run is already active,
+and checks the repository: it has commits, `HEAD` is on a branch, and the
+working tree is clean (the error lists up to ten dirty paths and says to commit
+or stash them). It then adds `.phasewise/` to `.git/info/exclude`, creates the
+branch `phasewise/<run-id>` at `HEAD`, copies the plan to the run directory and
+writes `state.json` and `current`.
+
+The run id is the UTC time plus four random hex characters:
+`20261114-153012-a3f9`.
+
+### One phase
+
+`engine::run_phase` runs with the run lock held:
+
+1. Build the prompt: the plan's context, the phase, one line per completed
+   phase, the checks, and the reviewer's note if any.
+2. Launch the agent ([command lines](agents.md)). Every launch counts as an
+   attempt, and attempts are never reset, so no log is ever overwritten. The
+   status is `running`. Events stream to the UI as they come. The attempt
+   stops on the phase timeout (`phase_timeout_minutes`) or on cancel.
+3. The agent failed, timed out, was interrupted, or left `HEAD` off the run
+   branch: the phase is `failed`, with no automatic retry.
+4. Otherwise the status is `verifying` and the checks run: the plan's global
+   checks, then the phase's, in order, stopping at the first failure.
+5. A check failed and retries are left (`max_retries`): the failure report
+   (command, exit code, last 200 lines of output) goes back to the agent, in
+   the same session when its id is known, and the cycle repeats from step 2.
+   No retries left: `failed` with `verify_failed`, and the tree is left as it
+   is for the user to inspect.
+6. All checks passed: `git add -A`, then a checkpoint commit on the run branch,
+   even when nothing changed. The phase is `awaiting_review`.
+
+| From | To | When |
+|---|---|---|
+| `pending` | `running` | The phase starts. |
+| `running` | `verifying` | The agent finished. |
+| `running` | `failed` | Agent error, timeout, interruption, or `HEAD` left the run branch. |
+| `verifying` | `running` | A check failed and retries are left. |
+| `verifying` | `failed` | A check failed with no retries left, or the checkpoint failed. |
+| `verifying` | `awaiting_review` | Every check passed and the checkpoint was committed. |
+| `awaiting_review` | `done` | The user approved it. |
+| `failed`, `awaiting_review` | `running` | The user retried it. |
+| any later phase | `pending` | The user rolled back to an earlier phase. |
+
+A retry resets the tree to the previous checkpoint and runs the phase again in
+a fresh session, with the user's note if there is one. A rollback to phase k
+resets the tree to its checkpoint and clears everything recorded for the later
+phases.
+
+### Reviewing and finishing
+
+`ops::next` approves the phase awaiting review (it becomes `done`) and runs the
+next pending one. With `--auto` it keeps going until a phase fails; the last
+phase always waits for review. When the last phase is approved, the run is
+`completed`. Integrating it is left to the user, who is told the command:
+
+```sh
+git switch <original-branch> && git merge --squash phasewise/<run-id> && git commit
+```
+
+`ops::abort` ends a run at any point. If the run branch has uncommitted
+changes, they are committed there first (`phasewise: abort — uncommitted
+changes`), so nothing is lost. phasewise then switches back to the original
+branch. The run branch is never deleted.
+
+`next`, `retry` and `abort` require the run branch to be checked out; `next`
+also requires a clean tree.
+
+## Writing a plan
+
+`ops::create_plan` drives `phasewise plan` and the home screen's `p`:
+
+1. Refuse if the output file exists and replacing it was not confirmed.
+2. Run a read-only agent session ([command lines](agents.md#writing-a-plan))
+   with `prompt::plan_prompt`: the plan format, how to write good phases, the
+   agent's model list, and the rule that the answer must hold the plan between
+   a `<<<PHASEWISE-PLAN` line and a `PHASEWISE-PLAN>>>` line.
+3. Extract the text between the last pair of markers, remove a code fence
+   around it, and validate it with `plan::parse`. Its `agent` must be the
+   chosen one.
+4. On any problem, resume the same session with the list of problems, at most
+   twice.
+5. Write the plan atomically, or nothing if it is still invalid. Every answer
+   and draft is kept under `.phasewise/plans/<plan-id>/`.
+
+The plan is not committed. The user reads it, then commits it, by hand or with
+`c` on the home screen (`ops::commit_plan`, which commits that one file and
+nothing else).
+
+## On disk
+
+```text
+<repo>/.phasewise/                     excluded through .git/info/exclude
+├── current                            id of the current run
+├── runs/<run-id>/
+│   ├── state.json                     the run's state
+│   ├── plan.md                        the plan as it was when the run started
+│   ├── lock                           PID of the process changing the run
+│   ├── phase-NN.attempt-K.jsonl       agent output, one event per line
+│   ├── phase-NN.attempt-K.stderr.log  agent stderr
+│   └── phase-NN.verify.log            check output, every attempt
+└── plans/<plan-id>/                   one per planning session
+    ├── attempt-K.jsonl
+    ├── attempt-K.stderr.log
+    └── draft-K.md                     each plan extracted from an answer
+```
+
+`NN` is the phase number with two digits; `K` counts from 1.
+
+`state.json` holds the run (`run_id`, plan path and title, agent, original
+branch, run branch, `base_sha`, status `active`, `completed` or `aborted`,
+timestamps, model and effort overrides) and one entry per phase: status,
+attempts, session id, checkpoint SHA, the agent's final message (at most 2000
+characters), cost, start and end times, the failure (`kind` and `detail`), the
+model and effort requested, and the model the agent reported. New fields are
+optional, so older files keep loading; `schema_version` stays 1.
+
+## Invariants
+
+These hold everywhere. A change that breaks one is a design change.
+
+- **git runs only from `git.rs`**, always as `git -C <root>` with the output
+  captured, so every failure can name the command and its stderr.
+- **phasewise never pushes, never deletes a branch, never uses `--force`, and
+  never resets or commits on the original branch.** The one commit it makes
+  outside the run branch is the plan file, when the user asks for it with `c`.
+  That commit runs the user's hooks and signing like any commit of theirs;
+  checkpoints skip both (`--no-verify --no-gpg-sign`) because they are
+  phasewise's own bookkeeping.
+- **Reads never block writes.** Every git command runs with
+  `GIT_OPTIONAL_LOCKS=0`, so the TUI's `status` and `diff` refreshes never hold
+  `index.lock` while a checkpoint is committed. A command that still meets a
+  held lock is retried for about 3.5 seconds before the error, which names the
+  lock file and what to do. phasewise never deletes a lock file.
+- **`git clean` never touches `.phasewise/`**: it runs with
+  `-e /.phasewise/`, and the directory is also excluded.
+- **State is written atomically:** a temporary file in the same directory,
+  `sync_all`, then `rename`.
+- **One process changes a run at a time.** `runs/<id>/lock` holds the PID of
+  the process running a mutating operation, created with `create_new`. A lock
+  whose process is gone is stale and replaced. With a live lock, read-only
+  commands show the state as it is and mutating commands refuse.
+- **Interrupted work is recovered on load.** Without a live lock, a phase left
+  in `running` or `verifying` becomes `failed` with `interrupted`.
+- **Every child runs in its own process group** and is stopped as a group:
+  `TERM`, a grace period (5 seconds for an agent, 2 for a check), then
+  `KILL`. A child dropped without being stopped
+  (an early return, a panic) is killed. After a normal exit, whatever it left
+  running in its group is stopped too.
+- **Signals:** Ctrl-C, `SIGTERM` and `SIGHUP` set a shared cancel flag; a
+  second one kills every group and exits with 130. The TUI also treats a
+  changed parent process as a closed terminal, because then no signal may
+  arrive.
+- **Agent parsers never fail.** Invalid JSON, unknown events and unknown fields
+  are ignored.
+- **No network.** phasewise itself makes no connections; only the agents do.
+- **Tests never run a real agent**, never use the network and never read the
+  global git configuration.
+
+## The TUI
+
+`phasewise` without a command, on a terminal inside a git repository, opens the
+TUI: the run screen when the current run is active, the home screen otherwise.
+`phasewise review` opens the run screen directly.
+
+- **One loop, two screens.** `tui/mod.rs` owns the terminal and a single event
+  loop. The home state always exists; the run state exists while the
+  repository has a current run, and keeps its worker and caches while the home
+  screen is shown. `esc` goes from the run screen to home; `enter` or `o` goes
+  back.
+- **State machines are pure.** `home.rs` and `app.rs` take a key and return a
+  command; `mod.rs` carries the command out: it starts a worker thread, calls
+  `ops`, or reloads data. This is what makes the screens testable without a
+  terminal.
+- **Workers.** A phase or a planning session runs on a thread that sends events
+  through a channel. Every turn, the loop drains the channels, joins finished
+  workers, reloads what changed (run data at most every 250 ms; the home data
+  every 2 seconds, on a thread) and redraws only when something changed, or
+  every 120 ms while a spinner shows. A periodic home reload is dropped if,
+  when it arrives, a popup is open, a commit is running or an explicit reload
+  happened since it started.
+- **Quitting** with work in progress asks first; yes cancels every worker and
+  waits for them to stop. A second Ctrl-C or `q` while stopping kills every
+  process group and exits with 130, like a second signal. The terminal is
+  restored on every exit path, including panics.
+- **Widths are terminal columns** (`widgets::text_width`): wide characters
+  take two, and truncation, padding and wrapping never split one.
+- **Rendering** is snapshot-tested with `insta` and ratatui's `TestBackend`.
+  The README screenshots come from the same rendering:
+  `cargo test --all-features -- --ignored readme_screenshots` writes the SVGs
+  in `assets/readme/`.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success. |
+| 1 | A usage or environment error, or a failed planning session. |
+| 3 | A phase ended `failed`. |
+| 130 | Stopped by a second Ctrl-C or signal. |
+
+## Where to change what
+
+| To… | Change |
+|---|---|
+| Support a new version of an agent CLI | `agent/claude.rs` or `agent/codex.rs`, their fixtures in `tests/fixtures/`, and [agents](agents.md). |
+| Add a model to the Claude list | `CLAUDE_MODELS` in `agent/claude.rs`, the [user guide](user-guide.md#models-and-effort) and [agents](agents.md#models-and-effort). |
+| Change what the agent is told | `prompt.rs` and its tests. |
+| Add plan syntax | `plan.rs`, [plan format](plan-format.md), and the plan prompt in `prompt.rs`, which teaches the format to the agent. |
+| Add or change a command | `cli.rs`, the operation in `ops.rs`, the integration tests and the [user guide](user-guide.md#commands). |
+| Change how an event reads | `display.rs`; the CLI and the TUI both follow. |
+| Add a key | `tui/home.rs` or `tui/app.rs`, the footer and shortcuts lists, and the [user guide](user-guide.md#keys). |
+| Change the look | `tui/widgets.rs`, `tui/home_view.rs`, `tui/view.rs`, the snapshots and the README screenshots. |
