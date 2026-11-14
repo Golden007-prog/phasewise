@@ -217,10 +217,14 @@ impl Default for ParentWatch {
     }
 }
 
+/// Signal 0 to a process group. `kill -0 -- -PGID` fails in dash (the `sh` of
+/// Debian and Ubuntu: "Illegal number"), so the signal is given with `-s`.
+const GROUP_PROBE: &str = "kill -s 0 -- \"-$1\"";
+
 /// Whether any process of the group still exists.
 fn group_exists(pgid: u32) -> bool {
     Command::new("sh")
-        .args(["-c", "kill -0 -- \"-$1\"", "sh"])
+        .args(["-c", GROUP_PROBE, "sh"])
         .arg(pgid.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -290,6 +294,23 @@ mod tests {
         assert!(!is_alive(pid));
         assert!(!group_exists(pid));
         assert!(!registered(pid));
+    }
+
+    #[test]
+    fn the_group_probe_works_in_every_posix_shell() {
+        let mut child = spawn_in_group(&mut quiet("sleep 30 & wait")).expect("spawn");
+        let pgid = child.id().to_string();
+        for shell in ["/bin/sh", "/bin/dash", "/bin/bash"] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            let status = Command::new(shell)
+                .args(["-c", GROUP_PROBE, "sh", &pgid])
+                .status()
+                .expect("run shell");
+            assert!(status.success(), "{shell} cannot probe a group");
+        }
+        child.terminate(Duration::from_secs(5)).expect("terminate");
     }
 
     #[test]
