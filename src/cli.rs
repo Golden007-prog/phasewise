@@ -15,8 +15,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use crate::agent::LaunchOptions;
 use crate::agent::{ModelInfo, agent_for};
 use crate::display::{
-    event_line, failure_kind_label, money, phase_count, phase_header, phase_summary,
-    plan_event_line, plan_header, status_label,
+    event_line, failure_kind_label, model_name, money, path_in, phase_count, phase_header,
+    phase_summary, plan_event_line, plan_header, status_label,
 };
 use crate::engine::EngineEvent;
 use crate::git::Git;
@@ -301,6 +301,14 @@ fn resolve_plan_path(arg: Option<PathBuf>) -> Result<PathBuf> {
     Ok(dir.join(PLAN_FILE))
 }
 
+/// A path as shown to the user: relative to the current directory when it is inside it.
+fn shown_path(path: &Path) -> PathBuf {
+    match std::env::current_dir() {
+        Ok(cwd) => path_in(&cwd, path),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
 fn check(arg: Option<PathBuf>) -> Result<ExitCode> {
     let path = resolve_plan_path(arg)?;
     let loaded = match plan::load(&path) {
@@ -309,6 +317,15 @@ fn check(arg: Option<PathBuf>) -> Result<ExitCode> {
             let message = err.to_string();
             // Parse problems are already rendered as `<path>:<line>: <message>`.
             if message.starts_with(&format!("{}:", path.display())) {
+                let shown = shown_path(&path);
+                let message = message
+                    .lines()
+                    .map(|l| match l.strip_prefix(&format!("{}:", path.display())) {
+                        Some(rest) => format!("{}:{rest}", shown.display()),
+                        None => l.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 eprintln!("{message}");
                 eprintln!("error: the plan has {} problem(s)", message.lines().count());
                 return Ok(ExitCode::from(1));
@@ -316,7 +333,7 @@ fn check(arg: Option<PathBuf>) -> Result<ExitCode> {
             return Err(err);
         }
     };
-    print_plan(&loaded, &path);
+    print_plan(&loaded, &shown_path(&path));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -324,12 +341,9 @@ fn print_plan(plan: &plan::Plan, path: &Path) {
     let st = Styler::for_stdout();
     let config = &plan.config;
     outln!(
-        "{}",
-        st.heading(&format!(
-            "{} ({})",
-            plan.title.as_deref().unwrap_or("(untitled)"),
-            path.display()
-        ))
+        "{} · {}",
+        st.heading(plan.title.as_deref().unwrap_or("(untitled)")),
+        st.dim(&path.display().to_string())
     );
     outln!("Agent: {}", config.agent);
     if let Some(model) = &config.model {
@@ -420,53 +434,66 @@ Any model name accepted by `{program} {flag}` still works."
 }
 
 fn print_models(kind: AgentKind, models: &[ModelInfo], st: &Styler) {
-    outln!("{}", st.heading(&format!("{kind} models")));
+    let (title, own_choice) = match kind {
+        AgentKind::Claude => ("Claude Code", "Claude Code's own choice"),
+        AgentKind::Codex => ("Codex", "Codex's own choice"),
+    };
+    outln!("{}", st.heading(title));
+    let name_width = models
+        .iter()
+        .map(|m| m.name.chars().count())
+        .chain(["Default".len()])
+        .max()
+        .unwrap_or(0);
     let id_width = models
         .iter()
         .map(|m| m.id.chars().count())
         .max()
         .unwrap_or(0);
-    // The label column is only shown when it adds something (Claude's aliases
-    // have no separate display name).
-    let show_labels = models.iter().any(|m| m.label != m.id);
-    let label_width = if show_labels {
-        models
-            .iter()
-            .map(|m| m.label.chars().count())
-            .max()
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    outln!(
+        "  {:<name_width$}  {:<id_width$}  {}",
+        "Default",
+        "",
+        st.dim(own_choice)
+    );
     for m in models {
-        let mut line = format!("  {:<id_width$}", m.id);
-        if show_labels {
-            line.push_str(&format!("  {:<label_width$}", m.label));
-        }
+        // Codex lists its own efforts per model; Claude's are one note below.
+        let mut parts = Vec::new();
         if !m.description.is_empty() {
-            line.push_str(&format!("  {}", m.description));
+            parts.push(m.description.clone());
         }
-        let line = line.trim_end().to_string();
-        if m.efforts.is_empty() {
-            outln!("{line}");
-        } else {
-            outln!(
-                "{line}{}",
-                st.dim(&format!(" · effort: {}", m.efforts.join(", ")))
-            );
+        if kind == AgentKind::Codex && !m.efforts.is_empty() {
+            parts.push(format!("effort: {}", m.efforts.join(", ")));
         }
+        let detail = parts.join(" · ");
+        let line = format!(
+            "  {:<name_width$}  {}  {}",
+            m.name,
+            st.accent(&format!("{:<id_width$}", m.id)),
+            st.dim(&detail)
+        );
+        outln!("{}", line.trim_end());
     }
     if models.is_empty() {
-        outln!("  (no models listed)");
+        outln!("  {}", st.dim("(no models listed)"));
     }
-    let note = match kind {
+    outln!();
+    match kind {
         AgentKind::Claude => {
-            "Effort levels: low, medium, high, xhigh, max. Any full model name accepted by \
-`claude --model` also works; your account may restrict which models are available."
+            outln!("  {}", st.dim("Effort: low, medium, high, xhigh, max"));
+            outln!(
+                "  {}",
+                st.dim(
+                    "Other names `claude --model` accepts work too, such as opus or \
+claude-opus-5-5[1m]. Your account decides which models you can use."
+                )
+            );
         }
-        AgentKind::Codex => "Any model name accepted by `codex -m` also works.",
-    };
-    outln!("  {}", st.dim(note));
+        AgentKind::Codex => outln!(
+            "  {}",
+            st.dim("Any model name accepted by `codex -m` also works.")
+        ),
+    }
 }
 
 fn doctor() -> Result<ExitCode> {
@@ -490,7 +517,7 @@ fn init() -> Result<ExitCode> {
     } else {
         std::fs::write(&path, PLAN_TEMPLATE)
             .with_context(|| format!("Cannot write {}", path.display()))?;
-        outln!("Created {}.", path.display());
+        outln!("Created {}.", shown_path(&path).display());
     }
     if git.ensure_excluded(".phasewise/")? {
         outln!("Added .phasewise/ to the git exclude file.");
@@ -501,6 +528,9 @@ fn init() -> Result<ExitCode> {
     outln!("  2. Commit it (`phasewise run` needs a clean working tree).");
     outln!("  3. phasewise check");
     outln!("  4. phasewise run");
+    outln!();
+    outln!("Or run `phasewise` with no arguments to open the home screen:");
+    outln!("commit the plan and start the run from there.");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -610,8 +640,7 @@ fn plan_command(
     let cancel = process::install_signal_handler(Some(INTERRUPT_NOTICE))?;
     let (tx, rx) = mpsc::channel::<PlanEvent>();
     let shown_from = cwd.clone();
-    // Paths inside the current directory are shown relative to it.
-    let shown = |path: &Path| path.strip_prefix(&shown_from).unwrap_or(path).to_path_buf();
+    let shown = |path: &Path| path_in(&shown_from, path);
     let worker = thread::spawn(move || ops::create_plan(&cwd, &request, &tx, &cancel));
     let started = Instant::now();
     let st = Styler::for_stdout();
@@ -976,7 +1005,10 @@ fn status() -> Result<ExitCode> {
                 p.attempts.to_string(),
                 files,
                 cost,
-                p.model.clone().unwrap_or_else(|| "-".to_string()),
+                p.agent_model
+                    .as_ref()
+                    .or(p.model.as_ref())
+                    .map_or_else(|| "-".to_string(), |m| model_name(state.agent, m)),
             ]
         })
         .collect();

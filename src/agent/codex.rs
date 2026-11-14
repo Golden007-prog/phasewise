@@ -84,7 +84,7 @@ pub fn parse_models(json: &str) -> Result<Vec<ModelInfo>> {
                 .unwrap_or_default();
             Some(ModelInfo {
                 id,
-                label,
+                name: label,
                 description: text(e, "description"),
                 efforts,
             })
@@ -283,6 +283,7 @@ impl AgentParser for CodexParser {
             self.session_seen = true;
             out.push(AgentEvent::SessionStarted {
                 session_id: id.to_string(),
+                model: None,
             });
         }
         match value.get("type").and_then(Value::as_str) {
@@ -348,6 +349,7 @@ mod tests {
         let want = vec![
             AgentEvent::SessionStarted {
                 session_id: TID.into(),
+                model: None,
             },
             call("Shell", "/bin/zsh -lc 'ls src'"),
             call("Edit", "src/hello.txt, README.md"),
@@ -369,6 +371,7 @@ mod tests {
         let want = vec![
             AgentEvent::SessionStarted {
                 session_id: TID.into(),
+                model: None,
             },
             AgentEvent::Error {
                 detail: "stream disconnected, retrying".into(),
@@ -616,7 +619,7 @@ mod tests {
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
         // The hidden entry and the one without a slug are dropped.
         assert_eq!(ids, ["gpt-fast", "gpt-deep"]);
-        assert_eq!(models[0].label, "GPT-Fast");
+        assert_eq!(models[0].name, "GPT-Fast");
         assert_eq!(models[0].description, "Fast model for simple tasks.");
         assert_eq!(models[0].efforts, ["low", "medium", "high"]);
         // Plain string efforts are accepted too.

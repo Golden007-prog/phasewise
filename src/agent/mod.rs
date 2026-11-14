@@ -30,7 +30,7 @@ pub struct LaunchOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelInfo {
     pub id: String,
-    pub label: String,
+    pub name: String,
     pub description: String,
     pub efforts: Vec<String>,
 }
@@ -40,6 +40,8 @@ pub struct ModelInfo {
 pub enum AgentEvent {
     SessionStarted {
         session_id: String,
+        /// The model the agent reports using, when it says so.
+        model: Option<String>,
     },
     Message {
         text: String,

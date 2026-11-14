@@ -29,8 +29,12 @@ struct Env {
 
 impl Env {
     fn new() -> Env {
+        Env::with_plan(PLAN)
+    }
+
+    fn with_plan(plan: &str) -> Env {
         let repo = TestRepo::new();
-        repo.write("phasewise.md", PLAN);
+        repo.write("phasewise.md", plan);
         repo.commit_all("add plan");
         Env {
             repo,
@@ -134,6 +138,17 @@ fn plan_phase_and_cli_values_reach_the_agent_with_the_right_precedence() {
 }
 
 #[test]
+fn the_model_the_agent_reports_is_recorded_and_shown() {
+    let env = Env::with_plan("# Demo\n\n## One\n\nDo one.\n");
+    env.ok(&["run"]);
+    let state = env.state();
+    assert_eq!(state["phases"][0]["agent_model"], "claude-sonnet-5-5");
+    assert!(state["phases"][0].get("model").is_none());
+    let status = env.ok(&["status"]).stdout;
+    assert!(status.contains("Sonnet 5.5"), "{status}");
+}
+
+#[test]
 fn the_override_is_stored_and_default_clears_it() {
     let env = Env::new();
     env.ok(&["run", "--model", "first", "--effort", "max"]);
@@ -223,10 +238,18 @@ fn check_shows_the_plan_and_phase_settings() {
 fn models_lists_both_agents() {
     let env = Env::new();
     let out = env.ok(&["models"]);
-    assert!(out.stdout.contains("claude models"), "{}", out.stdout);
-    assert!(out.stdout.contains("opusplan"), "{}", out.stdout);
+    assert!(out.stdout.contains("Claude Code"), "{}", out.stdout);
+    assert!(out.stdout.contains("Opus 5.5"), "{}", out.stdout);
+    assert!(out.stdout.contains("claude-opus-5-5"), "{}", out.stdout);
+    assert!(!out.stdout.contains("opusplan"), "{}", out.stdout);
     assert!(out.stdout.contains("claude --model"), "{}", out.stdout);
-    assert!(out.stdout.contains("codex models"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("Claude Code's own choice"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("Effort: low, medium, high, xhigh, max"));
+    assert!(out.stdout.contains("Codex's own choice"), "{}", out.stdout);
     let gpt_fast = out
         .stdout
         .lines()
@@ -250,7 +273,7 @@ fn models_for_one_agent_only() {
     let env = Env::new();
     let out = env.ok(&["models", "--agent", "claude"]).stdout;
     assert!(
-        out.contains("sonnet[1m]") && !out.contains("codex models"),
+        out.contains("claude-sonnet-5-5") && !out.contains("Codex"),
         "{out}"
     );
 }
@@ -277,7 +300,7 @@ fn a_failing_listing_is_reported_and_only_fails_when_nothing_listed() {
 
         let both = env.exec(&["models"], &envs);
         assert_eq!(both.code, 0, "{mode}: {}", both.stderr);
-        assert!(both.stdout.contains("opusplan"), "{}", both.stdout);
+        assert!(both.stdout.contains("claude-haiku-5-5"), "{}", both.stdout);
         assert!(
             both.stderr.contains("Could not list the codex models"),
             "{}",

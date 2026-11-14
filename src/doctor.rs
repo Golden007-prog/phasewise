@@ -9,6 +9,12 @@ use crate::git::Git;
 use crate::plan::{self, AgentKind};
 use crate::state::{PhaseStatus, PhasewiseDir, RunPaths, RunState, RunStatus, lock_holder};
 
+/// A path with the home directory written as `~`.
+fn tilde(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    crate::display::path_with_home(home.as_deref(), path)
+}
+
 const PLAN_FILE: &str = "phasewise.md";
 const EXCLUDE_PATTERN: &str = ".phasewise/";
 
@@ -25,7 +31,7 @@ pub fn run(cwd: &Path) -> Report {
     let git_ok = match Git::version() {
         Ok(version) => {
             let path = resolve_program(OsStr::new("git"))
-                .map_or_else(String::new, |p| format!("  [{}]", p.display()));
+                .map_or_else(String::new, |p| format!("  [{}]", tilde(&p)));
             lines.push(format!("  ✓ {:<7}{version}{path}", "git"));
             true
         }
@@ -71,10 +77,8 @@ fn agent_line(agent: &dyn Agent, name: &str, var: &str) -> (String, bool) {
     match agent.version() {
         Ok(version) => {
             let program = agent.program();
-            let path = resolve_program(&program).map_or_else(
-                || program.to_string_lossy().into_owned(),
-                |p| p.display().to_string(),
-            );
+            let path = resolve_program(&program)
+                .map_or_else(|| program.to_string_lossy().into_owned(), |p| tilde(&p));
             let via = if std::env::var_os(var).is_some_and(|v| !v.is_empty()) {
                 format!(" ({var} in effect)")
             } else {
@@ -113,7 +117,7 @@ fn repository_lines(cwd: &Path, lines: &mut Vec<String>) {
             return;
         }
     };
-    lines.push(format!("  ✓ git repository at {}", git.root().display()));
+    lines.push(format!("  ✓ git repository at {}", tilde(git.root())));
 
     match git.has_commits() {
         Ok(true) => lines.push("  ✓ has commits".to_string()),

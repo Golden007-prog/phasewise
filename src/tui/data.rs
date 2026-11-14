@@ -7,7 +7,9 @@ use anyhow::Result;
 
 use crate::agent::AgentEvent;
 use crate::agent::agent_for;
-use crate::display::{EventLine, agent_event_line, failure_kind_label, first_line_short};
+use crate::display::{
+    EventLine, agent_event_line, failure_kind_label, first_line_short, model_name,
+};
 use crate::git::Git;
 use crate::ops::Run;
 use crate::plan::{self, AgentKind};
@@ -45,7 +47,8 @@ pub struct PhaseView {
     pub attempts: u32,
     pub failure: Option<String>,
     pub has_checkpoint: bool,
-    /// Effective model and effort of the last attempt.
+    /// Display name of the model of the last attempt: the one the agent
+    /// reported, else the requested one. Effort is the requested one.
     pub model: Option<String>,
     pub effort: Option<String>,
 }
@@ -89,7 +92,11 @@ pub fn load_run_view(run: &Run) -> RunView {
                 )
             }),
             has_checkpoint: p.checkpoint_sha.is_some(),
-            model: p.model.clone(),
+            model: p
+                .agent_model
+                .as_ref()
+                .or(p.model.as_ref())
+                .map(|m| model_name(state.agent, m)),
             effort: p.effort.clone(),
         })
         .collect();
@@ -198,7 +205,7 @@ pub fn load_log(run: &Run, phase: usize) -> Vec<LogLine> {
         let mut sessions = Vec::new();
         for line in raw.lines() {
             for event in parser.feed(line) {
-                if let AgentEvent::SessionStarted { session_id } = &event {
+                if let AgentEvent::SessionStarted { session_id, .. } = &event {
                     sessions.push(session_id.clone());
                 }
                 if let Some(text) = agent_event_line(&event) {

@@ -253,6 +253,7 @@ pub fn run_phase(
     state.finished_at = None;
     state.failure = None;
     state.session_id = None;
+    state.agent_model = None;
 
     let options = resolve_options(ctx.state, ctx.plan, phase);
     let mut launch = Launch {
@@ -579,7 +580,7 @@ fn track_event(
     on_event: &mut dyn FnMut(AgentEvent) -> Result<()>,
 ) -> Result<()> {
     match &event {
-        AgentEvent::SessionStarted { session_id } => run.session_id = Some(session_id.clone()),
+        AgentEvent::SessionStarted { session_id, .. } => run.session_id = Some(session_id.clone()),
         AgentEvent::Error { detail } => {
             if run.finished_ok != Some(false) {
                 run.error_text = first_line(detail);
@@ -607,8 +608,12 @@ fn track_event(
 /// Phase bookkeeping for one agent event, then the event for the consumers.
 fn handle_agent_event(ctx: &mut PhaseContext, phase: usize, event: AgentEvent) -> Result<()> {
     match &event {
-        AgentEvent::SessionStarted { session_id } => {
-            ctx.phase_state(phase)?.session_id = Some(session_id.clone());
+        AgentEvent::SessionStarted { session_id, model } => {
+            let state = ctx.phase_state(phase)?;
+            state.session_id = Some(session_id.clone());
+            if model.is_some() {
+                state.agent_model = model.clone();
+            }
             ctx.save()?;
         }
         AgentEvent::Finished {

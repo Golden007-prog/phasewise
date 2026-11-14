@@ -756,6 +756,7 @@ mod tests {
             failure,
             model: None,
             effort: None,
+            agent_model: None,
         }
     }
 

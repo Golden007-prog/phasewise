@@ -1,8 +1,12 @@
 //! Formatting of engine events and run states, shared by the CLI and the TUI.
 
+use std::path::{Path, PathBuf};
+
 use crate::agent::AgentEvent;
+use crate::agent::claude::CLAUDE_MODELS;
 use crate::engine::EngineEvent;
 use crate::ops::PlanEvent;
+use crate::plan::AgentKind;
 use crate::state::{FailureKind, PhaseStatus};
 use crate::style::{Role, Styler};
 
@@ -11,6 +15,43 @@ const MAX_MESSAGE_CHARS: usize = 160;
 pub fn first_line_short(text: &str) -> String {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty());
     line.unwrap_or("").chars().take(MAX_MESSAGE_CHARS).collect()
+}
+
+/// The name to show for a model value. Claude: a catalog ID gives its name, an
+/// ID followed by `[1m]` gives the name and the context size; anything else
+/// (aliases included) and every Codex value is shown as written.
+pub fn model_name(agent: AgentKind, value: &str) -> String {
+    if agent == AgentKind::Claude {
+        let (id, long_context) = match value.strip_suffix("[1m]") {
+            Some(id) => (id, true),
+            None => (value, false),
+        };
+        if let Some((name, _, _)) = CLAUDE_MODELS
+            .iter()
+            .find(|(_, model_id, _)| *model_id == id)
+        {
+            return if long_context {
+                format!("{name} · 1M context")
+            } else {
+                (*name).to_string()
+            };
+        }
+    }
+    value.to_string()
+}
+
+/// `path` relative to `base` when it is inside it, else as given.
+pub fn path_in(base: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(base).unwrap_or(path).to_path_buf()
+}
+
+/// `path` with the home directory written as `~`.
+pub fn path_with_home(home: Option<&Path>, path: &Path) -> String {
+    match home.and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
 }
 
 /// Width the phase header is padded to, so its right part lines up.
@@ -360,6 +401,42 @@ pub fn failure_kind_label(kind: FailureKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_names() {
+        let c = AgentKind::Claude;
+        assert_eq!(model_name(c, "claude-opus-5-5"), "Opus 5.5");
+        assert_eq!(model_name(c, "claude-haiku-5-5"), "Haiku 5.5");
+        assert_eq!(
+            model_name(c, "claude-sonnet-5-5[1m]"),
+            "Sonnet 5.5 · 1M context"
+        );
+        assert_eq!(model_name(c, "opus"), "opus");
+        assert_eq!(model_name(c, "opus[1m]"), "opus[1m]");
+        assert_eq!(model_name(c, "claude-unknown-1"), "claude-unknown-1");
+        assert_eq!(
+            model_name(AgentKind::Codex, "claude-opus-5-5"),
+            "claude-opus-5-5"
+        );
+        assert_eq!(model_name(AgentKind::Codex, "gpt-5"), "gpt-5");
+    }
+
+    #[test]
+    fn paths_are_shortened() {
+        assert_eq!(
+            path_in(Path::new("/a/b"), Path::new("/a/b/c/d.md")),
+            Path::new("c/d.md")
+        );
+        assert_eq!(
+            path_in(Path::new("/a/b"), Path::new("/x/d.md")),
+            Path::new("/x/d.md")
+        );
+        let home = Some(Path::new("/home/u"));
+        assert_eq!(path_with_home(home, Path::new("/home/u/bin/x")), "~/bin/x");
+        assert_eq!(path_with_home(home, Path::new("/home/u")), "~");
+        assert_eq!(path_with_home(home, Path::new("/usr/bin/x")), "/usr/bin/x");
+        assert_eq!(path_with_home(None, Path::new("/home/u/x")), "/home/u/x");
+    }
+
     use super::*;
     use crate::state::Failure;
 
@@ -440,7 +517,8 @@ mod tests {
         );
         assert!(
             agent_event_line(&AgentEvent::SessionStarted {
-                session_id: "s".into()
+                session_id: "s".into(),
+                model: None
             })
             .is_none()
         );

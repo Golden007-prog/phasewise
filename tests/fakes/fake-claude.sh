@@ -99,7 +99,17 @@ case " $* " in
         ;;
 esac
 
-printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$sid"
+# Like Claude Code, report the model in use: the one passed with --model, else
+# a default.
+model=claude-sonnet-5-5
+prev=
+for arg in "$@"; do
+    if [ "$prev" = "--model" ]; then
+        model=$arg
+    fi
+    prev=$arg
+done
+printf '{"type":"system","subtype":"init","session_id":"%s","model":"%s"}\n' "$sid" "$model"
 
 if [ "$mode" = "slow" ]; then
     exec sleep 600

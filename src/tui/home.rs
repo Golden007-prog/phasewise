@@ -223,7 +223,7 @@ impl Home {
             items.extend(
                 models
                     .iter()
-                    .map(|m| ModelItem::Model(m.id.clone(), m.label.clone())),
+                    .map(|m| ModelItem::Model(m.id.clone(), m.name.clone())),
             );
         }
         items.push(ModelItem::Custom);
@@ -737,7 +737,7 @@ mod tests {
             .iter()
             .map(|id| ModelInfo {
                 id: (*id).into(),
-                label: id.to_uppercase(),
+                name: id.to_uppercase(),
                 description: String::new(),
                 efforts: Vec::new(),
             })

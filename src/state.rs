@@ -71,6 +71,9 @@ pub struct PhaseState {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The model the agent reported using in the last attempt, when it says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_model: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -264,6 +267,7 @@ impl RunState {
                     failure: None,
                     model: None,
                     effort: None,
+                    agent_model: None,
                 })
                 .collect(),
             model_override: None,
@@ -480,6 +484,7 @@ mod tests {
         // A v0.1 file has none of the model fields.
         assert!(v.get("model_override").is_none());
         assert!(v["phases"][0].get("model").is_none());
+        assert!(v["phases"][0].get("agent_model").is_none());
         let dir = tempfile::tempdir().unwrap();
         let paths = RunPaths::new(dir.path(), "r1");
         std::fs::create_dir_all(paths.dir()).unwrap();
@@ -488,13 +493,19 @@ mod tests {
         assert_eq!(loaded, sample_with_times(&loaded));
         assert_eq!(loaded.model_override, None);
         assert_eq!(loaded.phases[1].effort, None);
+        assert_eq!(loaded.phases[1].agent_model, None);
         // And the new fields round-trip when set.
         v["model_override"] = "opus".into();
         v["phases"][0]["effort"] = "high".into();
+        v["phases"][0]["agent_model"] = "claude-haiku-5-5".into();
         std::fs::write(paths.state_file(), serde_json::to_vec(&v).unwrap()).unwrap();
         let loaded = RunState::load(&paths).unwrap();
         assert_eq!(loaded.model_override.as_deref(), Some("opus"));
         assert_eq!(loaded.phases[0].effort.as_deref(), Some("high"));
+        assert_eq!(
+            loaded.phases[0].agent_model.as_deref(),
+            Some("claude-haiku-5-5")
+        );
     }
 
     /// `sample()` with the timestamps of `like` (they differ between calls).

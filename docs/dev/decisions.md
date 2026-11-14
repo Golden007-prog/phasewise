@@ -550,3 +550,23 @@ findings:
   the number is the phase's position, so `Python 3: migrate` (phase 1) and
   `Fase 9: X` (phase 2) are kept. Nothing is removed if no text would remain.
   The duplicate-title check uses the stripped titles.
+
+## v0.3 — models
+
+- **Full model IDs.** `phasewise models` and the TUI list `claude-fable-5-2`,
+  `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5` with a readable
+  name each, instead of bare aliases. A full ID pins the version the user sees;
+  an alias such as `opus` moves with Claude Code. Aliases stay valid everywhere
+  (nothing validates model names), so existing plans keep working.
+- **Dropped entries.** `opus[1m]` and `sonnet[1m]` are variants of listed models
+  and still work when typed (they display as "<name> · 1M context" when the ID
+  is in the catalog). `opusplan` uses Opus only in Claude Code's plan mode,
+  which phasewise never uses, so it behaved as Sonnet and misled.
+- **`agent_model`.** Claude Code's `system`/`init` event carries the model the
+  session really runs. The parser puts it in `AgentEvent::SessionStarted`, and
+  the engine stores it in `PhaseState.agent_model` (cleared when an attempt
+  starts, optional, old state files load). `status` and the review TUI show it
+  in preference to the requested model, through `display::model_name`.
+- **Codex** reports no model in its JSON events (checked in real captures), so
+  `agent_model` stays empty for Codex and its requested model is shown as
+  written.

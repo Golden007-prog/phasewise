@@ -12,7 +12,7 @@ use super::{
     Agent, AgentEvent, AgentParser, LaunchOptions, ModelInfo, program_from_env, program_version,
     tidy_detail,
 };
-use crate::plan::AgentKind;
+use crate::plan::{self, AgentKind};
 
 const TOOL_DETAIL_KEYS: [&str; 6] = [
     "file_path",
@@ -51,16 +51,26 @@ impl ClaudeAgent {
     }
 }
 
-/// Aliases documented for `claude --model` (Claude Code model configuration
-/// docs, checked 2026-11-14). The CLI has no non-interactive listing.
-const CLAUDE_MODELS: [(&str, &str); 7] = [
-    ("fable", "Hardest, longest tasks"),
-    ("opus", "Complex reasoning"),
-    ("sonnet", "Daily coding"),
-    ("haiku", "Fast, simple tasks"),
-    ("opus[1m]", "Opus with a 1M context window"),
-    ("sonnet[1m]", "Sonnet with a 1M context window"),
-    ("opusplan", "Opus to plan, Sonnet to execute"),
+/// The models offered for `claude --model`: (name, full ID, description).
+/// The full IDs pin the version shown. Aliases and `[1m]` variants stay valid
+/// when typed. The CLI has no non-interactive listing.
+pub const CLAUDE_MODELS: [(&str, &str, &str); 4] = [
+    (
+        "Fable 5.2",
+        "claude-fable-5-2",
+        "Most capable, for the hardest work",
+    ),
+    ("Opus 5.5", "claude-opus-5-5", "Complex, multi-step work"),
+    (
+        "Sonnet 5.5",
+        "claude-sonnet-5-5",
+        "Fast and capable, for most coding",
+    ),
+    (
+        "Haiku 5.5",
+        "claude-haiku-5-5",
+        "Fastest and cheapest, for simple phases",
+    ),
 ];
 
 impl Agent for ClaudeAgent {
@@ -138,11 +148,11 @@ impl Agent for ClaudeAgent {
     fn list_models(&self) -> Result<Vec<ModelInfo>> {
         Ok(CLAUDE_MODELS
             .iter()
-            .map(|(id, description)| ModelInfo {
+            .map(|(name, id, description)| ModelInfo {
                 id: (*id).to_string(),
-                label: (*id).to_string(),
+                name: (*name).to_string(),
                 description: (*description).to_string(),
-                efforts: Vec::new(),
+                efforts: plan::EFFORTS.iter().map(|e| (*e).to_string()).collect(),
             })
             .collect())
     }
@@ -267,8 +277,14 @@ impl AgentParser for ClaudeParser {
             && !id.is_empty()
         {
             self.session_seen = true;
+            let model = value
+                .get("model")
+                .and_then(Value::as_str)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string);
             out.push(AgentEvent::SessionStarted {
                 session_id: id.to_string(),
+                model,
             });
         }
         let kind = value.get("type").and_then(Value::as_str);
@@ -348,7 +364,8 @@ mod tests {
             parser.feed(line),
             vec![
                 AgentEvent::SessionStarted {
-                    session_id: "s".into()
+                    session_id: "s".into(),
+                    model: None
                 },
                 AgentEvent::Finished {
                     ok: false,
@@ -364,6 +381,7 @@ mod tests {
         let want = vec![
             AgentEvent::SessionStarted {
                 session_id: SID.into(),
+                model: Some("fake-model".into()),
             },
             AgentEvent::Message {
                 text: "I'll create the file.".into(),
@@ -585,21 +603,36 @@ mod tests {
     }
 
     #[test]
-    fn lists_the_documented_aliases() {
+    fn lists_the_catalog_with_full_ids() {
         let models = ClaudeAgent.list_models().expect("static list");
-        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        let pairs: Vec<_> = models
+            .iter()
+            .map(|m| (m.name.as_str(), m.id.as_str()))
+            .collect();
         assert_eq!(
-            ids,
+            pairs,
             [
-                "fable",
-                "opus",
-                "sonnet",
-                "haiku",
-                "opus[1m]",
-                "sonnet[1m]",
-                "opusplan"
+                ("Fable 5.2", "claude-fable-5-2"),
+                ("Opus 5.5", "claude-opus-5-5"),
+                ("Sonnet 5.5", "claude-sonnet-5-5"),
+                ("Haiku 5.5", "claude-haiku-5-5"),
             ]
         );
         assert!(models.iter().all(|m| !m.description.is_empty()));
+        assert!(models.iter().all(|m| m.efforts.len() == 5));
+    }
+
+    #[test]
+    fn init_event_reports_the_model() {
+        let mut parser = ClaudeParser::new(Path::new("/work/repo"));
+        let line =
+            r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-haiku-5-5"}"#;
+        assert_eq!(
+            parser.feed(line),
+            vec![AgentEvent::SessionStarted {
+                session_id: "s".into(),
+                model: Some("claude-haiku-5-5".into())
+            }]
+        );
     }
 }

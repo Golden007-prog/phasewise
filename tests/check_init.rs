@@ -34,7 +34,18 @@ fn check_passes_on_init_template() {
         .success()
         .stdout(predicate::str::contains("2 phases. The plan is valid."))
         .stdout(predicate::str::contains("  1. First step"))
-        .stdout(predicate::str::contains("My plan"));
+        .stdout(predicate::str::contains("My plan · phasewise.md"));
+}
+
+#[test]
+fn init_shows_a_relative_path_and_mentions_the_home_screen() {
+    let repo = TestRepo::new();
+    repo.phasewise()
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created phasewise.md."))
+        .stdout(predicate::str::contains("phasewise` with no arguments"));
 }
 
 #[test]

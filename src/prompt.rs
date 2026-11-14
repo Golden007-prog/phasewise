@@ -425,7 +425,7 @@ Do the second thing.
     fn plan_prompt_has_goal_markers_keys_and_agent() {
         let models = vec![ModelInfo {
             id: "opus".into(),
-            label: "opus".into(),
+            name: "opus".into(),
             description: "Complex reasoning".into(),
             efforts: Vec::new(),
         }];

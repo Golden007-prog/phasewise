@@ -503,6 +503,7 @@ fn reset_phase(run: &mut Run, number: usize) {
         phase.failure = None;
         phase.cost_usd = None;
         phase.model = None;
+        phase.agent_model = None;
         phase.effort = None;
         phase.started_at = None;
         phase.finished_at = None;

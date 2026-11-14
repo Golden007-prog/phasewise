@@ -12,7 +12,7 @@ use super::home::{HELP_KEYS, Home, Mode, ModelItem, Probe, commit_hint};
 use super::view::{
     MIN_HEIGHT, MIN_WIDTH, draw_too_small, event_spans, render_popup, role_style, truncate,
 };
-use crate::display::{first_line_short, phase_count};
+use crate::display::{first_line_short, model_name, phase_count};
 use crate::plan::AgentKind;
 use crate::style::Role;
 
@@ -154,7 +154,7 @@ fn phase_line(
     let mut right = vec![checks];
     // A model name belongs to one agent: plan-level values apply to the plan's own.
     if home.agent == plan.agent {
-        right.extend(phase.model.clone());
+        right.extend(phase.model.as_deref().map(|m| model_name(plan.agent, m)));
         right.extend(phase.effort.clone());
     }
     let right = right.join(" · ");
@@ -248,9 +248,11 @@ fn draw_settings(frame: &mut Frame, home: &Home, area: Rect) {
         }
         _ => (None, None),
     };
+    let model = home.model.as_deref().map(|m| model_name(home.agent, m));
+    let plan_model = plan_model.map(|m| model_name(home.agent, m));
     let lines = vec![
         Line::from(agent),
-        setting_line("Model", home.model.as_deref(), plan_model),
+        setting_line("Model", model.as_deref(), plan_model.as_deref()),
         setting_line("Effort", home.effort.as_deref(), plan_effort),
         Line::raw(""),
         Line::styled(
@@ -515,7 +517,7 @@ mod tests {
     fn model(id: &str, label: &str) -> ModelInfo {
         ModelInfo {
             id: id.into(),
-            label: label.into(),
+            name: label.into(),
             description: String::new(),
             efforts: Vec::new(),
         }
