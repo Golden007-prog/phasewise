@@ -9,3 +9,4 @@ One line per build phase: date, phase, quality gate result (`cargo fmt --check`,
 - 2026-11-14 — Phase 4 (engine, ops, run/next/status/diff, fake agents): gate passed (fmt ok, clippy ok, 113 tests). Manual run with the fake agent checked.
 - 2026-11-14 — Phase 5 (adapters aligned with documented formats, doctor, smoke test script): gate passed (fmt ok, clippy ok, 121 tests). Real smoke test NOT run: claude 2.1.296 and codex 0.160.0 are not logged in on this machine; both agents marked experimental.
 - 2026-11-14 — Phase 6 (retry, rollback, abort, orphan recovery notice, error messages): gate passed (fmt ok, clippy ok, 134 tests; full suite run 4 times without failures).
+- 2026-11-14 — Phase 7 (TUI: data, state, rendering, terminal loop, actions): gate passed (fmt ok, clippy ok, 165 tests). Manual flow open → n → Log → Diff → b → q checked in a real pty with expect and the fake agent; terminal restored.

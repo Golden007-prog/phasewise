@@ -163,8 +163,12 @@ pub fn main() -> ExitCode {
 
 fn dispatch(cli: Cli) -> Result<ExitCode> {
     match cli.command {
-        // Later phases open the TUI here when a run is active.
         None => {
+            let cwd = current_dir()?;
+            // With an active run on a terminal the TUI opens; otherwise show the help.
+            if std::io::stdout().is_terminal() && ops::load_active(&cwd).ok().flatten().is_some() {
+                return crate::tui::run(&cwd);
+            }
             Cli::command().print_long_help()?;
             Ok(ExitCode::SUCCESS)
         }
@@ -177,13 +181,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Some(Command::Rollback { n, yes }) => rollback_command(n as usize, yes),
         Some(Command::Status) => status(),
         Some(Command::Diff { n }) => diff(n),
-        Some(Command::Review) => not_implemented("review"),
+        Some(Command::Review) => crate::tui::run(&current_dir()?),
         Some(Command::Abort) => abort_command(),
     }
-}
-
-fn not_implemented(name: &str) -> Result<ExitCode> {
-    Err(anyhow!("`phasewise {name}` is not implemented yet"))
 }
 
 /// Explicit path as given, else `phasewise.md` at the repository root (or in

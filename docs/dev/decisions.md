@@ -157,3 +157,28 @@ deviates from the original plan, with the reason.
   snapshots in `src/tui/snapshots/`). The terminal loop and wiring come later.
 - `App` returns `Command::Reload` when the selection changes so the loop
   refreshes the diff/log/verify caches of the new phase.
+- **Terminal loop (`tui::run`):** refuses with exit 1 when there is no run (checked
+  first, so the message is the same without a terminal) or stdout is not a
+  terminal. Setup uses `ratatui::try_init()` (installs the panic hook) and a
+  `Drop` guard calling `ratatui::restore()` on every exit path. The loop polls
+  every 100 ms; engine events only mark the views stale and they are reloaded at
+  most every 250 ms. The display has its own `Run`, reloaded from disk; workers
+  get a fresh `Run` each (`ops::next` / `ops::retry`), `rollback` runs on the
+  UI thread.
+- **`q` while a phase runs:** `App` asks for confirmation; on `y` the loop sets
+  the cancel flag, keeps drawing (keys ignored) and exits when the worker has
+  been joined.
+- **Follow the log:** while the running phase's Log tab is shown and the view
+  was at the end of the log, the scroll is set to the end on each refresh.
+- **`phasewise` without arguments** opens the TUI only for an ACTIVE run on a
+  terminal; otherwise the long help. The `not_implemented` stub was removed.
+- **The TUI draws only when something changed** (key, resize, engine event,
+  reload). An idle TUI writes nothing, so a terminal that stops reading for a
+  while (seen with `expect`) cannot block it.
+- **Manual check of the TUI** was driven with `/usr/bin/expect` in a 110×30
+  pty (no tmux on the machine), with the fake agent: open → `n` → Log →
+  Diff → `k` → `b` → `y` → `q`. The phase ran, the rollback happened, the
+  process exited 0, the alternate screen was left and `stty -a` showed
+  `icanon` and `echo` again.
+- **`.DS_Store` was committed by mistake** in an earlier phase (created by
+  Finder). It is now untracked and ignored; it remains in the local history.

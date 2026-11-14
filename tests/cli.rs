@@ -62,12 +62,16 @@ fn no_arguments_prints_usage_and_succeeds() {
 }
 
 #[test]
-fn stub_command_reports_not_implemented() {
+fn review_outside_a_repository_fails_with_a_message() {
+    let dir = tempfile::tempdir().expect("create temp dir");
     phasewise()
         .arg("review")
+        .current_dir(dir.path())
+        .env(
+            "GIT_CEILING_DIRECTORIES",
+            dir.path().parent().unwrap_or(dir.path()),
+        )
         .assert()
         .code(1)
-        .stderr(predicate::str::contains(
-            "error: `phasewise review` is not implemented yet",
-        ));
+        .stderr(predicate::str::contains("error:"));
 }
