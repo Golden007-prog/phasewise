@@ -1,0 +1,19 @@
+---
+source: src/tui/view.rs
+expression: terminal.backend()
+---
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"  phasewise needs a terminal of at least 80×20 (now 60×15). "
+"                     Enlarge the window.                    "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "

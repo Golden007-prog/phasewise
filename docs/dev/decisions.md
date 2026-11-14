@@ -140,3 +140,20 @@ deviates from the original plan, with the reason.
   the first fresh session and its resume, then succeeds on a later fresh one.
 - Error messages across `src/` now end with what to do (git failures, schema
   version, lock, missing phase).
+
+## Build phase 7
+
+- **New dependencies:** `ratatui` 0.30.2 (default features, crossterm backend)
+  for the TUI; dev: `insta` 1.49.0 for rendering snapshots (`TestBackend`).
+  `crossterm` is not added directly: the code uses `ratatui::crossterm`
+  (re-export), so there is a single crossterm version.
+- **`src/display.rs`** holds the event/status formatting shared by the CLI
+  and the TUI; the CLI behaviour is unchanged.
+- **`git.rs`** gained read-only `diff_worktree`/`numstat_worktree` (tracked
+  files against the working tree) for the Diff tab of a phase without a
+  checkpoint; untracked files are `dirty_paths` minus the files in the numstat.
+- **TUI layers:** `tui/data.rs` (read-only loaders), `tui/app.rs` (pure state
+  machine: key in, `Command` out), `tui/view.rs` (rendering, tested with
+  snapshots in `src/tui/snapshots/`). The terminal loop and wiring come later.
+- `App` returns `Command::Reload` when the selection changes so the loop
+  refreshes the diff/log/verify caches of the new phase.

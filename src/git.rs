@@ -231,9 +231,23 @@ impl Git {
         self.run(&["diff", "--no-color", "--no-ext-diff", from, to])
     }
 
+    /// Tracked files against the working tree (untracked files are not included).
+    pub fn diff_worktree(&self, from: &str) -> Result<String> {
+        self.run(&["diff", "--no-color", "--no-ext-diff", from])
+    }
+
     /// Per-file added/removed line counts between two commits.
     pub fn numstat(&self, from: &str, to: &str) -> Result<Vec<FileStat>> {
-        let out = self.run(&[
+        self.numstat_args(&[from, to])
+    }
+
+    /// Per-file line counts of tracked files against the working tree.
+    pub fn numstat_worktree(&self, from: &str) -> Result<Vec<FileStat>> {
+        self.numstat_args(&[from])
+    }
+
+    fn numstat_args(&self, revs: &[&str]) -> Result<Vec<FileStat>> {
+        let mut args = vec![
             "-c",
             "core.quotepath=off",
             "diff",
@@ -241,9 +255,9 @@ impl Git {
             "--no-renames",
             "--no-color",
             "--no-ext-diff",
-            from,
-            to,
-        ])?;
+        ];
+        args.extend_from_slice(revs);
+        let out = self.run(&args)?;
         let mut stats = Vec::new();
         for line in out.lines() {
             let mut parts = line.splitn(3, '\t');

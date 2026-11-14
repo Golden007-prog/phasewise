@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod cli;
+pub mod display;
 pub mod doctor;
 pub mod engine;
 pub mod git;
@@ -14,4 +15,5 @@ pub mod plan;
 pub mod process;
 pub mod prompt;
 pub mod state;
+pub mod tui;
 pub mod verify;
