@@ -188,6 +188,31 @@ impl Home {
         self.data.run.as_ref().filter(|run| run.active())
     }
 
+    /// The id of the run whose branch the repository is on (`phasewise/<id>`).
+    pub fn run_branch_id(&self) -> Option<&str> {
+        self.data.branch.strip_prefix("phasewise/")
+    }
+
+    /// The branch to go back to from a run branch: the original branch of the
+    /// run when it is the current one.
+    pub fn original_branch(&self) -> &str {
+        self.data
+            .run
+            .as_ref()
+            .filter(|run| run.run_branch == self.data.branch)
+            .map_or("<your main branch>", |run| run.original_branch.as_str())
+    }
+
+    /// Refuses a command that must not run on the branch of a run.
+    fn refuse_on_run_branch(&mut self) -> Option<HomeCommand> {
+        let why = format!(
+            "You are on the branch of run {}. Go back with: git switch {}",
+            self.run_branch_id().unwrap_or_default(),
+            self.original_branch()
+        );
+        self.refuse(&why)
+    }
+
     /// The plan file as shown: relative to the directory phasewise started in.
     pub fn plan_name(&self) -> String {
         self.data.plan_rel.clone()
@@ -526,6 +551,9 @@ impl Home {
                 self.mode = Mode::GoalInput(String::new());
                 None
             }
+            KeyCode::Char('c') | KeyCode::Enter if self.run_branch_id().is_some() => {
+                self.refuse_on_run_branch()
+            }
             KeyCode::Char('c') => self.commit(),
             KeyCode::Enter => self.start(),
             _ => None,
@@ -762,9 +790,12 @@ impl Home {
         let mut keys = Vec::new();
         match &self.data.plan {
             PlanState::Valid(_) => {
-                keys.push(item("enter", "start"));
-                if self.data.plan_uncommitted {
-                    keys.push(item("c", "commit"));
+                // Neither starting nor committing works on the branch of a run.
+                if self.run_branch_id().is_none() {
+                    keys.push(item("enter", "start"));
+                    if self.data.plan_uncommitted {
+                        keys.push(item("c", "commit"));
+                    }
                 }
                 keys.extend([item("p", "new plan"), model, agent, effort]);
             }
@@ -1554,6 +1585,28 @@ mod tests {
         assert_eq!(text(&h), Some(COMMITTING));
         assert_eq!(h.handle_key(key('p')), None);
         assert_eq!(h.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn enter_and_c_refuse_on_a_run_branch() {
+        let mut h = valid();
+        h.data.plan_uncommitted = true;
+        h.data.branch = "phasewise/20260101-120000".into();
+        h.data.run = Some(run_summary(RunStatus::Aborted));
+        let expected =
+            "You are on the branch of run 20260101-120000. Go back with: git switch main";
+        assert_eq!(h.handle_key(code(KeyCode::Enter)), None);
+        assert_eq!(text(&h), Some(expected));
+        h.message = None;
+        assert_eq!(h.handle_key(key('c')), None);
+        assert_eq!(text(&h), Some(expected));
+        assert_eq!(h.mode, Mode::Normal);
+        let keys: Vec<_> = h.footer().into_iter().map(|(key, _)| key).collect();
+        assert!(!keys.contains(&"enter".to_string()), "{keys:?}");
+        assert!(!keys.contains(&"c".to_string()), "{keys:?}");
+        h.data.branch = "main".into();
+        assert!(h.handle_key(code(KeyCode::Enter)).is_none());
+        assert_eq!(h.mode, Mode::ConfirmCommitStart(0));
     }
 
     #[test]

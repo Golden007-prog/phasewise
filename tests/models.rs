@@ -149,6 +149,17 @@ fn the_model_the_agent_reports_is_recorded_and_shown() {
 }
 
 #[test]
+fn the_reported_model_follows_a_retry_with_another_model() {
+    let env = Env::with_plan("# Demo\n\n## One\n\nDo one.\n");
+    env.ok(&["run"]);
+    assert_eq!(env.state()["phases"][0]["agent_model"], "claude-sonnet-5-5");
+    env.ok(&["retry", "--model", "claude-haiku-5-5"]);
+    assert_eq!(env.state()["phases"][0]["agent_model"], "claude-haiku-5-5");
+    let status = env.ok(&["status"]).stdout;
+    assert!(status.contains("Haiku 5.5"), "{status}");
+}
+
+#[test]
 fn the_override_is_stored_and_default_clears_it() {
     let env = Env::new();
     env.ok(&["run", "--model", "first", "--effort", "max"]);

@@ -406,16 +406,13 @@ fn notices(home: &Home) -> Vec<Line<'static>> {
             vec![home.commit_hint()],
         );
     }
-    if let Some(id) = home.data.branch.strip_prefix("phasewise/") {
-        let original = home
-            .data
-            .run
-            .as_ref()
-            .filter(|run| run.run_branch == home.data.branch)
-            .map_or("<your main branch>", |run| run.original_branch.as_str());
+    if let Some(id) = home.run_branch_id() {
         push(
             format!("You are on the branch of run {id}; a new run would start from it."),
-            vec![format!("Go back with: git switch {original}")],
+            vec![format!(
+                "Go back with: git switch {}",
+                home.original_branch()
+            )],
         );
     }
     lines

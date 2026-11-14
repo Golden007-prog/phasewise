@@ -129,6 +129,7 @@ pub fn start(
                 "HEAD is detached. Switch to a branch (`git switch <branch>`), then run phasewise again."
             )
         })?;
+    refuse_run_branch(&git, &original_branch, "start a run")?;
 
     git.check_identity()?;
     git.ensure_excluded(".phasewise/")?;
@@ -266,11 +267,23 @@ fn dirty_paths(git: &Git) -> Result<Vec<String>> {
 /// returns the short SHA of the new commit.
 pub fn commit_plan(cwd: &Path, plan_path: &Path) -> Result<String> {
     let git = Git::discover(cwd)?;
+    commit_plan_in(&git, cwd, plan_path)
+}
+
+/// `commit_plan` on a repository already found (tests give it an isolated
+/// git environment).
+pub fn commit_plan_in(git: &Git, cwd: &Path, plan_path: &Path) -> Result<String> {
     let absolute = if plan_path.is_absolute() {
         plan_path.to_path_buf()
     } else {
         cwd.join(plan_path)
     };
+    if !absolute.exists() {
+        bail!(
+            "{} does not exist: write a plan first.",
+            plan_path.display()
+        );
+    }
     // Resolve symlinks (for example /tmp on macOS) so the paths compare.
     let absolute = absolute.canonicalize().unwrap_or(absolute);
     let root = git
@@ -285,10 +298,47 @@ pub fn commit_plan(cwd: &Path, plan_path: &Path) -> Result<String> {
         )
     })?;
     let relative = relative.to_string_lossy().into_owned();
+    match git.current_branch()? {
+        None => bail!(
+            "HEAD is detached. Switch to a branch (`git switch <branch>`) before you commit the plan."
+        ),
+        Some(branch) => refuse_run_branch(git, &branch, "commit the plan")?,
+    }
     if !git.dirty_paths()?.contains(&relative) {
-        bail!("{} has no changes to commit.", plan_path.display());
+        if git.is_ignored(&relative)? {
+            bail!(
+                "{} is ignored by git. Remove it from .gitignore (or .git/info/exclude), \
+or commit it yourself with `git add -f {}`.",
+                plan_path.display(),
+                plan_path.display()
+            );
+        }
+        bail!(
+            "{} is already committed: there is nothing to commit.",
+            plan_path.display()
+        );
     }
     git.commit_file(&relative, "Add phasewise plan")
+}
+
+/// Fails when `branch` is the branch of a phasewise run: plans are committed
+/// and runs started on the user's own branch. `action` completes "before you".
+fn refuse_run_branch(git: &Git, branch: &str, action: &str) -> Result<()> {
+    if !branch.starts_with("phasewise/") {
+        return Ok(());
+    }
+    let original = load_from_git(git)
+        .ok()
+        .flatten()
+        .filter(|run| run.state.run_branch == branch)
+        .map_or_else(
+            || "<branch>".to_string(),
+            |run| run.state.original_branch.clone(),
+        );
+    bail!(
+        "You are on {branch}, the branch of a phasewise run. Switch to your own branch \
+(`git switch {original}`) before you {action}."
+    )
 }
 
 /// The latest run, whatever its status, with crash recovery applied.

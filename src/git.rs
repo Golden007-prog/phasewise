@@ -76,6 +76,18 @@ impl Git {
         }
     }
 
+    /// Whether git ignores `path` (relative to the root): `git check-ignore`
+    /// exits 0 when it is ignored and 1 when it is not.
+    pub fn is_ignored(&self, path: &str) -> Result<bool> {
+        let args = ["check-ignore", "-q", "--", path];
+        let output = self.output(&args, None)?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(self.failure(&args, &output)),
+        }
+    }
+
     /// Makes sure `pattern` is a line of `.git/info/exclude`. Returns whether
     /// the file changed.
     pub fn ensure_excluded(&self, pattern: &str) -> Result<bool> {
@@ -140,10 +152,7 @@ impl Git {
         } else if output.status.code() == Some(1) {
             Ok(None)
         } else {
-            Err(failure(
-                &["symbolic-ref", "--quiet", "--short", "HEAD"],
-                &output,
-            ))
+            Err(self.failure(&["symbolic-ref", "--quiet", "--short", "HEAD"], &output))
         }
     }
 
@@ -189,7 +198,7 @@ impl Git {
         match output.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
-            _ => Err(failure(&args, &output)),
+            _ => Err(self.failure(&args, &output)),
         }
     }
 
@@ -235,7 +244,7 @@ Set it with `git config user.name \"Your Name\"` and `git config user.email you@
         args.extend(["-F", "-"]);
         let output = self.output(&args, Some(message))?;
         if !output.status.success() {
-            return Err(failure(&args, &output));
+            return Err(self.failure(&args, &output));
         }
         self.head_sha()
     }
@@ -248,7 +257,7 @@ Set it with `git config user.name \"Your Name\"` and `git config user.email you@
         let args = ["commit", "-q", "-F", "-", "--", path];
         let output = self.output(&args, Some(message))?;
         if !output.status.success() {
-            return Err(failure(&args, &output));
+            return Err(self.failure(&args, &output));
         }
         Ok(self
             .run(&["rev-parse", "--short", "HEAD"])?
@@ -323,9 +332,52 @@ Set it with `git config user.name \"Your Name\"` and `git config user.email you@
     fn run(&self, args: &[&str]) -> Result<String> {
         let output = self.output(args, None)?;
         if !output.status.success() {
-            return Err(failure(args, &output));
+            return Err(self.failure(args, &output));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// The `index.lock` of this repository, asked to git (`--git-path` also
+    /// works in linked worktrees); stderr is parsed only if that fails.
+    fn lock_path(&self, stderr: &str) -> String {
+        let asked = self
+            .output_once(&["rev-parse", "--git-path", "index.lock"], None)
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                let path = PathBuf::from(path);
+                if path.is_absolute() {
+                    path
+                } else {
+                    self.root.join(path)
+                }
+            });
+        asked
+            .or_else(|| lock_path_from_stderr(stderr).map(PathBuf::from))
+            .unwrap_or_else(|| self.root.join(".git").join("index.lock"))
+            .display()
+            .to_string()
+    }
+
+    /// The error of a failed git command: a lock error when another process
+    /// holds `index.lock`, the arguments and stderr otherwise.
+    fn failure(&self, args: &[&str], output: &Output) -> anyhow::Error {
+        if is_lock_contention(output) {
+            let path = self.lock_path(&String::from_utf8_lossy(&output.stderr));
+            return anyhow!(
+                "`git {}` failed: another git process is using the repository ({path} exists). \
+Wait for it to finish or close the tool that runs it (an editor's git integration, for example). \
+If no git command is running, the lock is left over from a crash: delete {path} and try again.",
+                args.join(" ")
+            );
+        }
+        anyhow!(
+            "`git {}` failed: {}. Fix the problem in the repository and try again.",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
     }
 
     /// Runs git with captured output and optional stdin; does not check the
@@ -378,42 +430,30 @@ Set it with `git config user.name \"Your Name\"` and `git config user.email you@
 /// Waits between attempts when `index.lock` is held (about 3.5 s in total).
 const LOCK_RETRY_WAITS_MS: [u64; 7] = [50, 100, 200, 400, 800, 1000, 1000];
 
-/// True when git could not take `index.lock`. Only the file name is matched:
-/// the rest of git's message is translated in other locales.
+/// True when git could not take `index.lock`: git's fatal exit code (128)
+/// and the file name in stderr. Only the file name is matched, the rest of
+/// git's message is translated in other locales. A failing hook (exit 1) that
+/// prints the name is not lock contention.
 fn is_lock_contention(output: &Output) -> bool {
-    String::from_utf8_lossy(&output.stderr).contains("index.lock")
+    output.status.code() == Some(128)
+        && String::from_utf8_lossy(&output.stderr).contains("index.lock")
 }
 
 /// The lock file named in git's message (`Unable to create '<path>': File
-/// exists.` in English), whatever the language of the message.
-fn lock_path(stderr: &str) -> String {
+/// exists.` in English), whatever the language of the message. The path
+/// starts at the first quote that is followed by `/`, so quotes inside the
+/// path (`/Users/O'Brien/repo`) do not matter.
+fn lock_path_from_stderr(stderr: &str) -> Option<String> {
     const NAME: &str = "index.lock";
-    stderr
-        .find(NAME)
-        .and_then(|end| {
-            let end = end + NAME.len();
-            let start = stderr[..end].rfind(['\'', '"', '‘', '«', '`'])? + 1;
-            let start = start + stderr[start..].find(|c: char| !c.is_whitespace())?;
-            Some(stderr[start..end].to_string())
+    let end = stderr.find(NAME)? + NAME.len();
+    let head = &stderr[..end];
+    let start = head
+        .char_indices()
+        .find(|(i, c)| {
+            matches!(c, '\'' | '"' | '‘' | '«' | '`') && head[i + c.len_utf8()..].starts_with('/')
         })
-        .unwrap_or_else(|| ".git/index.lock".to_string())
-}
-
-fn failure(args: &[&str], output: &Output) -> anyhow::Error {
-    if is_lock_contention(output) {
-        let path = lock_path(&String::from_utf8_lossy(&output.stderr));
-        return anyhow!(
-            "`git {}` failed: another git process is using the repository ({path} exists). \
-Wait for it to finish or close the tool that runs it (an editor's git integration, for example). \
-If no git command is running, the lock is left over from a crash: delete {path} and try again.",
-            args.join(" ")
-        );
-    }
-    anyhow!(
-        "`git {}` failed: {}. Fix the problem in the repository and try again.",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr).trim()
-    )
+        .map(|(i, c)| i + c.len_utf8())?;
+    Some(head[start..].to_string())
 }
 
 /// Added/removed line counts of one file; `None` for binary files.
@@ -499,12 +539,81 @@ mod tests {
     }
 
     #[test]
-    fn lock_path_is_found_in_any_language() {
+    fn lock_path_is_parsed_in_any_language() {
         let english = "fatal: Unable to create '/r/.git/index.lock': File exists.\n";
-        assert_eq!(lock_path(english), "/r/.git/index.lock");
+        assert_eq!(
+            lock_path_from_stderr(english).as_deref(),
+            Some("/r/.git/index.lock")
+        );
         let spanish = "fatal: No se pudo crear '/r/.git/index.lock': El archivo existe.";
-        assert_eq!(lock_path(spanish), "/r/.git/index.lock");
-        assert_eq!(lock_path("fatal: something else"), ".git/index.lock");
+        assert_eq!(
+            lock_path_from_stderr(spanish).as_deref(),
+            Some("/r/.git/index.lock")
+        );
+        let quote = "fatal: Unable to create '/Users/O'Brien/repo/.git/index.lock': File exists.";
+        assert_eq!(
+            lock_path_from_stderr(quote).as_deref(),
+            Some("/Users/O'Brien/repo/.git/index.lock")
+        );
+        assert_eq!(lock_path_from_stderr("fatal: something else"), None);
+    }
+
+    #[test]
+    fn lock_error_names_the_full_path_of_an_odd_directory() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("O'Brien repo");
+        fs::create_dir(&dir).expect("mkdir");
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .arg(&dir)
+            .envs(ENV)
+            .output()
+            .expect("git init");
+        assert!(init.status.success());
+        let git = Git::discover(&dir).expect("discover").with_env(ENV);
+        fs::write(dir.join("a.txt"), "a").expect("write");
+        let lock = lock(&git);
+        fs::write(&lock, "").expect("lock");
+        let err = git.add_all().expect_err("must fail").to_string();
+        let expected = lock.display().to_string();
+        assert!(expected.contains("O'Brien repo"), "{expected}");
+        assert!(err.contains(&format!("({expected} exists)")), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_hook_that_mentions_the_lock_is_not_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, git) = repo();
+        fs::write(dir.path().join("plan.md"), "plan").expect("write");
+        let counter = dir.path().join("hook-runs");
+        let hook = dir.path().join(".git/hooks/pre-commit");
+        fs::create_dir_all(hook.parent().expect("parent")).expect("hooks dir");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho run >> '{}'\necho 'index.lock hook says no' >&2\nexit 1\n",
+                counter.display()
+            ),
+        )
+        .expect("hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let err = git
+            .commit_file("plan.md", "Add phasewise plan")
+            .expect_err("hook fails")
+            .to_string();
+        let runs = fs::read_to_string(&counter).expect("counter");
+        assert_eq!(runs.lines().count(), 1, "hook must run once");
+        assert!(err.contains("index.lock hook says no"), "{err}");
+        assert!(!err.contains("another git process"), "{err}");
+    }
+
+    #[test]
+    fn is_ignored_tells_ignored_from_not_ignored() {
+        let (dir, git) = repo();
+        fs::write(dir.path().join(".gitignore"), "plan.md\n").expect("write");
+        assert!(git.is_ignored("plan.md").expect("ignored"));
+        assert!(!git.is_ignored("other.md").expect("not ignored"));
     }
 
     #[test]

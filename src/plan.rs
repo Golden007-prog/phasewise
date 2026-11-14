@@ -393,13 +393,73 @@ fn heading_text(source: &str) -> String {
     }
 }
 
+/// Words for "phase", "step", "stage" or "part" in common languages, in
+/// lowercase. This is data: extend it freely.
+const PHASE_WORDS: &[&str] = &[
+    "phase",
+    "step",
+    "stage",
+    "part",
+    "fase",
+    "paso",
+    "etapa",
+    "parte",
+    "passo",
+    "étape",
+    "etape",
+    "partie",
+    "schritt",
+    "stufe",
+    "teil",
+    "abschnitt",
+    "tappa",
+    "stap",
+    "deel",
+    "fas",
+    "steg",
+    "del",
+    "trin",
+    "faza",
+    "krok",
+    "etap",
+    "część",
+    "czesc",
+    "fáze",
+    "faze",
+    "část",
+    "cast",
+    "vaihe",
+    "aşama",
+    "asama",
+    "adım",
+    "adim",
+    "фаза",
+    "этап",
+    "шаг",
+    "часть",
+    "етап",
+    "крок",
+    "частина",
+    "φάση",
+    "βήμα",
+    "フェーズ",
+    "ステップ",
+    "段階",
+    "阶段",
+    "步骤",
+    "階段",
+    "步驟",
+    "단계",
+];
+
 /// Removes a leading phase-number prefix from `title` unless nothing would
 /// remain. `position` is the 1-based position of the phase.
 ///
-/// `Phase <digits>:` is removed whatever the number. A single word of letters
-/// plus the number of `position` followed by `:`, `.`, `)`, `-`, `–` or `—`
-/// (`Fase 1: X`, `Paso 4. X`) and a bare `position` followed by `.`, `)` or `:`
-/// and a space (`1. X`) are removed too.
+/// In this order: `Phase <digits>:` is removed whatever the number; a word
+/// from `PHASE_WORDS` plus the number of `position` and a separator (`:`, `：`,
+/// `-`, `–`, `—`, or `.` and `)` followed by whitespace) is removed
+/// (`Fase 1: X`, `Paso 4. X`); a bare `position` followed by `.`, `)` or `:`
+/// and whitespace (`1. X`) is removed too. Other words are never removed.
 fn strip_phase_prefix(title: &str, position: usize) -> String {
     let keep = || title.to_string();
     let non_empty = |rest: &str| {
@@ -421,22 +481,29 @@ fn strip_phase_prefix(title: &str, position: usize) -> String {
     }
 
     let number = position.to_string();
-    // A word of letters, then the position number and a separator.
-    let word = title.chars().take_while(|c| c.is_alphabetic()).count();
-    if word > 0 {
-        let byte = title
-            .char_indices()
-            .nth(word)
-            .map_or(title.len(), |(i, _)| i);
-        let rest = title[byte..].trim_start();
-        if let Some(after) = rest.strip_prefix(number.as_str())
+    // A known word, then the position number and a separator.
+    let word_end = title
+        .char_indices()
+        .find(|(_, c)| !c.is_alphabetic())
+        .map_or(title.len(), |(i, _)| i);
+    if word_end > 0 {
+        if PHASE_WORDS.contains(&title[..word_end].to_lowercase().as_str())
+            && let Some(after) = title[word_end..].trim_start().strip_prefix(number.as_str())
             && !after.starts_with(|c: char| c.is_ascii_digit())
-            && let Some(after) = after
-                .trim_start()
-                .strip_prefix([':', '.', ')', '-', '–', '—'])
-            && let Some(text) = non_empty(after)
         {
-            return text;
+            let after = after.trim_start();
+            let text = if let Some(rest) = after.strip_prefix([':', '：', '-', '–', '—']) {
+                non_empty(rest)
+            } else if let Some(rest) = after.strip_prefix(['.', ')'])
+                && rest.starts_with(char::is_whitespace)
+            {
+                non_empty(rest)
+            } else {
+                None
+            };
+            if let Some(text) = text {
+                return text;
+            }
         }
         return keep();
     }
@@ -871,6 +938,37 @@ mod tests {
                 "5.x notes"
             ]
         );
+    }
+
+    #[test]
+    fn strip_phase_prefix_table() {
+        let cases: &[(&str, usize, &str)] = &[
+            ("Python 3.12 upgrade", 3, "Python 3.12 upgrade"),
+            ("Web 2.0", 2, "Web 2.0"),
+            ("Node 18.x", 18, "Node 18.x"),
+            ("Python 3: migrate", 3, "Python 3: migrate"),
+            ("v2: X", 2, "v2: X"),
+            ("Version 2: API", 2, "Version 2: API"),
+            ("Windows 10 - x", 10, "Windows 10 - x"),
+            ("Fase 2: Crear", 2, "Crear"),
+            ("fase 2 - crear", 2, "crear"),
+            ("ÉTAPE 3 — Tests", 3, "Tests"),
+            ("Schritt 4) Aufräumen", 4, "Aufräumen"),
+            ("Paso 1.5 ajustar", 1, "Paso 1.5 ajustar"),
+            ("フェーズ1：設計", 1, "設計"),
+            ("Fase 9: X", 2, "Fase 9: X"),
+            ("Phase 7: X", 2, "X"),
+            ("2. X", 2, "X"),
+            ("2.0 release", 2, "2.0 release"),
+            ("Fase 2:", 2, "Fase 2:"),
+        ];
+        for (title, position, expected) in cases {
+            assert_eq!(
+                strip_phase_prefix(title, *position),
+                *expected,
+                "{title:?} at {position}"
+            );
+        }
     }
 
     #[test]

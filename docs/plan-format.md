@@ -38,11 +38,14 @@ Every key is optional.
   `---`) opens a phase. Phases are numbered 1, 2, 3... by order of appearance.
 - The title is the heading text without the `#` markers. A leading
   `Phase <number>:` (any case, any spacing) is removed, so
-  `## Phase 2: Convert utils` becomes `Convert utils`. A single word plus the
-  phase's own number, followed by `:`, `.`, `)`, `-`, `–` or `—`, is removed
-  too, in any language (`## Fase 2: X`, `## Step 2 — X`), and so is the bare
-  number (`## 2. X`, `## 2) X`). If nothing would be left (`## Phase 1:`), the
-  title is kept as written.
+  `## Phase 2: Convert utils` becomes `Convert utils`. A word for "phase",
+  "step", "stage" or "part" in a common language (`Fase`, `Paso`, `Étape`,
+  `Schritt`, `フェーズ`...) plus the phase's own number and a separator is
+  removed too: `:`, `：`, `-`, `–` or `—`, or `.` or `)` followed by a space
+  (`## Fase 2: X`, `## Étape 2 — X`, `## Step 2) X`). The bare number
+  (`## 2. X`, `## 2) X`) is removed as well. Other words are never removed
+  (`## Python 3: migrate` stays as written), nor is a prefix whose number is
+  not the phase's position, or one that would leave nothing (`## Phase 1:`).
 - A `##` inside a fenced code block is not a heading.
 - Titles must be unique, ignoring case.
 - Level-3 and deeper headings (`###`) stay inside the phase body.
@@ -74,7 +77,7 @@ phase, with a fenced block whose info string is exactly `phasewise`:
 ## Phase 3: Hard refactor
 
 ```phasewise
-model = "opus"
+model = "claude-opus-5-5"
 effort = "high"
 ```
 
@@ -153,10 +156,10 @@ Print a summary, or one JSON object with `--json`.
 - Output goes to stdout.
 ````
 
-More plans are in `examples/plans/`.
+More plans are in [`examples/plans/`](../examples/plans/).
 
-## Environment variables (testing and advanced use)
+## Environment variables
 
-- `PHASEWISE_PHASE_TIMEOUT_SECONDS`: whole seconds; overrides
-  `phase_timeout_minutes` for every phase. An invalid value is an error.
-- `PHASEWISE_CLAUDE_BIN` / `PHASEWISE_CODEX_BIN`: replace the agent binary.
+`PHASEWISE_PHASE_TIMEOUT_SECONDS` overrides `phase_timeout_minutes` for every
+phase. It and the other variables phasewise reads are listed in the
+[user guide](user-guide.md#files-and-settings).
