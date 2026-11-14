@@ -182,3 +182,69 @@ deviates from the original plan, with the reason.
   `icanon` and `echo` again.
 - **`.DS_Store` was committed by mistake** in an earlier phase (created by
   Finder). It is now untracked and ignored; it remains in the local history.
+
+## Build phase 8
+
+- **Both agents are documented as "experimental — not yet verified against a
+  real run"** in the README, because the real smoke test could not be run.
+- **The demo GIF is not recorded**: `demo/demo.tape` is ready for `vhs`, which
+  is not installed here; the README keeps a placeholder comment.
+- **Accidental real Codex run.** While the README commands were being checked,
+  one step ran `phasewise run --agent codex` without `PHASEWISE_CODEX_BIN`, so
+  the real `codex` 0.160.0 started. It was not logged in: api.openai.com
+  answered HTTP 401, the phase failed at once and nothing was spent. If Codex
+  reads `OPENAI_API_KEY` from the environment, that key (which belongs to
+  another provider) was sent to OpenAI in the rejected request; this corrects
+  the phase 5 note. Manual checks must always point `PHASEWISE_CLAUDE_BIN` and
+  `PHASEWISE_CODEX_BIN` at the fakes.
+
+## Build phase 9 — review fixes
+
+- **Run lock via `create_new`.** `LockGuard::acquire` creates `runs/<id>/lock`
+  with `create_new(true)`, so two processes cannot both own it. This is the one
+  exception to the temp file + `rename` rule for state files. An existing lock
+  with a live PID or an empty content is in use; a dead PID or non-PID content
+  is stale, removed and retried once.
+- **Lock held for whole operations.** `ops::execute/next/retry/rollback/abort`
+  take the lock first, reload the state under it (`load_locked`, which marks
+  orphaned running/verifying phases as interrupted even though the lock is
+  live) and keep it until they return, including the `--auto` chain.
+  `engine::run_phase` no longer locks; `approve` is only called under the lock.
+  `prepare_rollback` stays lock-free (the CLI calls it before its prompt) and
+  `rollback` re-checks under the lock.
+- **`.phasewise/` is excluded at command level.** `clean_untracked` passes
+  `-e /.phasewise/`; `add_all` runs `git add -A` and then `git reset -q --
+  .phasewise`. The pathspec form `add -A -- . ':(exclude).phasewise'` was tried
+  first but fails with git 2.54 when the directory is ignored via
+  `.git/info/exclude`.
+- **`FailureKind::CheckpointFailed`** (`checkpoint_failed`): a checkpoint that
+  cannot be created (HEAD left the run branch during verification, `git add` or
+  `commit` fails) fails the phase instead of aborting with an error, and keeps
+  the changes in the working tree for `phasewise retry`.
+- **Commit identity is checked up front** with `git var GIT_AUTHOR_IDENT` and
+  `GIT_COMMITTER_IDENT` (confirmed to fail with `user.useConfigOnly` and no
+  identity), in `ops::start` before the branch is created and before phases run.
+- **`ops::start` cleanup:** if a step after `create_branch` fails, it switches
+  back to the original branch and reports that the run branch can be removed
+  with `git branch -D` (phasewise never deletes branches).
+- **`ctrlc` with the `termination` feature** so SIGTERM and SIGHUP (closing the
+  terminal, `kill`) are handled like Ctrl-C instead of leaving agents running.
+- **`GroupChild` and a registry of live groups.** A child owns its process
+  group; Drop kills it, so early returns and panics cannot leak agent trees.
+  The registry lets the second signal and the panic hook (`try_lock`, so it can
+  never deadlock) kill every live group.
+- **Leftover cleanup after normal exits.** After the agent or a verification
+  command exits normally, `finish_leftovers` stops background processes it
+  left in the group (TERM, then KILL).
+- **Stdout errors are ignored** (`outln!`/`out!` macros instead of
+  `println!`), because `println!` panics on a closed stdout.
+- **TUI signal handling:** the first signal acts like a confirmed quit; an
+  error from the event loop interrupts and joins the worker before returning.
+- **Second review of these fixes** found nothing serious; its minor points were
+  fixed too: recovery on read (`load_with_recovery`) saves only under the lock
+  (if another process holds it, the state is shown as is); `is_alive` counts
+  "Operation not permitted" (EPERM, read with `LC_ALL=C`) as alive, so a lock
+  of another user's live process is never taken over; `ops::rollback` takes the
+  SHA the user confirmed and changes nothing if the target moved meanwhile;
+  `next` checks the git identity only when a phase will run; phases recovered
+  under the lock are announced after the operation.

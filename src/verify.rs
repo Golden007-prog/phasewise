@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::process::{spawn_in_group, terminate_group};
+use crate::process::spawn_in_group;
 
 const TAIL_LINES: usize = 200;
 const KILL_GRACE: Duration = Duration::from_secs(2);
+const LEFTOVER_GRACE: Duration = Duration::from_millis(200);
 const POLL: Duration = Duration::from_millis(20);
 
 /// Progress of the verification, reported through the `on_event` callback.
@@ -104,11 +105,15 @@ pub fn run_all(
                 timed_out = true;
             }
             if cancelled || timed_out {
-                break terminate_group(&mut child, KILL_GRACE)?;
+                break child.terminate(KILL_GRACE)?;
             }
             thread::sleep(POLL);
         };
 
+        if !cancelled && !timed_out {
+            // Do not let background processes outlive the command.
+            child.finish_leftovers(LEFTOVER_GRACE);
+        }
         let exit_code = status.code();
         if cancelled {
             writeln!(log, "interrupted")?;

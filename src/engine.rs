@@ -3,7 +3,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -15,15 +15,14 @@ use jiff::Timestamp;
 use crate::agent::{Agent, AgentEvent, AgentParser};
 use crate::git::{Git, checkpoint_message};
 use crate::plan::Plan;
-use crate::process::{signal_group, spawn_in_group, terminate_group};
+use crate::process::{GroupChild, spawn_in_group};
 use crate::prompt;
-use crate::state::{
-    Failure, FailureKind, LockGuard, PhaseStatus, RunPaths, RunState, truncate_summary,
-};
+use crate::state::{Failure, FailureKind, PhaseStatus, RunPaths, RunState, truncate_summary};
 use crate::verify::{self, VerifyEvent, VerifyOutcome};
 
 const POLL: Duration = Duration::from_millis(50);
 const EOF_WAIT: Duration = Duration::from_secs(2);
+const LEFTOVER_GRACE: Duration = Duration::from_millis(200);
 
 /// What the engine reports while a phase runs.
 #[derive(Debug, Clone, PartialEq)]
@@ -152,13 +151,13 @@ enum Reader {
     Eof,
 }
 
-/// Runs one phase until it is `awaiting_review` or `failed`.
+/// Runs one phase until it is `awaiting_review` or `failed`. The caller must
+/// hold the run lock (`LockGuard`).
 pub fn run_phase(
     ctx: &mut PhaseContext,
     phase_number: usize,
     note: Option<&str>,
 ) -> Result<PhaseStatus> {
-    let _lock = LockGuard::acquire(ctx.paths)?;
     let phase = phase_number;
     let plan_phase = ctx
         .plan
@@ -357,7 +356,7 @@ fn run_agent(
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
+    if let Some(mut stdin) = child.take_stdin() {
         let prompt = launch.prompt.clone();
         // A broken pipe only means the agent stopped reading; its exit status tells the rest.
         thread::spawn(move || {
@@ -365,7 +364,7 @@ fn run_agent(
         });
     }
     let (tx, rx) = mpsc::channel();
-    if let Some(stdout) = child.stdout.take() {
+    if let Some(stdout) = child.take_stdout() {
         let parser = ctx.agent.parser(&root);
         thread::spawn(move || read_stdout(stdout, stdout_file, parser, tx));
     } else {
@@ -408,7 +407,7 @@ fn read_stdout(
 fn follow_agent(
     ctx: &mut PhaseContext,
     phase: usize,
-    child: &mut Child,
+    child: &mut GroupChild,
     rx: &Receiver<Reader>,
 ) -> Result<AgentRun> {
     let mut run = AgentRun::default();
@@ -435,7 +434,7 @@ fn follow_agent(
                 stopped = true;
             }
             if stopped {
-                let status = terminate_group(child, ctx.settings.kill_grace)?;
+                let status = child.terminate(ctx.settings.kill_grace)?;
                 run.exit_code = status.code();
                 exited = true;
             }
@@ -448,8 +447,8 @@ fn follow_agent(
     if !stopped {
         // The phase is over: stop anything the agent left running in its group
         // (it could keep changing files or hold stdout open). Usually there is
-        // nothing left and the signal fails harmlessly.
-        signal_group(child.id(), "TERM");
+        // nothing left and this returns at once.
+        child.finish_leftovers(LEFTOVER_GRACE);
     }
     // The process is gone; give the reader a moment to deliver what is left.
     let deadline = Instant::now() + EOF_WAIT;
@@ -553,11 +552,38 @@ fn run_verification(
 }
 
 /// Commits the phase (empty commits allowed) and moves it to `awaiting_review`.
+/// A git failure fails the phase (`checkpoint_failed`) instead of aborting.
 fn checkpoint(ctx: &mut PhaseContext, phase: usize, title: &str) -> Result<PhaseStatus> {
-    ctx.git.add_all()?;
+    let run_branch = ctx.state.run_branch.clone();
+    // Verification commands can switch branches.
+    let current = ctx.git.current_branch();
+    if let Ok(current) = current
+        && current.as_deref() != Some(run_branch.as_str())
+    {
+        let now_on = current.unwrap_or_else(|| "a detached HEAD".to_string());
+        let detail = format!(
+            "The verification commands left the repository on {now_on} instead of {run_branch}, \
+so no checkpoint was created. Run `git switch {run_branch}`, then `phasewise retry`"
+        );
+        return ctx.fail(phase, FailureKind::CheckpointFailed, detail);
+    }
     let message = checkpoint_message(&ctx.state.run_id, phase, title);
-    ctx.git.commit(&message, true)?;
-    let sha = ctx.git.head_sha()?;
+    let created = ctx
+        .git
+        .add_all()
+        .and_then(|()| ctx.git.commit(&message, true))
+        .and_then(|_| ctx.git.head_sha());
+    let sha = match created {
+        Ok(sha) => sha,
+        Err(err) => {
+            let detail = format!(
+                "phasewise could not create the checkpoint commit: {err:#}. \
+The phase's changes are still in the working tree. Fix the cause (for example set git \
+user.name and user.email), then run `phasewise retry` to run the phase again"
+            );
+            return ctx.fail(phase, FailureKind::CheckpointFailed, detail);
+        }
+    };
     let state = ctx.phase_state(phase)?;
     state.checkpoint_sha = Some(sha.clone());
     state.status = PhaseStatus::AwaitingReview;

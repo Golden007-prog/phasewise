@@ -20,6 +20,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use crate::display::{failure_kind_label, first_line_short};
 use crate::engine::EngineEvent;
 use crate::ops::{self, NextOutcome, Run};
+use crate::process;
 use crate::state::{PhaseStatus, RunState};
 use app::{App, Command, Tab};
 
@@ -53,6 +54,8 @@ struct Tui<'a> {
     last_refresh: Instant,
     refresh_pending: bool,
     quitting: bool,
+    /// Set by SIGINT/SIGTERM/SIGHUP (the first one acts like a confirmed quit).
+    signalled: Arc<AtomicBool>,
     /// Something changed since the last draw. Drawing only then keeps an idle
     /// TUI silent (no output every poll).
     dirty: bool,
@@ -76,12 +79,20 @@ pub fn run(cwd: &Path) -> Result<ExitCode> {
         last_refresh: Instant::now(),
         refresh_pending: false,
         quitting: false,
+        signalled: process::install_signal_handler(None)?,
         dirty: true,
     };
     tui.load_caches();
     let mut terminal = ratatui::try_init()?;
     let _guard = TerminalGuard;
-    tui.event_loop(&mut terminal)?;
+    if let Err(err) = tui.event_loop(&mut terminal) {
+        // Stop the agent and wait for it before reporting the error.
+        tui.interrupt();
+        if let Some(worker) = tui.worker.take() {
+            let _ = worker.handle.join();
+        }
+        return Err(err);
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -91,6 +102,10 @@ impl Tui<'_> {
             if self.dirty {
                 terminal.draw(|frame| view::draw(frame, &mut self.app))?;
                 self.dirty = false;
+            }
+            if !self.quitting && self.signalled.load(Ordering::SeqCst) {
+                self.execute(Command::Quit);
+                self.dirty = true;
             }
             if self.quitting && self.worker.is_none() {
                 return Ok(());
@@ -184,9 +199,15 @@ impl Tui<'_> {
     }
 
     fn rollback(&mut self, k: usize) {
+        if self.worker.is_some() {
+            self.app.message = Some(
+                "A phase is running; wait for it to finish or press x to interrupt it.".to_string(),
+            );
+            return;
+        }
         let result = ops::load_current(self.cwd)
             .and_then(|run| run.ok_or_else(|| anyhow!(NO_RUN)))
-            .and_then(|mut run| ops::rollback(&mut run, k));
+            .and_then(|mut run| ops::rollback(&mut run, k, None));
         self.refresh();
         self.app.message = Some(match result {
             Ok(()) if k == 0 => "Rolled back to the initial state.".to_string(),

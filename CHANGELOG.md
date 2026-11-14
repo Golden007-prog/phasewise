@@ -16,6 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Run state in `.phasewise/` (atomic writes, lock file, recovery of phases left running by a dead process), excluded from git.
 - Adapters for Claude Code and Codex (experimental: not yet verified against a real run), with per-phase cost shown when Claude reports it.
 - Review TUI with phase list, Diff / Log / Verify tabs, live engine output, approve, retry with a note, rollback and interrupt; the terminal is restored on exit and on panic.
-- Ctrl-C handling that stops the agent's process group and records the phase as interrupted.
+- Ctrl-C, SIGTERM and SIGHUP handling that stops the agent's process group and records the phase as interrupted; a second signal kills every process phasewise started and exits with 130.
 - Guarantees: never pushes, never deletes branches, never uses `--force`, no network access of its own, no `unsafe`.
 - Documentation (README, plan format, security model, roadmap), example plans, smoke-test script for real agents and a VHS demo script.

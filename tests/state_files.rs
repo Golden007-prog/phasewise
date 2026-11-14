@@ -95,7 +95,7 @@ fn live_lock_blocks_acquire_and_recovery() {
 
     let err = LockGuard::acquire(&paths).unwrap_err().to_string();
     assert!(
-        err.contains(&format!("already running in process {}", child.id())),
+        err.contains(&format!("in use by phasewise process {}", child.id())),
         "{err}"
     );
     let loaded = load_with_recovery(&paths).unwrap();

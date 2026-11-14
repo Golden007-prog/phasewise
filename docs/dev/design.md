@@ -111,22 +111,24 @@ pub struct PhaseState {
 }
 pub enum PhaseStatus { Pending, Running, Verifying, AwaitingReview, Done, Failed }   // snake_case
 pub struct Failure { pub kind: FailureKind, pub detail: String }
-pub enum FailureKind { AgentError, VerifyFailed, Timeout, Interrupted }               // snake_case
+pub enum FailureKind { AgentError, VerifyFailed, Timeout, Interrupted, CheckpointFailed }               // snake_case
 ```
 
 - `RunPaths` computes every path. Writes are atomic: temp file in the same directory, `sync_all`, `rename`.
 - `checkpoint(n)`: `base_sha` for 0, else `phases[n-1].checkpoint_sha`.
 - `attempts` counts every agent launch of the phase in this run (never reset, so log files are never overwritten).
-- Lock: while a phase runs, `runs/<id>/lock` holds the PID of the phasewise process (RAII guard removes it). A lock whose PID is not alive (`process::is_alive`) is stale.
+- Lock: `runs/<id>/lock` holds the PID of the phasewise process for the whole of a mutating operation (`ops::execute/next/retry/rollback/abort`; RAII guard removes it). It is created with `create_new` (atomic). A lock whose PID is not alive, or whose content is not a PID, is stale and is replaced; an empty file is treated as in use. The state is reloaded under the lock (`load_locked`: phases left `running`/`verifying` are orphaned).
 - Recovery on load: if there is no live lock, phases in `running`/`verifying` become `failed` with `interrupted` ("phasewise stopped while this phase was running") and the state is saved. With a live lock, read-only commands show the state as is and mutating commands refuse ("phase N is running in process PID").
 - Run id: UTC `YYYYMMDD-HHMMSS` + `-` + 4 random lowercase hex chars (randomness from `std::collections::hash_map::RandomState`, no extra crate). Branch: `phasewise/<run-id>`.
 
 ## Processes (`process.rs`)
 
 - Agent and verification commands are spawned with `CommandExt::process_group(0)` so the whole tree can be stopped.
-- `terminate_group(child, grace)`: `kill -TERM -- -<pgid>` (run through `sh -c`, no `unsafe`), poll `try_wait` for `grace` (5 s), then `kill -KILL -- -<pgid>` and reap.
+- `GroupChild::terminate(grace)`: `kill -TERM -- -<pgid>` (run through `sh -c`, no `unsafe`), poll `try_wait` for `grace` (5 s), then `kill -KILL -- -<pgid>` and reap.
 - `is_alive(pid)`: `kill -0 <pid>` through `sh -c`.
-- The CLI installs a Ctrl-C handler (`ctrlc` crate) that sets the shared cancel flag; a second Ctrl-C exits immediately with 130. The TUI uses raw mode, so Ctrl-C is a key there.
+- `spawn_in_group` returns a `GroupChild` that owns its process group and registers the pgid in a global registry. Dropping it without `terminate`/`finish_leftovers` (early return, panic) kills the group and reaps the leader. `finish_leftovers(grace)` runs after a normal exit (agent and each verification command): `TERM` to the group and, if anything was there, `KILL` after the group disappears or `grace` passes.
+- `install_signal_handler` (`ctrlc` with `termination`: SIGINT, SIGTERM, SIGHUP) sets the shared cancel flag; the second signal kills every registered group (`kill_all_groups`) and exits 130. The CLI prints a notice on stderr; the TUI installs it silently and treats the flag as a confirmed quit (in raw mode Ctrl-C is still a key). A panic hook installed in `cli::main` kills the groups (`try_lock`, never blocks) before the previous hook (which restores the terminal) runs.
+- Output to stdout uses non-panicking macros: a closed stdout is ignored.
 
 ## Agents (`agent/`)
 
@@ -178,9 +180,9 @@ pub enum EngineEvent {
 
 `run_phase(ctx, phase_number, note) -> Result<PhaseStatus>` (ctx holds git, paths, state, plan, agent, settings, sender, cancel flag):
 
-1. Take the lock. Fresh session. Prompt = `phase_prompt` (+ note).
-2. Loop: `attempts += 1`, status `running`, save, emit `PhaseStarted`. Spawn the agent (new or resume command), write the prompt to its stdin from a thread and close it. A reader thread reads stdout line by line (lossy UTF-8), appends each raw line to the `.jsonl`, feeds the parser and sends the events back. stderr goes straight to its log file. The engine loop polls with `recv_timeout` (50 ms), forwards events, records session id / summary / cost, and checks the per-attempt timeout (`phase_timeout_minutes`, overridable with `PHASEWISE_PHASE_TIMEOUT_SECONDS`) and the cancel flag (both → `terminate_group`). After the child exits, wait at most 2 s more for stdout EOF.
-3. Failure → `failed`: cancel → `interrupted`; timeout → `timeout`; non-zero exit, `Finished { ok: false }`, or HEAD no longer on the run branch → `agent_error` (detail includes the exit code, the agent's error text or the last stderr lines). No automatic retry for these.
+1. The caller already holds the run lock. Fresh session. Prompt = `phase_prompt` (+ note).
+2. Loop: `attempts += 1`, status `running`, save, emit `PhaseStarted`. Spawn the agent (new or resume command), write the prompt to its stdin from a thread and close it. A reader thread reads stdout line by line (lossy UTF-8), appends each raw line to the `.jsonl`, feeds the parser and sends the events back. stderr goes straight to its log file. The engine loop polls with `recv_timeout` (50 ms), forwards events, records session id / summary / cost, and checks the per-attempt timeout (`phase_timeout_minutes`, overridable with `PHASEWISE_PHASE_TIMEOUT_SECONDS`) and the cancel flag (both → `GroupChild::terminate`). After the child exits, wait at most 2 s more for stdout EOF.
+3. Failure → `failed`: cancel → `interrupted`; timeout → `timeout`; non-zero exit, `Finished { ok: false }`, or HEAD no longer on the run branch → `agent_error` (detail includes the exit code, the agent's error text or the last stderr lines). No automatic retry for these. A checkpoint that cannot be created (HEAD moved off the run branch by a verify command, `git add`/`commit` failure) → `checkpoint_failed`.
 4. Status `verifying`, save, run global then phase verify commands.
 5. Verification failed and retries left (`max_retries` per `run_phase` call) → emit `Retrying`, prompt = `resume_prompt(report)` with the resume command if a session id is known, else `fresh_retry_prompt`; back to 2. No retries left → `failed` with `verify_failed`, tree left as is.
 6. Verification passed → `git add -A`, checkpoint commit (`--allow-empty`), `checkpoint_sha = HEAD`, status `awaiting_review`, save, emit `CheckpointCreated` and `PhaseFinished`.

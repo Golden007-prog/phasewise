@@ -146,7 +146,7 @@ If verification fails, phasewise retries up to `max_retries` times (default 1). 
 phasewise itself is free; the agents are not. Claude's reported `total_cost_usd` is shown per phase in `phasewise status`. Codex reports tokens only, so phasewise shows no cost for it. There are no spending limits in v0.1; for Claude you can pass `--max-budget-usd` through `agent_args` in the plan front matter.
 
 **What does Ctrl-C do?**
-In `run`, `next` and `retry`, the first Ctrl-C stops the agent and marks the phase failed (interrupted); a second one exits immediately. If phasewise dies some other way, the next command that reads the run marks the orphaned phase as failed (interrupted). In the TUI, Ctrl-C works like `q`.
+In `run`, `next` and `retry`, the first Ctrl-C stops the agent and marks the phase failed (interrupted); a second one kills the agent's processes and exits with 130. SIGTERM and SIGHUP (for example closing the terminal) are handled like Ctrl-C. If phasewise dies some other way, the next command that reads the run marks the orphaned phase as failed (interrupted). In the TUI, Ctrl-C works like `q`.
 
 ## Roadmap
 

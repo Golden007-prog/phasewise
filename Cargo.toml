@@ -15,7 +15,7 @@ unsafe_code = "forbid"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
-ctrlc = "3.5.2"
+ctrlc = { version = "3.5.2", features = ["termination"] }
 jiff = { version = "0.2.43", features = ["serde"] }
 pulldown-cmark = { version = "0.13.6", default-features = false }
 ratatui = "0.30.2"

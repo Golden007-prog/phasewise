@@ -338,6 +338,46 @@ fn agent_switching_branch_is_an_error() {
 }
 
 #[test]
+fn checkpoint_failure_fails_the_phase() {
+    let env = Env::new();
+    let out = env.exec(&["run"], &[("FAKE_MODE", "index_lock")]);
+    assert_eq!(out.code, 3, "{}\n{}", out.stdout, out.stderr);
+    let state = env.state();
+    assert_eq!(env.statuses()[0], "failed");
+    let (kind, detail) = failure_of(&state, 1);
+    assert_eq!(kind, "checkpoint_failed");
+    assert!(detail.contains("phasewise retry"), "{detail}");
+    assert!(
+        !env.repo
+            .path()
+            .join(format!(".phasewise/runs/{}/lock", env.run_id()))
+            .exists()
+    );
+}
+
+#[test]
+fn unknown_git_identity_is_refused_up_front() {
+    let env = Env::new();
+    env.repo.git(&["config", "--unset", "user.name"]);
+    env.repo.git(&["config", "--unset", "user.email"]);
+    env.repo.git(&["config", "user.useConfigOnly", "true"]);
+    let out = env.exec(&["run"], &[]);
+    assert_eq!(out.code, 1, "{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains("git does not know who you are"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        env.repo
+            .git(&["branch", "--list", "phasewise/*"])
+            .trim()
+            .is_empty()
+    );
+    assert!(!env.repo.path().join(".phasewise/current").exists());
+}
+
+#[test]
 fn dirty_tree_is_refused_without_side_effects() {
     let env = Env::new();
     env.repo.write("dirty.txt", "x\n");

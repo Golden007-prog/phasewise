@@ -14,8 +14,8 @@ use crate::engine::{EngineEvent, PhaseContext, PhaseSettings, run_phase};
 use crate::git::Git;
 use crate::plan::{self, AgentKind, Plan};
 use crate::state::{
-    PhaseStatus, PhasewiseDir, RunPaths, RunState, RunStatus, load_with_recovery, lock_holder,
-    new_run_id, run_branch_name, write_atomic,
+    LockGuard, PhaseStatus, PhasewiseDir, RunPaths, RunState, RunStatus, load_locked,
+    load_with_recovery, lock_holder, new_run_id, run_branch_name, write_atomic,
 };
 
 const KILL_GRACE: Duration = Duration::from_secs(5);
@@ -70,13 +70,52 @@ pub fn start(cwd: &Path, plan_path: &Path, agent_override: Option<AgentKind>) ->
             )
         })?;
 
+    git.check_identity()?;
     git.ensure_excluded(".phasewise/")?;
     let run_id = new_run_id(Timestamp::now());
     let run_branch = run_branch_name(&run_id);
     let base_sha = git.head_sha()?;
     git.create_branch(&run_branch, &base_sha)?;
 
-    let paths = RunPaths::new(git.root(), &run_id);
+    // From here on the repository is on the run branch: undo that if a later step fails.
+    match write_run_files(
+        &git,
+        plan_path,
+        &plan_text,
+        &plan,
+        agent_override,
+        &run_id,
+        &original_branch,
+        &base_sha,
+    ) {
+        Ok(run) => Ok(run),
+        Err(err) => {
+            let _ = git.switch(&original_branch);
+            Err(err.context(format!(
+                "Branch {run_branch} was created and can be removed with `git branch -D {run_branch}` \
+(phasewise never deletes branches)"
+            )))
+        }
+    }
+}
+
+/// The steps of `start` after the branch exists, split out so `start` can undo
+/// the branch switch when one of them fails.
+// Same independent run fields as `RunState::new`; a parameter struct would only
+// move the list to the single call site.
+#[allow(clippy::too_many_arguments)]
+fn write_run_files(
+    git: &Git,
+    plan_path: &Path,
+    plan_text: &str,
+    plan: &Plan,
+    agent_override: Option<AgentKind>,
+    run_id: &str,
+    original_branch: &str,
+    base_sha: &str,
+) -> Result<Run> {
+    let run_branch = run_branch_name(run_id);
+    let paths = RunPaths::new(git.root(), run_id);
     write_atomic(&paths.plan_copy(), plan_text.as_bytes())?;
     let phases: Vec<(usize, String)> = plan
         .phases
@@ -87,22 +126,22 @@ pub fn start(cwd: &Path, plan_path: &Path, agent_override: Option<AgentKind>) ->
         .canonicalize()
         .unwrap_or_else(|_| plan_path.to_path_buf());
     let mut state = RunState::new(
-        &run_id,
+        run_id,
         &plan_path,
         plan.title.clone(),
         agent_override.unwrap_or(plan.config.agent),
-        &original_branch,
+        original_branch,
         &run_branch,
-        &base_sha,
+        base_sha,
         &phases,
     );
     state.save(&paths)?;
-    PhasewiseDir::new(git.root()).write_current(&run_id)?;
+    PhasewiseDir::new(git.root()).write_current(run_id)?;
     Ok(Run {
-        git,
+        git: git.clone(),
         paths,
         state,
-        plan,
+        plan: plan.clone(),
         recovered: Vec::new(),
     })
 }
@@ -176,13 +215,7 @@ fn load_from_git(git: &Git) -> Result<Option<Run>> {
     }
     let before = RunState::load(&paths)?;
     let state = load_with_recovery(&paths)?;
-    let recovered = before
-        .phases
-        .iter()
-        .zip(&state.phases)
-        .filter(|(old, new)| old.status != new.status && new.status == PhaseStatus::Failed)
-        .map(|(old, _)| old.number)
-        .collect();
+    let recovered = recovered_phases(&before, &state);
     let plan = plan::load(&paths.plan_copy())?;
     Ok(Some(Run {
         git: git.clone(),
@@ -222,7 +255,8 @@ Unset it or fix the value."
     })
 }
 
-/// Moves the phase awaiting review to `done`; completes the run when no phase is pending.
+/// Moves the phase awaiting review to `done`; completes the run when no phase
+/// is pending. Only call it while holding the run lock.
 pub fn approve(run: &mut Run) -> Result<()> {
     let phase = run
         .state
@@ -244,13 +278,42 @@ pub fn approve(run: &mut Run) -> Result<()> {
     run.state.save(&run.paths)
 }
 
+/// Takes the run lock and reloads the state under it. Phases left
+/// `running`/`verifying` are orphaned (we hold the lock) and are marked failed;
+/// they are added to `run.recovered`.
+fn lock_and_reload(run: &mut Run) -> Result<LockGuard> {
+    let lock = LockGuard::acquire(&run.paths)?;
+    let before = RunState::load(&run.paths)?;
+    let state = load_locked(&run.paths, &lock)?;
+    let recovered = recovered_phases(&before, &state);
+    run.state = state;
+    for number in recovered {
+        if !run.recovered.contains(&number) {
+            run.recovered.push(number);
+        }
+    }
+    Ok(lock)
+}
+
+/// Numbers of phases that `old` had running/verifying and `new` has failed.
+fn recovered_phases(old: &RunState, new: &RunState) -> Vec<usize> {
+    old.phases
+        .iter()
+        .zip(&new.phases)
+        .filter(|(old, new)| old.status != new.status && new.status == PhaseStatus::Failed)
+        .map(|(old, _)| old.number)
+        .collect()
+}
+
 /// Approves the phase awaiting review (if any) and runs the next pending one.
+/// Holds the run lock for the whole operation.
 pub fn next(
     run: &mut Run,
     auto: bool,
     events: &Sender<EngineEvent>,
     cancel: &AtomicBool,
 ) -> Result<NextOutcome> {
+    let _lock = lock_and_reload(run)?;
     check_can_advance(run)?;
     if run
         .state
@@ -263,17 +326,27 @@ pub fn next(
             return Ok(NextOutcome::Completed);
         }
     }
-    execute(run, auto, events, cancel).map(NextOutcome::Ran)
+    // Only needed when a phase will run (completing the run commits nothing).
+    run.git.check_identity()?;
+    execute_locked(run, auto, events, cancel).map(NextOutcome::Ran)
 }
 
-/// The run must be active and no phasewise process may be running a phase.
-fn check_active_unlocked(run: &Run) -> Result<()> {
+/// The run must be active. For callers that hold the run lock (a live lock is
+/// then our own).
+fn check_active(run: &Run) -> Result<()> {
     if run.state.status != RunStatus::Active {
         bail!(
             "Run {} is not active. Start a new one with `phasewise run`.",
             run.state.run_id
         );
     }
+    Ok(())
+}
+
+/// The run must be active and no phasewise process may be running a phase.
+/// Only for callers that do not hold the lock.
+fn check_active_unlocked(run: &Run) -> Result<()> {
+    check_active(run)?;
     if let Some(pid) = lock_holder(&run.paths) {
         let number = run
             .state
@@ -301,7 +374,7 @@ fn check_on_run_branch(run: &Run) -> Result<()> {
 }
 
 fn check_can_advance(run: &Run) -> Result<()> {
-    check_active_unlocked(run)?;
+    check_active(run)?;
     if let Some(failed) = run
         .state
         .phases
@@ -348,7 +421,8 @@ pub fn retry(
     events: &Sender<EngineEvent>,
     cancel: &AtomicBool,
 ) -> Result<PhaseStatus> {
-    check_active_unlocked(run)?;
+    let _lock = lock_and_reload(run)?;
+    check_active(run)?;
     let number = run
         .state
         .phases
@@ -363,6 +437,7 @@ Run `phasewise status` to see the run, or `phasewise next` to continue."
             )
         })?;
     check_on_run_branch(run)?;
+    run.git.check_identity()?;
     let previous = run
         .state
         .checkpoint(number - 1)
@@ -381,9 +456,15 @@ then `phasewise rollback 0` to start over.",
     run_one(run, number, note, events, cancel)
 }
 
-/// Checks that `rollback k` can run and returns the SHA it goes back to.
+/// Checks that `rollback k` can run and returns the SHA it goes back to. Does
+/// not take the lock (the CLI calls it before its confirmation prompt);
+/// `rollback` checks again under the lock.
 pub fn prepare_rollback(run: &Run, k: usize) -> Result<String> {
     check_active_unlocked(run)?;
+    rollback_target(run, k)
+}
+
+fn rollback_target(run: &Run, k: usize) -> Result<String> {
     check_on_run_branch(run)?;
     let valid = |n: usize| run.state.checkpoint(n).map(str::to_string);
     valid(k).ok_or_else(|| {
@@ -403,9 +484,21 @@ pub fn prepare_rollback(run: &Run, k: usize) -> Result<String> {
 }
 
 /// Goes back to the checkpoint of phase `k` (`0` = initial state); later
-/// phases become `pending` again.
-pub fn rollback(run: &mut Run, k: usize) -> Result<()> {
-    let sha = prepare_rollback(run, k)?;
+/// phases become `pending` again. `expected_sha` is the target the user
+/// confirmed (from `prepare_rollback`); if the run changed since, nothing is done.
+pub fn rollback(run: &mut Run, k: usize, expected_sha: Option<&str>) -> Result<()> {
+    let _lock = lock_and_reload(run)?;
+    check_active(run)?;
+    let sha = rollback_target(run, k)?;
+    if let Some(expected) = expected_sha
+        && expected != sha
+    {
+        bail!(
+            "The run changed while waiting for confirmation: the target of `rollback {k}` is \
+now {}. Nothing was changed; run `phasewise rollback {k}` again.",
+            sha.chars().take(7).collect::<String>()
+        );
+    }
     run.git.reset_hard(&sha)?;
     run.git.clean_untracked()?;
     let numbers: Vec<usize> = run.state.phases.iter().map(|p| p.number).collect();
@@ -419,7 +512,8 @@ pub fn rollback(run: &mut Run, k: usize) -> Result<()> {
 /// returns to the original branch and marks the run `aborted`. Never deletes
 /// the run branch.
 pub fn abort(run: &mut Run) -> Result<AbortOutcome> {
-    check_active_unlocked(run)?;
+    let _lock = lock_and_reload(run)?;
+    check_active(run)?;
     let mut leftovers_sha = None;
     let mut switched = false;
     if on_run_branch(run)? {
@@ -471,8 +565,21 @@ fn run_one(
 
 /// Runs the first pending phase. With `auto`, approves each phase that reaches
 /// `awaiting_review` and continues while phases remain; the last one stays
-/// `awaiting_review`. Stops at the first failure or on cancellation.
+/// `awaiting_review`. Stops at the first failure or on cancellation. Holds the
+/// run lock for the whole chain.
 pub fn execute(
+    run: &mut Run,
+    auto: bool,
+    events: &Sender<EngineEvent>,
+    cancel: &AtomicBool,
+) -> Result<PhaseStatus> {
+    let _lock = lock_and_reload(run)?;
+    check_active(run)?;
+    run.git.check_identity()?;
+    execute_locked(run, auto, events, cancel)
+}
+
+fn execute_locked(
     run: &mut Run,
     auto: bool,
     events: &Sender<EngineEvent>,

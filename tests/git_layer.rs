@@ -170,6 +170,26 @@ fn phasewise_dir_is_never_committed() {
 }
 
 #[test]
+fn phasewise_dir_survives_without_exclude_entry() {
+    let repo = TestRepo::new();
+    let git = git_for(&repo);
+    repo.write(".phasewise/x", "keep\n");
+    repo.write("other.txt", "junk\n");
+    git.clean_untracked().unwrap();
+    assert_eq!(repo.read(".phasewise/x"), "keep\n");
+    assert!(!repo.path().join("other.txt").exists());
+
+    repo.write("other.txt", "work\n");
+    git.add_all().unwrap();
+    let staged = repo.git(&["diff", "--cached", "--name-only"]);
+    assert_eq!(staged.trim(), "other.txt");
+
+    // Also fine when the directory does not exist.
+    std::fs::remove_dir_all(repo.path().join(".phasewise")).unwrap();
+    git.add_all().unwrap();
+}
+
+#[test]
 fn numstat_counts_and_binary() {
     let repo = TestRepo::new();
     let git = git_for(&repo);

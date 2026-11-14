@@ -200,8 +200,28 @@ impl Git {
         self.run(&["switch", branch]).map(|_| ())
     }
 
+    /// Stages everything except phasewise's own `.phasewise/` directory, even
+    /// if it is not excluded in `.git/info/exclude`. (A pathspec exclude makes
+    /// `git add` fail when the directory is ignored, so it is unstaged after.)
     pub fn add_all(&self) -> Result<()> {
-        self.run(&["add", "-A"]).map(|_| ())
+        self.run(&["add", "-A"])?;
+        self.run(&["reset", "-q", "--", ".phasewise"]).map(|_| ())
+    }
+
+    /// Checks that git knows who the author and committer are, so checkpoint
+    /// commits will not fail later.
+    pub fn check_identity(&self) -> Result<()> {
+        for var in ["GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"] {
+            let output = self.output(&["var", var], None)?;
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "git does not know who you are, so phasewise cannot create checkpoint commits. \
+Set it with `git config user.name \"Your Name\"` and `git config user.email you@example.com` \
+(add --global for every repository), then run phasewise again."
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Commits the index with `message` and returns the new `HEAD` SHA.
@@ -222,9 +242,11 @@ impl Git {
         self.run(&["reset", "--hard", sha]).map(|_| ())
     }
 
-    /// Removes untracked files and directories (ignored files are kept).
+    /// Removes untracked files and directories (ignored files are kept;
+    /// `.phasewise/` at the repository root is never removed).
     pub fn clean_untracked(&self) -> Result<()> {
-        self.run(&["clean", "-fd"]).map(|_| ())
+        self.run(&["clean", "-fd", "-e", "/.phasewise/"])
+            .map(|_| ())
     }
 
     pub fn diff(&self, from: &str, to: &str) -> Result<String> {

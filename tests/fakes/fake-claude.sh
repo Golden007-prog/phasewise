@@ -1,7 +1,7 @@
 #!/bin/sh
 # Fake Claude Code for tests. Reads the prompt from stdin and emits stream-json.
 # FAKE_MODE (or FAKE_MODE_<N> per phase): success, fail, fix_on_resume,
-# never_fixes, broken_once, commit, slow, branch.
+# never_fixes, broken_once, commit, slow, branch, index_lock, stubborn.
 # broken_once: the first fresh session (and its resume) writes broken output; a later
 # fresh session succeeds (needs FAKE_LOG_DIR for its marker file). FAKE_LOG_DIR: append calls to calls.log.
 
@@ -78,6 +78,15 @@ case "$mode" in
     branch)
         git switch -q -c "fake-agent-branch-$n"
         printf 'phase %s\n' "$n" > "$file"
+        ;;
+    stubborn)
+        trap '' TERM
+        echo $$ > "$FAKE_LOG_DIR/agent.pid"
+        sleep 30
+        ;;
+    index_lock)
+        printf 'phase %s\n' "$n" > "$file"
+        : > "$(git rev-parse --git-dir)/index.lock"
         ;;
     fail)
         ;;

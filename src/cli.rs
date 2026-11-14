@@ -3,9 +3,8 @@
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Instant;
 
@@ -18,8 +17,28 @@ use crate::engine::EngineEvent;
 use crate::git::Git;
 use crate::ops::{self, NextOutcome, Run};
 use crate::plan::{self, AgentKind};
+use crate::process;
 use crate::state::{PhaseStatus, RunStatus};
 
+// Output to stdout goes through these macros instead of `println!`/`print!`,
+// which panic when stdout is closed (for example `| head`). A closed stdout
+// must not abort the command, so write errors are ignored.
+macro_rules! outln {
+    () => {{
+        let _ = writeln!(std::io::stdout().lock());
+    }};
+    ($($arg:tt)*) => {{
+        let _ = writeln!(std::io::stdout().lock(), $($arg)*);
+    }};
+}
+
+macro_rules! out {
+    ($($arg:tt)*) => {{
+        let _ = write!(std::io::stdout().lock(), $($arg)*);
+    }};
+}
+
+const INTERRUPT_NOTICE: &str = "Interrupting… (press Ctrl-C again to quit immediately)";
 const PLAN_FILE: &str = "phasewise.md";
 const PLAN_TEMPLATE: &str = include_str!("templates/phasewise.md");
 
@@ -130,6 +149,7 @@ pub enum Command {
 
 /// Entry point called from `main`.
 pub fn main() -> ExitCode {
+    process::install_panic_hook();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
@@ -221,42 +241,42 @@ fn check(arg: Option<PathBuf>) -> Result<ExitCode> {
 
 fn print_plan(plan: &plan::Plan, path: &Path) {
     let config = &plan.config;
-    println!(
+    outln!(
         "{} ({})",
         plan.title.as_deref().unwrap_or("(untitled)"),
         path.display()
     );
-    println!("Agent: {}", config.agent);
+    outln!("Agent: {}", config.agent);
     if config.verify.is_empty() {
-        println!("Checks after every phase: (none)");
+        outln!("Checks after every phase: (none)");
     } else {
-        println!("Checks after every phase:");
+        outln!("Checks after every phase:");
         for command in &config.verify {
-            println!("  - {command}");
+            outln!("  - {command}");
         }
     }
-    println!("Max retries: {}", config.max_retries);
-    println!("Phase timeout: {} min", config.phase_timeout_minutes);
-    println!("Check timeout: {} s", config.verify_timeout_seconds);
-    println!();
+    outln!("Max retries: {}", config.max_retries);
+    outln!("Phase timeout: {} min", config.phase_timeout_minutes);
+    outln!("Check timeout: {} s", config.verify_timeout_seconds);
+    outln!();
     for phase in &plan.phases {
-        println!("  {}. {}", phase.number, phase.title);
+        outln!("  {}. {}", phase.number, phase.title);
         if phase.verify.is_empty() {
-            println!("       (no phase-specific checks)");
+            outln!("       (no phase-specific checks)");
         } else {
             for command in &phase.verify {
-                println!("       - {command}");
+                outln!("       - {command}");
             }
         }
     }
-    println!();
-    println!("{} phases. The plan is valid.", plan.phases.len());
+    outln!();
+    outln!("{} phases. The plan is valid.", plan.phases.len());
 }
 
 fn doctor() -> Result<ExitCode> {
     let report = crate::doctor::run(&current_dir()?);
     for line in &report.lines {
-        println!("{line}");
+        outln!("{line}");
     }
     Ok(if report.ok {
         ExitCode::SUCCESS
@@ -270,21 +290,21 @@ fn init() -> Result<ExitCode> {
     let git = Git::discover(&cwd)?;
     let path = git.root().join(PLAN_FILE);
     if path.exists() {
-        println!("{PLAN_FILE} already exists; left untouched.");
+        outln!("{PLAN_FILE} already exists; left untouched.");
     } else {
         std::fs::write(&path, PLAN_TEMPLATE)
             .with_context(|| format!("Cannot write {}", path.display()))?;
-        println!("Created {}.", path.display());
+        outln!("Created {}.", path.display());
     }
     if git.ensure_excluded(".phasewise/")? {
-        println!("Added .phasewise/ to the git exclude file.");
+        outln!("Added .phasewise/ to the git exclude file.");
     }
-    println!();
-    println!("Next steps:");
-    println!("  1. Edit {PLAN_FILE} to describe your phases.");
-    println!("  2. Commit it (`phasewise run` needs a clean working tree).");
-    println!("  3. phasewise check");
-    println!("  4. phasewise run");
+    outln!();
+    outln!("Next steps:");
+    outln!("  1. Edit {PLAN_FILE} to describe your phases.");
+    outln!("  2. Commit it (`phasewise run` needs a clean working tree).");
+    outln!("  3. phasewise check");
+    outln!("  4. phasewise run");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -298,9 +318,12 @@ fn current_dir() -> Result<PathBuf> {
 fn run_command(plan: Option<PathBuf>, agent: Option<AgentArg>, auto: bool) -> Result<ExitCode> {
     let path = resolve_plan_path(plan)?;
     let run = ops::start(&current_dir()?, &path, agent.map(AgentKind::from))?;
-    println!(
+    outln!(
         "Run {} on branch {} (original branch: {}, agent: {})",
-        run.state.run_id, run.state.run_branch, run.state.original_branch, run.state.agent
+        run.state.run_id,
+        run.state.run_branch,
+        run.state.original_branch,
+        run.state.agent
     );
     drive(run, move |run, events, cancel| {
         ops::execute(run, auto, events, cancel).map(NextOutcome::Ran)
@@ -316,8 +339,10 @@ fn next_command(auto: bool) -> Result<ExitCode> {
 
 /// Loads the latest run; says once if a phase left running was marked failed.
 fn load_run() -> Result<Run> {
-    let run = ops::load_current(&current_dir()?)?.ok_or_else(|| anyhow!(NO_RUN))?;
+    let mut run = ops::load_current(&current_dir()?)?.ok_or_else(|| anyhow!(NO_RUN))?;
     announce_recovery(&run);
+    // Operations may recover more phases under the run lock; only those are announced later.
+    run.recovered.clear();
     Ok(run)
 }
 
@@ -348,13 +373,13 @@ fn rollback_command(k: usize, yes: bool) -> Result<ExitCode> {
     } else {
         format!("the checkpoint of phase {k}")
     };
-    println!(
+    outln!(
         "This goes back to {target} ({}) on {}:",
         short_sha(&sha),
         run.state.run_branch
     );
-    println!("  git reset --hard {} and git clean -fd", short_sha(&sha));
-    println!(
+    outln!("  git reset --hard {} and git clean -fd", short_sha(&sha));
+    outln!(
         "Changes after it are discarded and untracked files are deleted (ignored files are kept)."
     );
     if !yes {
@@ -363,76 +388,60 @@ fn rollback_command(k: usize, yes: bool) -> Result<ExitCode> {
                 "Rollback needs confirmation and stdin is not a terminal. Pass --yes to confirm."
             ));
         }
-        print!("Continue? [y/N] ");
+        out!("Continue? [y/N] ");
         let _ = std::io::stdout().flush();
         let mut answer = String::new();
         std::io::stdin()
             .read_line(&mut answer)
             .context("Cannot read the answer from stdin. Pass --yes to confirm.")?;
         if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
-            println!("Nothing changed.");
+            outln!("Nothing changed.");
             return Ok(ExitCode::SUCCESS);
         }
     }
-    ops::rollback(&mut run, k)?;
-    println!("Rolled back to {target} ({}).", short_sha(&sha));
+    ops::rollback(&mut run, k, Some(&sha))?;
+    announce_recovery(&run);
+    outln!("Rolled back to {target} ({}).", short_sha(&sha));
     let later = run.state.phases.iter().filter(|p| p.number > k).count();
     if later > 0 {
-        println!("{later} later phase(s) are pending again.");
+        outln!("{later} later phase(s) are pending again.");
     }
-    println!("Next: `phasewise next` runs the next phase.");
+    outln!("Next: `phasewise next` runs the next phase.");
     Ok(ExitCode::SUCCESS)
 }
 
 fn abort_command() -> Result<ExitCode> {
     let mut run = load_run()?;
     let outcome = ops::abort(&mut run)?;
+    announce_recovery(&run);
     let state = &run.state;
-    println!("Run {} aborted.", state.run_id);
+    outln!("Run {} aborted.", state.run_id);
     if let Some(sha) = &outcome.leftovers_sha {
-        println!(
+        outln!(
             "Uncommitted changes were saved in commit {} on {}.",
             short_sha(sha),
             state.run_branch
         );
     }
     if outcome.switched {
-        println!("You are back on {}.", outcome.current_branch);
+        outln!("You are back on {}.", outcome.current_branch);
     } else {
-        println!(
+        outln!(
             "You are on {}; it was not changed because you were not on the run branch.",
             outcome.current_branch
         );
     }
-    println!(
+    outln!(
         "The run branch {} is kept. To use or remove it:",
         state.run_branch
     );
-    println!(
+    outln!(
         "  git switch {} && git merge --squash {} && git commit   integrate its work",
-        state.original_branch, state.run_branch
+        state.original_branch,
+        state.run_branch
     );
-    println!("  git branch -D {}   delete it", state.run_branch);
+    outln!("  git branch -D {}   delete it", state.run_branch);
     Ok(ExitCode::SUCCESS)
-}
-
-/// The shared cancel flag; the first Ctrl-C sets it, the second one exits.
-fn install_ctrlc() -> Result<Arc<AtomicBool>> {
-    static CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-    if let Some(flag) = CANCEL.get() {
-        return Ok(Arc::clone(flag));
-    }
-    let flag = Arc::new(AtomicBool::new(false));
-    let handler_flag = Arc::clone(&flag);
-    ctrlc::set_handler(move || {
-        if handler_flag.swap(true, Ordering::SeqCst) {
-            std::process::exit(130);
-        }
-        println!("Interrupting… (press Ctrl-C again to quit immediately)");
-    })
-    .context("Cannot install the Ctrl-C handler")?;
-    let _ = CANCEL.set(Arc::clone(&flag));
-    Ok(flag)
 }
 
 /// Runs the engine work in a thread that owns the run and prints its events here.
@@ -440,7 +449,7 @@ fn drive<F>(run: Run, work: F) -> Result<ExitCode>
 where
     F: FnOnce(&mut Run, &Sender<EngineEvent>, &AtomicBool) -> Result<NextOutcome> + Send + 'static,
 {
-    let cancel = install_ctrlc()?;
+    let cancel = process::install_signal_handler(Some(INTERRUPT_NOTICE))?;
     let verify_secs = ops::settings(&run)?.verify_timeout.as_secs();
     let (tx, rx) = mpsc::channel();
     let worker = thread::spawn(move || {
@@ -464,6 +473,7 @@ where
     let (run, result) = worker
         .join()
         .map_err(|_| anyhow!("The engine thread panicked. This is a bug; please report it."))?;
+    announce_recovery(&run);
     Ok(report_outcome(&run, result?))
 }
 
@@ -471,11 +481,12 @@ fn report_outcome(run: &Run, outcome: NextOutcome) -> ExitCode {
     match outcome {
         NextOutcome::Completed => {
             let state = &run.state;
-            println!("All phases done.");
-            println!("To integrate the work:");
-            println!(
+            outln!("All phases done.");
+            outln!("To integrate the work:");
+            outln!(
                 "  git switch {} && git merge --squash {} && git commit",
-                state.original_branch, state.run_branch
+                state.original_branch,
+                state.run_branch
             );
             ExitCode::SUCCESS
         }
@@ -491,11 +502,11 @@ fn report_outcome(run: &Run, outcome: NextOutcome) -> ExitCode {
                 .rev()
                 .find(|p| p.status == PhaseStatus::AwaitingReview)
                 .map_or(0, |p| p.number);
-            println!();
-            println!("Phase {number} is ready for review.");
-            println!("  phasewise diff      show what changed");
-            println!("  phasewise review    inspect it interactively");
-            println!("  phasewise next      approve it and continue");
+            outln!();
+            outln!("Phase {number} is ready for review.");
+            outln!("  phasewise diff      show what changed");
+            outln!("  phasewise review    inspect it interactively");
+            outln!("  phasewise next      approve it and continue");
             ExitCode::SUCCESS
         }
     }
@@ -510,29 +521,29 @@ fn print_failure(run: &Run) {
     else {
         return;
     };
-    println!();
+    outln!();
     if let Some(failure) = &phase.failure {
-        println!(
+        outln!(
             "Phase {} failed ({}): {}",
             phase.number,
             failure_kind_label(failure.kind),
             failure.detail
         );
     } else {
-        println!("Phase {} failed.", phase.number);
+        outln!("Phase {} failed.", phase.number);
     }
-    println!("Options:");
-    println!("  phasewise retry [--note \"...\"]   rerun the phase in a new session");
-    println!(
+    outln!("Options:");
+    outln!("  phasewise retry [--note \"...\"]   rerun the phase in a new session");
+    outln!(
         "  phasewise rollback {}              go back to the previous checkpoint",
         phase.number - 1
     );
-    println!("  or inspect the working tree; it was left as the agent left it");
+    outln!("  or inspect the working tree; it was left as the agent left it");
 }
 
 fn status() -> Result<ExitCode> {
     let Some(run) = ops::load_current(&current_dir()?)? else {
-        println!("{NO_RUN}");
+        outln!("{NO_RUN}");
         return Ok(ExitCode::SUCCESS);
     };
     announce_recovery(&run);
@@ -542,17 +553,18 @@ fn status() -> Result<ExitCode> {
         RunStatus::Completed => "completed",
         RunStatus::Aborted => "aborted",
     };
-    println!("Run:    {} ({run_status})", state.run_id);
-    println!(
+    outln!("Run:    {} ({run_status})", state.run_id);
+    outln!(
         "Plan:   {}",
         state.plan_title.as_deref().unwrap_or("(untitled)")
     );
-    println!("Agent:  {}", state.agent);
-    println!(
+    outln!("Agent:  {}", state.agent);
+    outln!(
         "Branch: {} (from {})",
-        state.run_branch, state.original_branch
+        state.run_branch,
+        state.original_branch
     );
-    println!();
+    outln!();
 
     let rows: Vec<[String; 5]> = state
         .phases
@@ -590,21 +602,21 @@ fn status() -> Result<ExitCode> {
             out.push_str(&format!("{cell:<width$}  "));
         }
         out.push_str(title);
-        println!("{out}");
+        outln!("{out}");
     };
     line(headers, "TITLE");
     for (row, phase) in rows.iter().zip(&state.phases) {
         line([&row[0], &row[1], &row[2], &row[3], &row[4]], &phase.title);
         if let (PhaseStatus::Failed, Some(failure)) = (phase.status, &phase.failure) {
-            println!(
+            outln!(
                 "    {}: {}",
                 failure_kind_label(failure.kind),
                 failure.detail
             );
         }
     }
-    println!();
-    println!("{}", next_step_hint(&run));
+    outln!();
+    outln!("{}", next_step_hint(&run));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -672,7 +684,7 @@ fn diff(n: Option<u32>) -> Result<ExitCode> {
     };
     let text = run.git.diff(from, to)?;
     if text.trim().is_empty() {
-        println!("Phase {number} made no changes.");
+        outln!("Phase {number} made no changes.");
         return Ok(ExitCode::SUCCESS);
     }
     let color = std::io::stdout().is_terminal();

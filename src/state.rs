@@ -43,6 +43,7 @@ pub enum FailureKind {
     VerifyFailed,
     Timeout,
     Interrupted,
+    CheckpointFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,16 +316,63 @@ pub fn lock_holder(paths: &RunPaths) -> Option<u32> {
 }
 
 impl LockGuard {
+    /// Takes the run lock. The lock file is created with `create_new`, so two
+    /// processes can never both own it (the one exception to temp + rename).
     pub fn acquire(paths: &RunPaths) -> Result<LockGuard> {
-        if let Some(pid) = lock_holder(paths) {
-            bail!(
-                "A phase is already running in process {pid}. Wait for it to finish or stop that process."
-            );
-        }
         let path = paths.lock_file();
-        write_atomic(&path, format!("{}\n", std::process::id()).as_bytes())?;
-        Ok(LockGuard { path })
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Cannot create {}", parent.display()))?;
+        }
+        for attempt in 0..2 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let written = file
+                        .write_all(format!("{}\n", std::process::id()).as_bytes())
+                        .and_then(|()| file.sync_all());
+                    if let Err(e) = written {
+                        let _ = fs::remove_file(&path);
+                        return Err(e).with_context(|| format!("Cannot write {}", path.display()));
+                    }
+                    return Ok(LockGuard { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let text = fs::read_to_string(&path).unwrap_or_default();
+                    let trimmed = text.trim();
+                    let pid: Option<u32> = trimmed.parse().ok();
+                    let stale = match pid {
+                        Some(pid) => !process::is_alive(pid),
+                        // Empty: another process is creating it right now.
+                        None => !trimmed.is_empty(),
+                    };
+                    if !stale || attempt == 1 {
+                        return Err(lock_in_use(pid, &path));
+                    }
+                    let _ = fs::remove_file(&path);
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("Cannot create {}", path.display()));
+                }
+            }
+        }
+        Err(lock_in_use(None, &path))
     }
+}
+
+fn lock_in_use(pid: Option<u32>, path: &Path) -> anyhow::Error {
+    let holder = pid.map_or_else(
+        || "another phasewise process".to_string(),
+        |pid| format!("phasewise process {pid}"),
+    );
+    anyhow!(
+        "This run is in use by {holder} (lock file: {}). Wait for it to finish; \
+if no phasewise process is running, delete the lock file.",
+        path.display()
+    )
 }
 
 impl Drop for LockGuard {
@@ -333,13 +381,36 @@ impl Drop for LockGuard {
     }
 }
 
-/// Loads the state; without a live lock, phases left `running`/`verifying`
-/// become `failed` (`interrupted`) and the state is saved.
+/// Loads the state; with a live lock (another process, or this one running a
+/// phase in a worker thread) the state is returned as is. Without one, phases
+/// left `running`/`verifying` become `failed` (`interrupted`) and the state is
+/// saved. That write happens under the lock, so it cannot overwrite the state
+/// of a process that has just taken the lock and started a phase.
 pub fn load_with_recovery(paths: &RunPaths) -> Result<RunState> {
-    let mut state = RunState::load(paths)?;
-    if lock_holder(paths).is_some() {
+    let state = RunState::load(paths)?;
+    let orphans = state
+        .phases
+        .iter()
+        .any(|p| matches!(p.status, PhaseStatus::Running | PhaseStatus::Verifying));
+    if !orphans || lock_holder(paths).is_some() {
         return Ok(state);
     }
+    match LockGuard::acquire(paths) {
+        Ok(lock) => load_locked(paths, &lock),
+        // Another process took the lock meanwhile: its phase may really be running.
+        Err(_) => Ok(state),
+    }
+}
+
+/// Like `load_with_recovery` for a caller that holds the run lock: any phase
+/// left `running`/`verifying` is orphaned, even though the lock is live.
+pub fn load_locked(paths: &RunPaths, _lock: &LockGuard) -> Result<RunState> {
+    let mut state = RunState::load(paths)?;
+    recover_orphans(&mut state, paths)?;
+    Ok(state)
+}
+
+fn recover_orphans(state: &mut RunState, paths: &RunPaths) -> Result<()> {
     let now = Timestamp::now();
     let mut changed = false;
     for phase in &mut state.phases {
@@ -356,7 +427,7 @@ pub fn load_with_recovery(paths: &RunPaths) -> Result<RunState> {
     if changed {
         state.save(paths)?;
     }
-    Ok(state)
+    Ok(())
 }
 
 /// UTC `YYYYMMDD-HHMMSS-xxxx` with four random lowercase hex characters.
@@ -496,5 +567,62 @@ mod tests {
             paths.verify_log(12),
             Path::new("/r/.phasewise/runs/id/phase-12.verify.log")
         );
+    }
+
+    fn temp_paths() -> (tempfile::TempDir, RunPaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RunPaths::new(dir.path(), "r1");
+        (dir, paths)
+    }
+
+    #[test]
+    fn second_acquire_fails_and_names_the_lock_file() {
+        let (_dir, paths) = temp_paths();
+        let guard = LockGuard::acquire(&paths).unwrap();
+        let err = LockGuard::acquire(&paths).unwrap_err().to_string();
+        assert!(
+            err.contains(&paths.lock_file().display().to_string()),
+            "{err}"
+        );
+        assert!(err.contains(&std::process::id().to_string()), "{err}");
+        drop(guard);
+        assert!(!paths.lock_file().exists());
+    }
+
+    #[test]
+    fn garbage_lock_is_stale() {
+        let (_dir, paths) = temp_paths();
+        fs::create_dir_all(paths.dir()).unwrap();
+        fs::write(paths.lock_file(), "garbage").unwrap();
+        let _guard = LockGuard::acquire(&paths).unwrap();
+        assert_eq!(lock_holder(&paths), Some(std::process::id()));
+    }
+
+    #[test]
+    fn empty_lock_is_refused() {
+        let (_dir, paths) = temp_paths();
+        fs::create_dir_all(paths.dir()).unwrap();
+        fs::write(paths.lock_file(), "").unwrap();
+        let err = LockGuard::acquire(&paths).unwrap_err().to_string();
+        assert!(err.contains("in use"), "{err}");
+        assert!(paths.lock_file().exists());
+    }
+
+    #[test]
+    fn load_locked_recovers_despite_own_live_lock() {
+        let (_dir, paths) = temp_paths();
+        let mut state = sample();
+        state.phases[0].status = PhaseStatus::Running;
+        state.save(&paths).unwrap();
+        let guard = LockGuard::acquire(&paths).unwrap();
+        let unrecovered = load_with_recovery(&paths).unwrap();
+        assert_eq!(unrecovered.phases[0].status, PhaseStatus::Running);
+        let loaded = load_locked(&paths, &guard).unwrap();
+        assert_eq!(loaded.phases[0].status, PhaseStatus::Failed);
+        assert_eq!(
+            loaded.phases[0].failure.as_ref().unwrap().kind,
+            FailureKind::Interrupted
+        );
+        assert_eq!(RunState::load(&paths).unwrap(), loaded);
     }
 }

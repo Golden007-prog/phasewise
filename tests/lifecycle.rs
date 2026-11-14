@@ -4,7 +4,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::TestRepo;
+use common::{TestRepo, isolated_git_env};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -224,6 +224,28 @@ fn rollback_returns_to_a_checkpoint_and_next_reruns_the_phase() {
     assert!(env.exists("phase-2.txt"));
     assert_eq!(env.state()["phases"][1]["attempts"], 2);
     env.check_invariants();
+}
+
+#[test]
+fn rollback_refuses_a_target_that_changed_after_confirmation() {
+    let env = Env::new();
+    env.ok(&["run", "--auto"], &[]);
+    let head = env.repo.git_trim(&["rev-parse", "HEAD"]);
+    let mut run = phasewise::ops::load_current(env.repo.path())
+        .expect("load run")
+        .expect("a run exists");
+    run.git = run.git.with_env(isolated_git_env());
+    // As if the checkpoint the user confirmed had been replaced meanwhile.
+    let err = phasewise::ops::rollback(&mut run, 1, Some("0000000"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("changed while waiting for confirmation"),
+        "{err}"
+    );
+    assert_eq!(env.repo.git_trim(&["rev-parse", "HEAD"]), head);
+    assert_eq!(env.statuses(), ["done", "done", "awaiting_review"]);
+    assert!(env.exists("phase-3.txt"));
 }
 
 #[test]

@@ -68,6 +68,15 @@ case "$mode" in
         git switch -q -c "fake-agent-branch-$n"
         printf 'phase %s\n' "$n" > "$file"
         ;;
+    stubborn)
+        trap '' TERM
+        echo $$ > "$FAKE_LOG_DIR/agent.pid"
+        sleep 30
+        ;;
+    index_lock)
+        printf 'phase %s\n' "$n" > "$file"
+        : > "$(git rev-parse --git-dir)/index.lock"
+        ;;
     fail)
         ;;
     *)

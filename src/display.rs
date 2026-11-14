@@ -110,5 +110,6 @@ pub fn failure_kind_label(kind: FailureKind) -> &'static str {
         FailureKind::VerifyFailed => "verify_failed",
         FailureKind::Timeout => "timeout",
         FailureKind::Interrupted => "interrupted",
+        FailureKind::CheckpointFailed => "checkpoint_failed",
     }
 }
