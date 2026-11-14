@@ -160,7 +160,11 @@ ignored as designed: `rate_limit_event` and `system`/`thinking_tokens`. The raw
 captures were not committed as fixtures: they contain local paths and account
 details and need sanitizing first.
 
-**Codex: not run.** `codex login status` said `Not logged in` and there is no
-`~/.codex/auth.json`. An `OPENAI_API_KEY` for another provider exists in the
-shell and was not used on purpose (see `decisions.md`, build phase 8, for one
-accidental run that was rejected with HTTP 401). Codex stays "experimental".
+**Codex: passed on 2026-11-14** with Codex CLI 0.160.0, after the maintainer
+logged in with ChatGPT. The run used a clean environment without
+`OPENAI_API_KEY`. 8/8 checks, as for Claude Code; Codex reports no cost. The
+real stream had `thread.started`, `turn.started`, `item.started`/
+`item.completed` with `agent_message` and `command_execution`, and
+`turn.completed`, all as documented. stderr only held an error from an MCP
+server in the maintainer's Codex configuration that needed its own login; it
+did not affect the run.

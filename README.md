@@ -96,9 +96,9 @@ Review TUI keys: `j`/`k` or arrows select a phase, `Tab` switches tab, `PageUp`/
 | Agent | Status |
 |---|---|
 | Claude Code | tested — smoke test passed with Claude Code 2.1.325 (2026-11-14) |
-| Codex | experimental — not yet verified against a real run |
+| Codex | tested — smoke test passed with Codex CLI 0.160.0 (2026-11-14) |
 
-The test suite uses fake agents and synthetic output captures only. The real smoke test (`docs/dev/smoke-test.md`, two trivial phases) has passed with Claude Code; it has not been run with Codex yet, whose parser follows the documented output format, so expect rough edges there.
+The test suite uses fake agents and synthetic output captures only. The real smoke test (`docs/dev/smoke-test.md`, two trivial phases) has passed with both agents. Agent CLIs change often; if a newer version breaks a run, please open an issue with the raw output from `.phasewise/runs/<id>/`.
 
 Command lines phasewise uses (the prompt is sent on stdin; `agent_args` from the plan are appended at the end):
 

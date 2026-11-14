@@ -253,3 +253,5 @@ deviates from the original plan, with the reason.
   README. Two unknown event types (`rate_limit_event`, `system`/`thinking_tokens`)
   were ignored as designed. Codex is still not logged in and stays
   "experimental". Raw captures were not saved as fixtures (personal data).
+- **Real smoke test with Codex passed** (0.160.0, logged in with ChatGPT, run
+  without `OPENAI_API_KEY`), 8/8 checks; Codex is now "tested" in the README.
