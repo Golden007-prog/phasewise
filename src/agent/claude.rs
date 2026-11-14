@@ -8,7 +8,10 @@ use std::process::Command;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{Agent, AgentEvent, AgentParser, program_from_env, program_version, tidy_detail};
+use super::{
+    Agent, AgentEvent, AgentParser, LaunchOptions, ModelInfo, program_from_env, program_version,
+    tidy_detail,
+};
 use crate::plan::AgentKind;
 
 const TOOL_DETAIL_KEYS: [&str; 6] = [
@@ -33,7 +36,32 @@ impl ClaudeAgent {
             .args(["--disallowedTools", "Bash(git push *)"]);
         cmd
     }
+
+    /// Fixed flags, then `--model`/`--effort`, so a resume and the plan's
+    /// `agent_args` come after them.
+    fn command_with_options(&self, root: &Path, options: &LaunchOptions) -> Command {
+        let mut cmd = self.base_command(root);
+        if let Some(model) = &options.model {
+            cmd.args(["--model", model]);
+        }
+        if let Some(effort) = &options.effort {
+            cmd.args(["--effort", effort]);
+        }
+        cmd
+    }
 }
+
+/// Aliases documented for `claude --model` (Claude Code model configuration
+/// docs, checked 2026-11-14). The CLI has no non-interactive listing.
+const CLAUDE_MODELS: [(&str, &str); 7] = [
+    ("fable", "Hardest, longest tasks"),
+    ("opus", "Complex reasoning"),
+    ("sonnet", "Daily coding"),
+    ("haiku", "Fast, simple tasks"),
+    ("opus[1m]", "Opus with a 1M context window"),
+    ("sonnet[1m]", "Sonnet with a 1M context window"),
+    ("opusplan", "Opus to plan, Sonnet to execute"),
+];
 
 impl Agent for ClaudeAgent {
     fn kind(&self) -> AgentKind {
@@ -51,16 +79,39 @@ impl Agent for ClaudeAgent {
         )
     }
 
-    fn new_session_command(&self, root: &Path, extra_args: &[String]) -> Command {
-        let mut cmd = self.base_command(root);
+    fn new_session_command(
+        &self,
+        root: &Path,
+        options: &LaunchOptions,
+        extra_args: &[String],
+    ) -> Command {
+        let mut cmd = self.command_with_options(root, options);
         cmd.args(extra_args);
         cmd
     }
 
-    fn resume_command(&self, root: &Path, session_id: &str, extra_args: &[String]) -> Command {
-        let mut cmd = self.base_command(root);
+    fn resume_command(
+        &self,
+        root: &Path,
+        session_id: &str,
+        options: &LaunchOptions,
+        extra_args: &[String],
+    ) -> Command {
+        let mut cmd = self.command_with_options(root, options);
         cmd.args(["--resume", session_id]).args(extra_args);
         cmd
+    }
+
+    fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        Ok(CLAUDE_MODELS
+            .iter()
+            .map(|(id, description)| ModelInfo {
+                id: (*id).to_string(),
+                label: (*id).to_string(),
+                description: (*description).to_string(),
+                efforts: Vec::new(),
+            })
+            .collect())
     }
 
     fn parser(&self, root: &Path) -> Box<dyn AgentParser> {
@@ -361,7 +412,8 @@ mod tests {
     fn commands_match_the_notes() {
         let agent = ClaudeAgent;
         let extra = vec!["--max-budget-usd".to_string(), "5".to_string()];
-        let new = agent.new_session_command(Path::new("/work/repo"), &extra);
+        let none = LaunchOptions::default();
+        let new = agent.new_session_command(Path::new("/work/repo"), &none, &extra);
         let args: Vec<_> = new
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -386,11 +438,90 @@ mod tests {
             ]
         );
         assert_eq!(new.get_current_dir(), Some(Path::new("/work/repo")));
-        let resume = agent.resume_command(Path::new("/work/repo"), "abc", &extra);
+        let resume = agent.resume_command(Path::new("/work/repo"), "abc", &none, &extra);
         let args: Vec<_> = resume
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(args[12..], ["--resume", "abc", "--max-budget-usd", "5"]);
+    }
+
+    fn argv(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn model_and_effort_go_after_the_fixed_flags_and_before_resume_and_extras() {
+        let agent = ClaudeAgent;
+        let root = Path::new("/work/repo");
+        let extra = vec!["--max-budget-usd".to_string(), "5".to_string()];
+        let both = LaunchOptions {
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+        };
+        let new = argv(&agent.new_session_command(root, &both, &extra));
+        assert_eq!(new[11], "Bash(git push *)");
+        assert_eq!(
+            new[12..],
+            [
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--max-budget-usd",
+                "5"
+            ]
+        );
+        let resume = argv(&agent.resume_command(root, "abc", &both, &extra));
+        assert_eq!(
+            resume[12..],
+            [
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--resume",
+                "abc",
+                "--max-budget-usd",
+                "5"
+            ]
+        );
+        let only_effort = LaunchOptions {
+            model: None,
+            effort: Some("low".into()),
+        };
+        assert_eq!(
+            argv(&agent.new_session_command(root, &only_effort, &[]))[12..],
+            ["--effort", "low"]
+        );
+        let only_model = LaunchOptions {
+            model: Some("sonnet[1m]".into()),
+            effort: None,
+        };
+        assert_eq!(
+            argv(&agent.resume_command(root, "s", &only_model, &[]))[12..],
+            ["--model", "sonnet[1m]", "--resume", "s"]
+        );
+    }
+
+    #[test]
+    fn lists_the_documented_aliases() {
+        let models = ClaudeAgent.list_models().expect("static list");
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "fable",
+                "opus",
+                "sonnet",
+                "haiku",
+                "opus[1m]",
+                "sonnet[1m]",
+                "opusplan"
+            ]
+        );
+        assert!(models.iter().all(|m| !m.description.is_empty()));
     }
 }

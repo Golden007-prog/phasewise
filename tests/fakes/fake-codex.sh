@@ -2,9 +2,27 @@
 # Fake Codex for tests. Reads the prompt from stdin and emits `--json` events.
 # FAKE_MODE (or FAKE_MODE_<N> per phase): success, fail, fix_on_resume,
 # never_fixes, commit, slow, branch. FAKE_LOG_DIR: append calls to calls.log.
+# FAKE_MODELS_MODE: behaviour of `debug models` (see below).
 
 if [ "$1" = "--version" ]; then
     echo "codex-cli 0.0.0-fake"
+    exit 0
+fi
+
+# `codex debug models`: prints the synthetic catalog. FAKE_MODELS_MODE: ok (default),
+# fail (exit 1 with a message on stderr), invalid (prints text that is not JSON).
+if [ "$1" = "debug" ] && [ "$2" = "models" ]; then
+    case "${FAKE_MODELS_MODE:-ok}" in
+        fail)
+            echo "fake codex: cannot load the catalog" >&2
+            exit 1
+            ;;
+        invalid)
+            echo "this is not json"
+            exit 0
+            ;;
+    esac
+    cat "$(dirname "$0")/../fixtures/codex-models.synthetic.json"
     exit 0
 fi
 

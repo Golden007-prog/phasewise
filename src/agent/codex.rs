@@ -8,7 +8,10 @@ use std::process::Command;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{Agent, AgentEvent, AgentParser, program_from_env, program_version, tidy_detail};
+use super::{
+    Agent, AgentEvent, AgentParser, LaunchOptions, ModelInfo, program_from_env, program_version,
+    run_listing, tidy_detail,
+};
 use crate::plan::AgentKind;
 
 pub struct CodexAgent;
@@ -20,6 +23,73 @@ impl CodexAgent {
             .args(["exec", "--json", "--sandbox", "workspace-write"]);
         cmd
     }
+
+    /// Fixed flags, then `-m`/`-c model_reasoning_effort`; both must come
+    /// before the `resume` subcommand.
+    fn command_with_options(&self, root: &Path, options: &LaunchOptions) -> Command {
+        let mut cmd = self.base_command(root);
+        if let Some(model) = &options.model {
+            cmd.args(["-m", model]);
+        }
+        if let Some(effort) = &options.effort {
+            cmd.arg("-c")
+                .arg(format!("model_reasoning_effort=\"{effort}\""));
+        }
+        cmd
+    }
+}
+
+/// Models with `"visibility": "list"` from the output of `codex debug models`,
+/// in catalog order. Unknown fields are ignored; entries without a `slug` are
+/// skipped.
+pub fn parse_models(json: &str) -> Result<Vec<ModelInfo>> {
+    let value: Value = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("the output is not valid JSON ({e})"))?;
+    let entries = value
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("the output has no `models` list"))?;
+    let text = |entry: &Value, key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    Ok(entries
+        .iter()
+        .filter(|e| e.get("visibility").and_then(Value::as_str) == Some("list"))
+        .filter_map(|e| {
+            let id = text(e, "slug");
+            if id.is_empty() {
+                return None;
+            }
+            let label = match text(e, "display_name") {
+                l if l.is_empty() => id.clone(),
+                l => l,
+            };
+            let efforts = e
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(|l| {
+                            l.as_str()
+                                .or_else(|| l.get("effort").and_then(Value::as_str))
+                        })
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ModelInfo {
+                id,
+                label,
+                description: text(e, "description"),
+                efforts,
+            })
+        })
+        .collect())
 }
 
 impl Agent for CodexAgent {
@@ -38,16 +108,36 @@ impl Agent for CodexAgent {
         )
     }
 
-    fn new_session_command(&self, root: &Path, extra_args: &[String]) -> Command {
-        let mut cmd = self.base_command(root);
+    fn new_session_command(
+        &self,
+        root: &Path,
+        options: &LaunchOptions,
+        extra_args: &[String],
+    ) -> Command {
+        let mut cmd = self.command_with_options(root, options);
         cmd.arg("-").args(extra_args);
         cmd
     }
 
-    fn resume_command(&self, root: &Path, session_id: &str, extra_args: &[String]) -> Command {
-        let mut cmd = self.base_command(root);
+    fn resume_command(
+        &self,
+        root: &Path,
+        session_id: &str,
+        options: &LaunchOptions,
+        extra_args: &[String],
+    ) -> Command {
+        let mut cmd = self.command_with_options(root, options);
         cmd.args(["resume", session_id, "-"]).args(extra_args);
         cmd
+    }
+
+    fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let output = run_listing(
+            &self.program(),
+            &["debug", "models"],
+            "`codex` was not found. Install Codex or set PHASEWISE_CODEX_BIN.",
+        )?;
+        parse_models(&output)
     }
 
     fn parser(&self, root: &Path) -> Box<dyn AgentParser> {
@@ -372,7 +462,8 @@ mod tests {
     fn commands_match_the_notes() {
         let agent = CodexAgent;
         let extra = vec!["-c".to_string(), "x=1".to_string()];
-        let new = agent.new_session_command(Path::new("/work/repo"), &extra);
+        let none = LaunchOptions::default();
+        let new = agent.new_session_command(Path::new("/work/repo"), &none, &extra);
         let args: Vec<_> = new
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -390,7 +481,7 @@ mod tests {
             ]
         );
         assert_eq!(new.get_current_dir(), Some(Path::new("/work/repo")));
-        let resume = agent.resume_command(Path::new("/work/repo"), "tid", &extra);
+        let resume = agent.resume_command(Path::new("/work/repo"), "tid", &none, &extra);
         let args: Vec<_> = resume
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -409,5 +500,76 @@ mod tests {
                 "x=1"
             ]
         );
+    }
+
+    fn argv(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn model_and_effort_go_before_the_resume_subcommand() {
+        let agent = CodexAgent;
+        let root = Path::new("/work/repo");
+        let extra = vec!["-c".to_string(), "x=1".to_string()];
+        let both = LaunchOptions {
+            model: Some("gpt-fast".into()),
+            effort: Some("high".into()),
+        };
+        let fixed = ["exec", "--json", "--sandbox", "workspace-write"];
+        let opts = ["-m", "gpt-fast", "-c", "model_reasoning_effort=\"high\""];
+        let mut expected: Vec<&str> = fixed.to_vec();
+        expected.extend(opts);
+        expected.extend(["-", "-c", "x=1"]);
+        assert_eq!(
+            argv(&agent.new_session_command(root, &both, &extra)),
+            expected
+        );
+        let mut expected: Vec<&str> = fixed.to_vec();
+        expected.extend(opts);
+        expected.extend(["resume", "tid", "-", "-c", "x=1"]);
+        assert_eq!(
+            argv(&agent.resume_command(root, "tid", &both, &extra)),
+            expected
+        );
+        let effort = LaunchOptions {
+            model: None,
+            effort: Some("low".into()),
+        };
+        assert_eq!(
+            argv(&agent.resume_command(root, "t", &effort, &[]))[4..],
+            ["-c", "model_reasoning_effort=\"low\"", "resume", "t", "-"]
+        );
+        let model = LaunchOptions {
+            model: Some("m".into()),
+            effort: None,
+        };
+        assert_eq!(
+            argv(&agent.new_session_command(root, &model, &[]))[4..],
+            ["-m", "m", "-"]
+        );
+    }
+
+    #[test]
+    fn catalog_keeps_listed_models_in_order() {
+        let json = include_str!("../../tests/fixtures/codex-models.synthetic.json");
+        let models = parse_models(json).expect("catalog");
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        // The hidden entry and the one without a slug are dropped.
+        assert_eq!(ids, ["gpt-fast", "gpt-deep"]);
+        assert_eq!(models[0].label, "GPT-Fast");
+        assert_eq!(models[0].description, "Fast model for simple tasks.");
+        assert_eq!(models[0].efforts, ["low", "medium", "high"]);
+        // Plain string efforts are accepted too.
+        assert_eq!(models[1].efforts, ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(models[1].description, "");
+    }
+
+    #[test]
+    fn bad_catalogs_are_errors() {
+        assert!(parse_models("not json").is_err());
+        assert!(parse_models("{}").is_err());
+        assert!(parse_models(r#"{"models": []}"#).expect("empty").is_empty());
     }
 }

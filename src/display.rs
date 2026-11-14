@@ -186,21 +186,16 @@ pub fn agent_event_line(event: &AgentEvent) -> Option<EventLine> {
 /// The heading of a phase block: `▶ Phase 1/2 · Title`, then the dim right
 /// part (`attempt 1 · claude`), padded so it ends at column 80.
 ///
-/// `model` and `effort` are the hook for choosing them (v0.2 part 2): they are
-/// shown after the agent when set. Callers pass `None` until then.
-pub fn phase_header(
-    event: &EngineEvent,
-    agent: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
-    styler: &Styler,
-) -> Option<String> {
+/// The model and effort of the attempt follow the agent when they are set.
+pub fn phase_header(event: &EngineEvent, agent: &str, styler: &Styler) -> Option<String> {
     let EngineEvent::PhaseStarted {
         phase,
         total,
         title,
         attempt,
         resumed,
+        model,
+        effort,
     } = event
     else {
         return None;
@@ -212,8 +207,8 @@ pub fn phase_header(
         format!("attempt {attempt}")
     }];
     parts.push(agent.to_string());
-    parts.extend(model.map(str::to_string));
-    parts.extend(effort.map(str::to_string));
+    parts.extend(model.clone());
+    parts.extend(effort.clone());
     let right = parts.join(" · ");
     let pad = HEADER_WIDTH
         .saturating_sub(left.chars().count() + right.chars().count())
@@ -464,6 +459,8 @@ mod tests {
             title: "T".into(),
             attempt: 1,
             resumed: false,
+            model: None,
+            effort: None,
         };
         let finished = EngineEvent::PhaseFinished {
             phase: 1,
@@ -501,22 +498,24 @@ mod tests {
     #[test]
     fn header_shows_attempt_agent_and_optional_settings() {
         let plain = Styler { color: false };
-        let started = |attempt, resumed| EngineEvent::PhaseStarted {
-            phase: 1,
-            total: 2,
-            title: "Create a file".into(),
-            attempt,
-            resumed,
+        let started = |attempt, resumed, model: Option<&str>, effort: Option<&str>| {
+            EngineEvent::PhaseStarted {
+                phase: 1,
+                total: 2,
+                title: "Create a file".into(),
+                attempt,
+                resumed,
+                model: model.map(str::to_string),
+                effort: effort.map(str::to_string),
+            }
         };
-        let h = phase_header(&started(1, false), "claude", None, None, &plain).expect("header");
+        let h = phase_header(&started(1, false, None, None), "claude", &plain).expect("header");
         assert!(h.starts_with("▶ Phase 1/2 · Create a file  "), "{h}");
         assert!(h.ends_with("attempt 1 · claude"), "{h}");
         assert_eq!(h.chars().count(), HEADER_WIDTH);
         let h = phase_header(
-            &started(2, true),
+            &started(2, true, Some("opus"), Some("high")),
             "codex",
-            Some("opus"),
-            Some("high"),
             &plain,
         )
         .expect("header");
@@ -531,7 +530,7 @@ mod tests {
             files: None,
             cost_usd: None,
         };
-        assert!(phase_header(&finished, "claude", None, None, &plain).is_none());
+        assert!(phase_header(&finished, "claude", &plain).is_none());
     }
 
     #[test]

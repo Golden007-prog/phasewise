@@ -44,6 +44,61 @@ impl FromStr for AgentKind {
     }
 }
 
+/// Effort levels accepted by both agents.
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+const MAX_MODEL_CHARS: usize = 100;
+
+/// Checks a model name: non-empty, at most 100 characters, no whitespace and
+/// no leading `-` (so it can never be read as a flag). `default` is not
+/// special here; callers decide what it means.
+pub fn validate_model(model: &str) -> Result<(), String> {
+    if model.is_empty() {
+        return Err("the model name is empty; remove the setting or name a model".to_string());
+    }
+    if model.chars().count() > MAX_MODEL_CHARS {
+        return Err(format!(
+            "the model name is longer than {MAX_MODEL_CHARS} characters"
+        ));
+    }
+    if model.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "the model name `{model}` must not contain whitespace"
+        ));
+    }
+    if model.starts_with('-') {
+        return Err(format!(
+            "the model name `{model}` must not start with `-`, it would be read as a flag"
+        ));
+    }
+    Ok(())
+}
+
+/// Checks an effort level (`low`, `medium`, `high`, `xhigh` or `max`).
+pub fn validate_effort(effort: &str) -> Result<(), String> {
+    if EFFORTS.contains(&effort) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown effort `{effort}`; expected one of {}",
+            EFFORTS.join(", ")
+        ))
+    }
+}
+
+/// Validation of a value written in a plan: `default` is refused there.
+fn plan_value(key: &str, value: &str) -> Result<String, String> {
+    if value == "default" {
+        return Err(format!(
+            "`{key} = \"default\"` is not allowed in a plan; remove the `{key}` key to use the agent's default"
+        ));
+    }
+    match key {
+        "model" => validate_model(value),
+        _ => validate_effort(value),
+    }
+    .map(|()| value.to_string())
+}
+
 /// Settings from the TOML front matter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanConfig {
@@ -53,6 +108,9 @@ pub struct PlanConfig {
     pub phase_timeout_minutes: u64,
     pub verify_timeout_seconds: u64,
     pub agent_args: Vec<String>,
+    /// Model for every phase (applies only when the run uses the plan's agent).
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 impl Default for PlanConfig {
@@ -64,6 +122,8 @@ impl Default for PlanConfig {
             phase_timeout_minutes: 60,
             verify_timeout_seconds: 600,
             agent_args: Vec::new(),
+            model: None,
+            effort: None,
         }
     }
 }
@@ -76,6 +136,9 @@ pub struct Phase {
     /// Instructions for the agent, without `verify` blocks.
     pub body: String,
     pub verify: Vec<String>,
+    /// From the phase's `phasewise` settings block.
+    pub model: Option<String>,
+    pub effort: Option<String>,
     /// Line of the phase heading.
     pub line: usize,
 }
@@ -113,6 +176,15 @@ struct RawConfig {
     phase_timeout_minutes: Option<u64>,
     verify_timeout_seconds: Option<u64>,
     agent_args: Option<Vec<String>>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPhaseSettings {
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 /// Reads and parses a plan file. Errors are rendered one per line as
@@ -274,6 +346,17 @@ fn parse_front_matter(
     if let Some(v) = raw.agent_args {
         config.agent_args = v;
     }
+    for (key, value, slot) in [
+        ("model", raw.model, &mut config.model),
+        ("effort", raw.effort, &mut config.effort),
+    ] {
+        if let Some(value) = value {
+            match plan_value(key, &value) {
+                Ok(v) => *slot = Some(v),
+                Err(m) => errors.push(err(key_line(text, 2, fm_lines, key), m)),
+            }
+        }
+    }
     if errors.is_empty() {
         Ok(config)
     } else {
@@ -341,7 +424,11 @@ fn parse_body(text: &str, body_start: usize) -> Result<Parsed, Vec<PlanError>> {
     // (range, commands) of every `verify` block.
     let mut verify_blocks: Vec<(Range<usize>, Vec<String>)> = Vec::new();
 
+    // (range, TOML text) of every `phasewise` settings block.
+    let mut settings_blocks: Vec<(Range<usize>, String)> = Vec::new();
+
     let mut in_verify: Option<(Range<usize>, String)> = None;
+    let mut in_settings: Option<(Range<usize>, String)> = None;
     for (event, range) in Parser::new_ext(body, Options::empty()).into_offset_iter() {
         let range = range.start + body_start..range.end + body_start;
         match event {
@@ -362,12 +449,21 @@ fn parse_body(text: &str, body_start: usize) -> Result<Parsed, Vec<PlanError>> {
             Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) if &*info == "verify" => {
                 in_verify = Some((range, String::new()));
             }
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))) if &*info == "phasewise" => {
+                in_settings = Some((range, String::new()));
+            }
             Event::Text(t) => {
                 if let Some((_, content)) = in_verify.as_mut() {
                     content.push_str(&t);
                 }
+                if let Some((_, content)) = in_settings.as_mut() {
+                    content.push_str(&t);
+                }
             }
             Event::End(TagEnd::CodeBlock) => {
+                if let Some(block) = in_settings.take() {
+                    settings_blocks.push(block);
+                }
                 if let Some((range, content)) = in_verify.take() {
                     verify_blocks.push((range, commands(&content)));
                 }
@@ -383,6 +479,15 @@ fn parse_body(text: &str, body_start: usize) -> Result<Parsed, Vec<PlanError>> {
             errors.push(err(
                 line_of(text, range.start),
                 "a `verify` block must come after a phase heading (`## ...`)",
+            ));
+        }
+    }
+
+    for (range, _) in &settings_blocks {
+        if range.start < first_phase_start {
+            errors.push(err(
+                line_of(text, range.start),
+                "a `phasewise` settings block must come after a phase heading (`## ...`)",
             ));
         }
     }
@@ -404,11 +509,49 @@ fn parse_body(text: &str, body_start: usize) -> Result<Parsed, Vec<PlanError>> {
         let mut body = String::new();
         let mut cursor = heading.range.end;
         let mut verify = Vec::new();
+        let mut model = None;
+        let mut effort = None;
+        // Blocks to cut out of the body, in file order.
+        enum Cut<'a> {
+            Verify(&'a [String]),
+            Settings(&'a str),
+        }
+        let mut cuts: Vec<(&Range<usize>, Cut)> = Vec::new();
         for (range, cmds) in &verify_blocks {
             if range.start >= heading.range.end && range.end <= end {
-                body.push_str(&text[cursor..range.start]);
-                cursor = range.end;
-                verify.extend(cmds.iter().cloned());
+                cuts.push((range, Cut::Verify(cmds)));
+            }
+        }
+        let mut first_settings: Option<usize> = None;
+        for (range, content) in &settings_blocks {
+            if range.start >= heading.range.end && range.end <= end {
+                let line = line_of(text, range.start);
+                if let Some(first) = first_settings {
+                    errors.push(err(
+                        line,
+                        format!(
+                            "a phase can have only one `phasewise` settings block (the first is at line {first})"
+                        ),
+                    ));
+                } else {
+                    first_settings = Some(line);
+                    cuts.push((range, Cut::Settings(content)));
+                }
+            }
+        }
+        cuts.sort_by_key(|(range, _)| range.start);
+        for (range, cut) in cuts {
+            body.push_str(&text[cursor..range.start]);
+            cursor = range.end;
+            match cut {
+                Cut::Verify(cmds) => verify.extend(cmds.iter().cloned()),
+                Cut::Settings(content) => {
+                    let line = line_of(text, range.start);
+                    match parse_phase_settings(content, line) {
+                        Ok((m, e)) => (model, effort) = (m, e),
+                        Err(mut es) => errors.append(&mut es),
+                    }
+                }
             }
         }
         body.push_str(&text[cursor..end]);
@@ -417,6 +560,8 @@ fn parse_body(text: &str, body_start: usize) -> Result<Parsed, Vec<PlanError>> {
             title: heading.title.clone(),
             body: body.trim().to_string(),
             verify,
+            model,
+            effort,
             line: line_of(text, heading.range.start),
         });
     }
@@ -455,6 +600,49 @@ fn parse_body(text: &str, body_start: usize) -> Result<Parsed, Vec<PlanError>> {
 
     if errors.is_empty() {
         Ok((h1_title, context, phases))
+    } else {
+        Err(errors)
+    }
+}
+
+/// Parses the TOML of a `phasewise` block whose fence is at `fence_line`.
+fn parse_phase_settings(
+    content: &str,
+    fence_line: usize,
+) -> Result<(Option<String>, Option<String>), Vec<PlanError>> {
+    let raw: RawPhaseSettings = match toml::from_str(content) {
+        Ok(raw) => raw,
+        Err(e) => {
+            let offset = e.span().map_or(0, |span| span.start).min(content.len());
+            let in_block = content.as_bytes()[..offset]
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count();
+            return Err(vec![err(
+                fence_line + 1 + in_block,
+                format!("in the `phasewise` block: {}", e.message()),
+            )]);
+        }
+    };
+    let mut errors = Vec::new();
+    let mut out = [None, None];
+    for (i, (key, value)) in [("model", raw.model), ("effort", raw.effort)]
+        .into_iter()
+        .enumerate()
+    {
+        if let Some(value) = value {
+            match plan_value(key, &value) {
+                Ok(v) => out[i] = Some(v),
+                Err(m) => {
+                    let line = key_line(content, 1, content.lines().count(), key);
+                    errors.push(err(fence_line + line, m));
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        let [model, effort] = out;
+        Ok((model, effort))
     } else {
         Err(errors)
     }
@@ -737,5 +925,111 @@ mod tests {
         std::fs::write(&path, "## A\n\n## B\n\nx\n").unwrap();
         let msg = load(&path).unwrap_err().to_string();
         assert!(msg.starts_with(&format!("{}:1: ", path.display())), "{msg}");
+    }
+
+    #[test]
+    fn model_and_effort_validation() {
+        assert!(validate_model("opus[1m]").is_ok());
+        assert!(validate_model("gpt-5.1-codex").is_ok());
+        assert!(validate_model(&"a".repeat(100)).is_ok());
+        assert!(validate_model("").is_err());
+        assert!(validate_model(&"a".repeat(101)).is_err());
+        assert!(validate_model("two words").is_err());
+        assert!(validate_model("tab\tname").is_err());
+        assert!(validate_model("-flag").unwrap_err().contains("flag"));
+        for e in EFFORTS {
+            assert!(validate_effort(e).is_ok());
+        }
+        assert!(
+            validate_effort("extreme")
+                .unwrap_err()
+                .contains("low, medium")
+        );
+        assert!(validate_effort("").is_err());
+        assert!(validate_effort("default").is_err());
+    }
+
+    #[test]
+    fn front_matter_model_and_effort() {
+        let plan = ok("+++\nmodel = \"opus\"\neffort = \"xhigh\"\n+++\n## A\n\nbody\n");
+        assert_eq!(plan.config.model.as_deref(), Some("opus"));
+        assert_eq!(plan.config.effort.as_deref(), Some("xhigh"));
+        assert_eq!(plan.phases[0].model, None);
+        let es =
+            errs("+++\nagent = \"claude\"\nmodel = \"-x\"\neffort = \"huge\"\n+++\n## A\n\nbody\n");
+        assert_eq!(es.len(), 2, "{es:?}");
+        assert_eq!(es[0].0, 3);
+        assert!(es[0].1.contains("must not start with"), "{es:?}");
+        assert_eq!(es[1].0, 4);
+        assert!(es[1].1.contains("unknown effort"), "{es:?}");
+    }
+
+    #[test]
+    fn default_is_an_error_in_a_plan() {
+        let es = errs("+++\nmodel = \"default\"\n+++\n## A\n\nbody\n");
+        assert_eq!(es[0].0, 2);
+        assert!(es[0].1.contains("remove the `model` key"), "{es:?}");
+        let es = errs("## A\n\nbody\n\n```phasewise\neffort = \"default\"\n```\n");
+        assert_eq!(es[0].0, 6);
+        assert!(es[0].1.contains("remove the `effort` key"), "{es:?}");
+    }
+
+    #[test]
+    fn phase_settings_block_is_parsed_and_removed_from_the_body() {
+        let plan = ok(
+            "## A\n\nBefore.\n\n```phasewise\nmodel = \"sonnet\"\neffort = \"low\"\n```\n\nAfter.\n\n```verify\ntrue\n```\n\n## B\n\nplain\n",
+        );
+        assert_eq!(plan.phases[0].model.as_deref(), Some("sonnet"));
+        assert_eq!(plan.phases[0].effort.as_deref(), Some("low"));
+        assert_eq!(plan.phases[0].verify, vec!["true"]);
+        let body = &plan.phases[0].body;
+        assert!(
+            body.contains("Before.") && body.contains("After."),
+            "{body}"
+        );
+        assert!(
+            !body.contains("phasewise") && !body.contains("sonnet"),
+            "{body}"
+        );
+        assert_eq!(plan.phases[1].model, None);
+        // A block with only one key is fine.
+        let plan = ok("## A\n\nx\n\n```phasewise\neffort = \"max\"\n```\n");
+        assert_eq!(plan.phases[0].model, None);
+        assert_eq!(plan.phases[0].effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn phase_settings_block_errors_have_line_numbers() {
+        // Unknown key, named; line of the key.
+        let es = errs("## A\n\nx\n\n```phasewise\nmodel = \"m\"\ntemperature = 1\n```\n");
+        assert_eq!(es.len(), 1, "{es:?}");
+        assert_eq!(es[0].0, 7);
+        assert!(es[0].1.contains("temperature"), "{es:?}");
+        // Invalid value; line of the key.
+        let es = errs("## A\n\nx\n\n```phasewise\nmodel = \"m\"\neffort = \"huge\"\n```\n");
+        assert_eq!(es[0].0, 7);
+        assert!(es[0].1.contains("unknown effort"), "{es:?}");
+        // Block before the first phase.
+        let es = errs("```phasewise\nmodel = \"m\"\n```\n\n## A\n\nx\n");
+        assert_eq!(es[0].0, 1);
+        assert!(es[0].1.contains("after a phase heading"), "{es:?}");
+        // Second block in one phase; the first one is at line 5.
+        let es = errs(
+            "## A\n\nx\n\n```phasewise\nmodel = \"a\"\n```\n\n```phasewise\nmodel = \"b\"\n```\n",
+        );
+        assert_eq!(es.len(), 1, "{es:?}");
+        assert_eq!(es[0].0, 9);
+        assert!(
+            es[0].1.contains("only one") && es[0].1.contains("line 5"),
+            "{es:?}"
+        );
+        // Blocks in different phases are fine.
+        ok(
+            "## A\n\nx\n\n```phasewise\nmodel = \"a\"\n```\n\n## B\n\ny\n\n```phasewise\nmodel = \"b\"\n```\n",
+        );
+        // Invalid TOML.
+        let es = errs("## A\n\nx\n\n```phasewise\nmodel = \n```\n");
+        assert_eq!(es[0].0, 6);
+        assert!(es[0].1.starts_with("in the `phasewise` block"), "{es:?}");
     }
 }

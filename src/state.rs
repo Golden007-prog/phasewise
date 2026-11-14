@@ -66,6 +66,11 @@ pub struct PhaseState {
     pub started_at: Option<Timestamp>,
     pub finished_at: Option<Timestamp>,
     pub failure: Option<Failure>,
+    /// Effective model and effort of the last attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -82,6 +87,11 @@ pub struct RunState {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub phases: Vec<PhaseState>,
+    /// Overrides given with `--model` / `--effort`; they beat the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_override: Option<String>,
 }
 
 /// The `<repo>/.phasewise` directory.
@@ -252,8 +262,12 @@ impl RunState {
                     started_at: None,
                     finished_at: None,
                     failure: None,
+                    model: None,
+                    effort: None,
                 })
                 .collect(),
+            model_override: None,
+            effort_override: None,
         }
     }
 
@@ -458,6 +472,37 @@ mod tests {
             "deadbeef",
             &[(1, "One".to_string()), (2, "Two".to_string())],
         )
+    }
+
+    #[test]
+    fn v01_state_without_model_fields_still_loads() {
+        let mut v: serde_json::Value = serde_json::to_value(sample()).unwrap();
+        // A v0.1 file has none of the model fields.
+        assert!(v.get("model_override").is_none());
+        assert!(v["phases"][0].get("model").is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RunPaths::new(dir.path(), "r1");
+        std::fs::create_dir_all(paths.dir()).unwrap();
+        std::fs::write(paths.state_file(), serde_json::to_vec(&v).unwrap()).unwrap();
+        let loaded = RunState::load(&paths).unwrap();
+        assert_eq!(loaded, sample_with_times(&loaded));
+        assert_eq!(loaded.model_override, None);
+        assert_eq!(loaded.phases[1].effort, None);
+        // And the new fields round-trip when set.
+        v["model_override"] = "opus".into();
+        v["phases"][0]["effort"] = "high".into();
+        std::fs::write(paths.state_file(), serde_json::to_vec(&v).unwrap()).unwrap();
+        let loaded = RunState::load(&paths).unwrap();
+        assert_eq!(loaded.model_override.as_deref(), Some("opus"));
+        assert_eq!(loaded.phases[0].effort.as_deref(), Some("high"));
+    }
+
+    /// `sample()` with the timestamps of `like` (they differ between calls).
+    fn sample_with_times(like: &RunState) -> RunState {
+        let mut s = sample();
+        s.created_at = like.created_at;
+        s.updated_at = like.updated_at;
+        s
     }
 
     #[test]

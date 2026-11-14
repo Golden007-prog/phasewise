@@ -2,18 +2,38 @@
 //! normalized events.
 
 use std::ffi::OsString;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 
 use crate::plan::AgentKind;
+use crate::process::spawn_in_group;
 
 pub mod claude;
 pub mod codex;
 
 const MAX_DETAIL_CHARS: usize = 200;
+const LISTING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per-launch settings that become command-line options. `None` passes no flag.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchOptions {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// A model an agent can use, as listed by `phasewise models`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub efforts: Vec<String>,
+}
 
 /// What the agent reported, independent of the agent.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,8 +82,22 @@ pub trait Agent: Send + Sync {
     /// First non-empty line of `<program> --version`.
     fn version(&self) -> Result<String>;
     /// The prompt goes to stdin; stdio is configured by the caller.
-    fn new_session_command(&self, root: &Path, extra_args: &[String]) -> Command;
-    fn resume_command(&self, root: &Path, session_id: &str, extra_args: &[String]) -> Command;
+    fn new_session_command(
+        &self,
+        root: &Path,
+        options: &LaunchOptions,
+        extra_args: &[String],
+    ) -> Command;
+    fn resume_command(
+        &self,
+        root: &Path,
+        session_id: &str,
+        options: &LaunchOptions,
+        extra_args: &[String],
+    ) -> Command;
+    /// Models the agent offers. Claude: a documented static list. Codex: asks
+    /// `codex debug models`.
+    fn list_models(&self) -> Result<Vec<ModelInfo>>;
     /// `root` is used to shorten absolute paths in tool details.
     fn parser(&self, root: &Path) -> Box<dyn AgentParser>;
 }
@@ -109,6 +143,60 @@ fn program_version(program: &OsString, not_found: &str) -> Result<String> {
                 output.status
             )
         })
+}
+
+/// Runs `program args` (stdin null, no terminal) in its own process group and
+/// returns its stdout; fails on a non-zero exit, on a timeout of 10 s or when
+/// the program cannot be started.
+fn run_listing(program: &OsString, args: &[&str], not_found: &str) -> Result<String> {
+    let name = program.to_string_lossy().into_owned();
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = match spawn_in_group(&mut cmd) {
+        Ok(child) => child,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Err(anyhow!("{not_found}")),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Cannot run `{name} {}`", args.join(" ")));
+        }
+    };
+    let Some(mut stdout) = child.take_stdout() else {
+        return Err(anyhow!("Cannot read the output of `{name}`"));
+    };
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + LISTING_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                child.finish_leftovers(Duration::from_millis(200));
+                break status;
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.terminate(Duration::from_millis(500));
+                return Err(anyhow!(
+                    "`{name} {}` did not answer within {} s",
+                    args.join(" "),
+                    LISTING_TIMEOUT.as_secs()
+                ));
+            }
+            Err(e) => {
+                let _ = child.terminate(Duration::from_millis(500));
+                return Err(e).with_context(|| format!("Cannot wait for `{name}`"));
+            }
+        }
+    };
+    let bytes = reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(anyhow!("`{name} {}` failed ({status})", args.join(" ")));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Shortens a tool detail for display: absolute paths under `root` become

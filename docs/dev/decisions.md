@@ -290,3 +290,31 @@ deviates from the original plan, with the reason.
 - **Help popup.** `?` opens it and any key closes it.
 - **Header bar.** Reads `phasewise  run <id>  plan <title>  agent <a>  branch <b>`
   with dim labels. At the minimum width (80) a long branch name is cut off.
+
+## v0.2 — models and effort
+
+- **Validation lives in `plan.rs`** (`validate_model`, `validate_effort`), used by
+  the parser and by `ops::Overrides::parse` for the CLI flags. `default` is
+  handled by the callers: a clear request in the flags, an error in a plan.
+- **Flags that look like options.** clap itself refuses `--model -x`; the
+  validation message ("must not start with `-`") shows with `--model=-x`.
+- **Overrides are applied under the run lock.** `ops::start` stores them when
+  it creates the run; `next` applies them after its checks and `retry` after the
+  reset, so a refused command changes nothing. The TUI passes none.
+- **Resolution** is `engine::resolve_options`, called once per phase run; the
+  effective values are saved in `PhaseState` at every attempt and carried by the
+  `PhaseStarted` event, so `status` shows the model of the last attempt.
+  `rollback` and `retry` clear them with the rest of the phase.
+- **`phase_header` reads model and effort from the event.** The part 1 hook
+  (extra parameters) became unnecessary, so the parameters were removed.
+- **TUI.** The header bar shows `model` and `effort` of the selected phase when
+  known. The attempt heading in the Log tab does not show the model: only the
+  last attempt's values are stored, so earlier attempts would be wrong.
+- **`phasewise models`.** One heading per agent, then `id  label  efforts
+  description` per model (`-` when the efforts are unknown, as for Claude) and a
+  dim note. A listing error goes to stderr and names the CLI's model flag; the
+  exit code is 1 only when no requested agent listed. The `debug models` call
+  uses a 10 s timeout and its own process group; its stderr is discarded.
+- **Fakes.** `fake-codex.sh` answers `debug models` with the synthetic catalog;
+  `FAKE_MODELS_MODE=fail|invalid` makes it fail. The catalog fixture is
+  unchanged. Both fakes already logged their full argv.

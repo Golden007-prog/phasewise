@@ -29,6 +29,8 @@ Every key is optional.
 | `phase_timeout_minutes` | integer >= 1 | `60` | Time limit for the agent in one phase. |
 | `verify_timeout_seconds` | integer >= 1 | `600` | Time limit for each verification command. |
 | `agent_args` | array of strings | `[]` | Extra arguments for the agent command line. |
+| `model` | string | unset | Model for every phase; see [Model and effort](#model-and-effort). |
+| `effort` | string | unset | Effort for every phase: `low`, `medium`, `high`, `xhigh` or `max`. |
 
 ## Phases and titles
 
@@ -60,6 +62,37 @@ receives. A `verify` block before the first phase is an error.
 The commands of a phase run after the global `verify` commands from the front
 matter.
 
+## Model and effort
+
+`model` and `effort` can be set for the whole plan (front matter) and for one
+phase, with a fenced block whose info string is exactly `phasewise`:
+
+````markdown
+## Phase 3: Hard refactor
+
+```phasewise
+model = "opus"
+effort = "high"
+```
+
+Refactor the parser.
+````
+
+The block is TOML with only the keys `model` and `effort`, both optional. It is
+removed from the text the agent receives, like `verify` blocks. A phase can have
+one block, and it must come after a phase heading.
+
+- A model is a non-empty name of at most 100 characters, without whitespace and
+  not starting with `-`. List the names with `phasewise models`.
+- `default` is not a value in a plan: remove the key to use the agent's own
+  default.
+- Precedence, highest first: `--model` / `--effort` of `run`, `next` or `retry`
+  (stored in the run), the phase block, the front matter, nothing (no flag is
+  passed).
+- The plan's values (block and front matter) apply only when the run uses the
+  plan's `agent`. With `run --agent codex` on a Claude plan they are ignored,
+  because a model name belongs to one agent.
+
 ## What the agent receives
 
 For each phase the agent gets the shared context (title excluded), a summary of
@@ -80,7 +113,10 @@ line, and exits with code 1:
 - a plan with no phases;
 - a phase with an empty body;
 - duplicate phase titles (reported at the second one, with the first one's line);
-- a `verify` block before the first phase.
+- a `verify` block before the first phase;
+- an invalid `model` or `effort`, or the value `default`;
+- a `phasewise` block before the first phase, a second one in the same phase,
+  an unknown key in it (named in the message) or an invalid value.
 
 ## Full example
 

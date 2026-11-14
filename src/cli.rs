@@ -12,10 +12,11 @@ use anyhow::{Context, Result, anyhow};
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
+use crate::agent::{ModelInfo, agent_for};
 use crate::display::{event_line, failure_kind_label, phase_header, phase_summary, status_label};
 use crate::engine::EngineEvent;
 use crate::git::Git;
-use crate::ops::{self, NextOutcome, Run};
+use crate::ops::{self, NextOutcome, Overrides, Run};
 use crate::plan::{self, AgentKind};
 use crate::process;
 use crate::state::{PhaseStatus, RunStatus};
@@ -56,6 +57,23 @@ impl From<AgentArg> for AgentKind {
             AgentArg::Claude => AgentKind::Claude,
             AgentArg::Codex => AgentKind::Codex,
         }
+    }
+}
+
+/// `--model` and `--effort` of `run`, `next` and `retry`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct SettingsArgs {
+    /// Model for this run from now on (`default` removes the override)
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+    /// Effort for this run from now on: low, medium, high, xhigh or max (`default` removes the override)
+    #[arg(long, value_name = "EFFORT")]
+    effort: Option<String>,
+}
+
+impl SettingsArgs {
+    fn overrides(&self) -> Result<Overrides> {
+        Overrides::parse(self.model.as_deref(), self.effort.as_deref())
     }
 }
 
@@ -100,6 +118,8 @@ pub enum Command {
         /// Chain phases until the plan ends or the first failure
         #[arg(long)]
         auto: bool,
+        #[command(flatten)]
+        settings: SettingsArgs,
     },
 
     /// Approve the phase awaiting review and launch the next one
@@ -108,6 +128,8 @@ pub enum Command {
         /// Chain phases until the plan ends or the first failure
         #[arg(long)]
         auto: bool,
+        #[command(flatten)]
+        settings: SettingsArgs,
     },
 
     /// Go back to the checkpoint before the current phase and rerun it in a new session
@@ -116,6 +138,8 @@ pub enum Command {
         /// Note appended to the phase prompt
         #[arg(long, value_name = "TEXT")]
         note: Option<String>,
+        #[command(flatten)]
+        settings: SettingsArgs,
     },
 
     /// Go back to the checkpoint of phase N (0 = initial state)
@@ -142,6 +166,14 @@ pub enum Command {
     /// Open the review TUI
     #[command(after_help = "Examples:\n  phasewise review")]
     Review,
+
+    /// List the models an agent offers (for `--model` and the plan's `model` setting)
+    #[command(after_help = "Examples:\n  phasewise models\n  phasewise models --agent codex")]
+    Models {
+        /// Only this agent (default: both)
+        #[arg(long, value_enum)]
+        agent: Option<AgentArg>,
+    },
 
     /// Mark the run as abandoned and return to the original branch (the run branch is kept)
     #[command(after_help = "Examples:\n  phasewise abort")]
@@ -196,9 +228,15 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Some(Command::Init) => init(),
         Some(Command::Check { plan }) => check(plan),
         Some(Command::Doctor) => doctor(),
-        Some(Command::Run { plan, agent, auto }) => run_command(plan, agent, auto),
-        Some(Command::Next { auto }) => next_command(auto),
-        Some(Command::Retry { note }) => retry_command(note),
+        Some(Command::Run {
+            plan,
+            agent,
+            auto,
+            settings,
+        }) => run_command(plan, agent, auto, &settings),
+        Some(Command::Next { auto, settings }) => next_command(auto, &settings),
+        Some(Command::Retry { note, settings }) => retry_command(note, &settings),
+        Some(Command::Models { agent }) => models_command(agent),
         Some(Command::Rollback { n, yes }) => rollback_command(n as usize, yes),
         Some(Command::Status) => status(),
         Some(Command::Diff { n }) => diff(n),
@@ -252,6 +290,12 @@ fn print_plan(plan: &plan::Plan, path: &Path) {
         ))
     );
     outln!("Agent: {}", config.agent);
+    if let Some(model) = &config.model {
+        outln!("Model: {model}");
+    }
+    if let Some(effort) = &config.effort {
+        outln!("Effort: {effort}");
+    }
     if config.verify.is_empty() {
         outln!("Checks after every phase: (none)");
     } else {
@@ -269,7 +313,13 @@ fn print_plan(plan: &plan::Plan, path: &Path) {
             "  {}",
             st.heading(&format!("{}. {}", phase.number, phase.title))
         );
-        // v0.2 part 2 adds the phase's model settings here.
+        let settings: Vec<String> = [("model", &phase.model), ("effort", &phase.effort)]
+            .into_iter()
+            .filter_map(|(key, value)| value.as_ref().map(|v| format!("{key}: {v}")))
+            .collect();
+        if !settings.is_empty() {
+            outln!("     {}", st.dim(&settings.join(" · ")));
+        }
         if phase.verify.is_empty() {
             outln!("     {}", st.dim("(no phase-specific checks)"));
         } else {
@@ -283,6 +333,95 @@ fn print_plan(plan: &plan::Plan, path: &Path) {
         "{}",
         st.ok(&format!("{} phases. The plan is valid.", plan.phases.len()))
     );
+}
+
+/// What `phasewise models` prints for one agent, or why it could not.
+fn models_command(agent: Option<AgentArg>) -> Result<ExitCode> {
+    let kinds = match agent {
+        Some(a) => vec![AgentKind::from(a)],
+        None => vec![AgentKind::Claude, AgentKind::Codex],
+    };
+    let st = Styler::for_stdout();
+    let mut listed = 0;
+    let mut first = true;
+    for kind in &kinds {
+        let a = agent_for(*kind);
+        let result = a.list_models();
+        let program = a.program().to_string_lossy().into_owned();
+        let flag = match kind {
+            AgentKind::Claude => "--model",
+            AgentKind::Codex => "-m",
+        };
+        match result {
+            Ok(models) => {
+                listed += 1;
+                if !first {
+                    outln!();
+                }
+                first = false;
+                print_models(*kind, &models, &st);
+            }
+            Err(err) => eprintln!(
+                "Could not list the {kind} models: {err:#}. \
+Any model name accepted by `{program} {flag}` still works."
+            ),
+        }
+    }
+    Ok(if listed == 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn print_models(kind: AgentKind, models: &[ModelInfo], st: &Styler) {
+    outln!("{}", st.heading(&format!("{kind} models")));
+    let id_width = models
+        .iter()
+        .map(|m| m.id.chars().count())
+        .max()
+        .unwrap_or(0);
+    // The label column is only shown when it adds something (Claude's aliases
+    // have no separate display name).
+    let show_labels = models.iter().any(|m| m.label != m.id);
+    let label_width = if show_labels {
+        models
+            .iter()
+            .map(|m| m.label.chars().count())
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    for m in models {
+        let mut line = format!("  {:<id_width$}", m.id);
+        if show_labels {
+            line.push_str(&format!("  {:<label_width$}", m.label));
+        }
+        if !m.description.is_empty() {
+            line.push_str(&format!("  {}", m.description));
+        }
+        let line = line.trim_end().to_string();
+        if m.efforts.is_empty() {
+            outln!("{line}");
+        } else {
+            outln!(
+                "{line}{}",
+                st.dim(&format!(" · effort: {}", m.efforts.join(", ")))
+            );
+        }
+    }
+    if models.is_empty() {
+        outln!("  (no models listed)");
+    }
+    let note = match kind {
+        AgentKind::Claude => {
+            "Effort levels: low, medium, high, xhigh, max. Any full model name accepted by \
+`claude --model` also works; your account may restrict which models are available."
+        }
+        AgentKind::Codex => "Any model name accepted by `codex -m` also works.",
+    };
+    outln!("  {}", st.dim(note));
 }
 
 fn doctor() -> Result<ExitCode> {
@@ -327,9 +466,20 @@ fn current_dir() -> Result<PathBuf> {
     std::env::current_dir().context("Cannot read the current directory")
 }
 
-fn run_command(plan: Option<PathBuf>, agent: Option<AgentArg>, auto: bool) -> Result<ExitCode> {
+fn run_command(
+    plan: Option<PathBuf>,
+    agent: Option<AgentArg>,
+    auto: bool,
+    settings: &SettingsArgs,
+) -> Result<ExitCode> {
+    let overrides = settings.overrides()?;
     let path = resolve_plan_path(plan)?;
-    let run = ops::start(&current_dir()?, &path, agent.map(AgentKind::from))?;
+    let run = ops::start(
+        &current_dir()?,
+        &path,
+        agent.map(AgentKind::from),
+        &overrides,
+    )?;
     outln!(
         "Run {} on branch {} (original branch: {}, agent: {})",
         run.state.run_id,
@@ -342,10 +492,11 @@ fn run_command(plan: Option<PathBuf>, agent: Option<AgentArg>, auto: bool) -> Re
     })
 }
 
-fn next_command(auto: bool) -> Result<ExitCode> {
+fn next_command(auto: bool, settings: &SettingsArgs) -> Result<ExitCode> {
+    let overrides = settings.overrides()?;
     let run = load_run()?;
     drive(run, move |run, events, cancel| {
-        ops::next(run, auto, events, cancel)
+        ops::next(run, auto, &overrides, events, cancel)
     })
 }
 
@@ -366,10 +517,11 @@ fn announce_recovery(run: &Run) {
     }
 }
 
-fn retry_command(note: Option<String>) -> Result<ExitCode> {
+fn retry_command(note: Option<String>, settings: &SettingsArgs) -> Result<ExitCode> {
+    let overrides = settings.overrides()?;
     let run = load_run()?;
     drive(run, move |run, events, cancel| {
-        ops::retry(run, note.as_deref(), events, cancel).map(NextOutcome::Ran)
+        ops::retry(run, note.as_deref(), &overrides, events, cancel).map(NextOutcome::Ran)
     })
 }
 
@@ -476,7 +628,7 @@ where
     for event in rx {
         // A closed stdout (for example `| head`) must not abort the run, so
         // write errors are ignored by `outln!`.
-        if let Some(header) = phase_header(&event, &agent, None, None, &st) {
+        if let Some(header) = phase_header(&event, &agent, &st) {
             outln!();
             outln!("{header}");
         } else if let Some(line) = event_line(&event, verify_secs) {
@@ -593,7 +745,7 @@ fn status() -> Result<ExitCode> {
     );
     outln!();
 
-    let rows: Vec<[String; 5]> = state
+    let rows: Vec<[String; 6]> = state
         .phases
         .iter()
         .map(|p| {
@@ -613,11 +765,11 @@ fn status() -> Result<ExitCode> {
                 p.attempts.to_string(),
                 files,
                 cost,
+                p.model.clone().unwrap_or_else(|| "-".to_string()),
             ]
         })
         .collect();
-    // v0.2 part 2 adds a MODEL column before TITLE.
-    let headers = ["#", "STATUS", "TRIES", "FILES", "COST"];
+    let headers = ["#", "STATUS", "TRIES", "FILES", "COST", "MODEL"];
     let mut widths = headers.map(str::len);
     for row in &rows {
         for (width, cell) in widths.iter_mut().zip(row) {
@@ -626,7 +778,7 @@ fn status() -> Result<ExitCode> {
     }
     let st = Styler::for_stdout();
     // Cells are padded before colouring so the ANSI codes do not affect widths.
-    let line = |cells: [&str; 5], title: &str, status_role: Option<Role>| {
+    let line = |cells: [&str; 6], title: &str, status_role: Option<Role>| {
         let mut out = String::new();
         for (i, (cell, width)) in cells.iter().zip(widths).enumerate() {
             let padded = format!("{cell:<width$}");
@@ -646,7 +798,7 @@ fn status() -> Result<ExitCode> {
     line(headers, "TITLE", None);
     for (row, phase) in rows.iter().zip(&state.phases) {
         line(
-            [&row[0], &row[1], &row[2], &row[3], &row[4]],
+            [&row[0], &row[1], &row[2], &row[3], &row[4], &row[5]],
             &phase.title,
             Some(status_role(phase.status)),
         );

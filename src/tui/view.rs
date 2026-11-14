@@ -100,13 +100,23 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let v = &app.view;
     let dim = role_style(Role::Dim);
     let mut spans = vec![Span::styled("phasewise", role_style(Role::Heading))];
-    // v0.2 part 2 adds the model after the agent.
-    for (label, value) in [
+    // The model and effort are those of the selected phase's last attempt.
+    let selected = v.phases.get(app.selected);
+    let model = selected.and_then(|p| p.model.as_deref());
+    let effort = selected.and_then(|p| p.effort.as_deref());
+    let mut fields = vec![
         ("run", v.run_id.as_str()),
         ("plan", v.plan_title.as_str()),
         ("agent", v.agent.as_str()),
-        ("branch", v.run_branch.as_str()),
-    ] {
+    ];
+    if let Some(model) = model {
+        fields.push(("model", model));
+    }
+    if let Some(effort) = effort {
+        fields.push(("effort", effort));
+    }
+    fields.push(("branch", v.run_branch.as_str()));
+    for (label, value) in fields {
         spans.push(Span::styled(format!("  {label} "), dim));
         spans.push(Span::raw(value.to_string()));
     }
@@ -442,6 +452,8 @@ mod tests {
             attempts: 1,
             failure: None,
             has_checkpoint: checkpoint,
+            model: None,
+            effort: None,
         };
         let mut app = App::new(RunView {
             run_id: "20260101-120000".into(),

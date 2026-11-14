@@ -41,6 +41,9 @@ pub struct PhaseView {
     pub attempts: u32,
     pub failure: Option<String>,
     pub has_checkpoint: bool,
+    /// Effective model and effort of the last attempt.
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// Diff of one phase. `files` holds the path and the added/removed line
@@ -82,6 +85,8 @@ pub fn load_run_view(run: &Run) -> RunView {
                 )
             }),
             has_checkpoint: p.checkpoint_sha.is_some(),
+            model: p.model.clone(),
+            effort: p.effort.clone(),
         })
         .collect();
     RunView {

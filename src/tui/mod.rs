@@ -153,9 +153,12 @@ impl Tui<'_> {
                     None => "Interrupting…".to_string(),
                 });
             }
-            Command::Next => self.spawn(|run, tx, cancel| ops::next(run, false, tx, cancel)),
+            Command::Next => self.spawn(|run, tx, cancel| {
+                ops::next(run, false, &ops::Overrides::default(), tx, cancel)
+            }),
             Command::Retry(note) => self.spawn(move |run, tx, cancel| {
-                ops::retry(run, note.as_deref(), tx, cancel).map(NextOutcome::Ran)
+                ops::retry(run, note.as_deref(), &ops::Overrides::default(), tx, cancel)
+                    .map(NextOutcome::Ran)
             }),
             Command::Rollback(k) => self.rollback(k),
         }
@@ -358,6 +361,8 @@ mod tests {
             started_at: None,
             finished_at: None,
             failure,
+            model: None,
+            effort: None,
         }
     }
 
@@ -375,6 +380,8 @@ mod tests {
             created_at: Timestamp::UNIX_EPOCH,
             updated_at: Timestamp::UNIX_EPOCH,
             phases,
+            model_override: None,
+            effort_override: None,
         }
     }
 

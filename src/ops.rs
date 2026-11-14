@@ -53,9 +53,62 @@ pub enum NextOutcome {
     Completed,
 }
 
+/// What `--model` / `--effort` ask for one setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Override {
+    Set(String),
+    /// `default`: remove the stored override.
+    Clear,
+}
+
+/// The `--model` / `--effort` flags of `run`, `next` and `retry`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Overrides {
+    pub model: Option<Override>,
+    pub effort: Option<Override>,
+}
+
+impl Overrides {
+    /// Validates the flag values; `default` means "clear the override".
+    pub fn parse(model: Option<&str>, effort: Option<&str>) -> Result<Overrides> {
+        let one = |value: Option<&str>, check: fn(&str) -> Result<(), String>, flag: &str| {
+            value
+                .map(|v| {
+                    if v == "default" {
+                        return Ok(Override::Clear);
+                    }
+                    check(v)
+                        .map(|()| Override::Set(v.to_string()))
+                        .map_err(|e| anyhow!("Invalid --{flag}: {e}."))
+                })
+                .transpose()
+        };
+        Ok(Overrides {
+            model: one(model, plan::validate_model, "model")?,
+            effort: one(effort, plan::validate_effort, "effort")?,
+        })
+    }
+
+    /// Stores the given values in the run state; the caller saves it.
+    pub fn apply(&self, state: &mut RunState) {
+        let set = |slot: &mut Option<String>, value: &Option<Override>| match value {
+            Some(Override::Set(v)) => *slot = Some(v.clone()),
+            Some(Override::Clear) => *slot = None,
+            None => {}
+        };
+        set(&mut state.model_override, &self.model);
+        set(&mut state.effort_override, &self.effort);
+    }
+}
+
 /// Starts a run: validates the plan and the repository, creates the run
 /// branch and writes the run files. Nothing is written if a check fails.
-pub fn start(cwd: &Path, plan_path: &Path, agent_override: Option<AgentKind>) -> Result<Run> {
+pub fn start(
+    cwd: &Path,
+    plan_path: &Path,
+    agent_override: Option<AgentKind>,
+    overrides: &Overrides,
+) -> Result<Run> {
     let plan = plan::load(plan_path)?;
     let plan_text = std::fs::read_to_string(plan_path)
         .with_context(|| format!("Cannot read {}", plan_path.display()))?;
@@ -84,6 +137,7 @@ pub fn start(cwd: &Path, plan_path: &Path, agent_override: Option<AgentKind>) ->
         &plan_text,
         &plan,
         agent_override,
+        overrides,
         &run_id,
         &original_branch,
         &base_sha,
@@ -110,6 +164,7 @@ fn write_run_files(
     plan_text: &str,
     plan: &Plan,
     agent_override: Option<AgentKind>,
+    overrides: &Overrides,
     run_id: &str,
     original_branch: &str,
     base_sha: &str,
@@ -135,6 +190,7 @@ fn write_run_files(
         base_sha,
         &phases,
     );
+    overrides.apply(&mut state);
     state.save(&paths)?;
     PhasewiseDir::new(git.root()).write_current(run_id)?;
     Ok(Run {
@@ -310,11 +366,13 @@ fn recovered_phases(old: &RunState, new: &RunState) -> Vec<usize> {
 pub fn next(
     run: &mut Run,
     auto: bool,
+    overrides: &Overrides,
     events: &Sender<EngineEvent>,
     cancel: &AtomicBool,
 ) -> Result<NextOutcome> {
     let _lock = lock_and_reload(run)?;
     check_can_advance(run)?;
+    overrides.apply(&mut run.state);
     if run
         .state
         .phases
@@ -408,6 +466,8 @@ fn reset_phase(run: &mut Run, number: usize) {
         phase.summary = None;
         phase.failure = None;
         phase.cost_usd = None;
+        phase.model = None;
+        phase.effort = None;
         phase.started_at = None;
         phase.finished_at = None;
     }
@@ -418,6 +478,7 @@ fn reset_phase(run: &mut Run, number: usize) {
 pub fn retry(
     run: &mut Run,
     note: Option<&str>,
+    overrides: &Overrides,
     events: &Sender<EngineEvent>,
     cancel: &AtomicBool,
 ) -> Result<PhaseStatus> {
@@ -452,6 +513,7 @@ then `phasewise rollback 0` to start over.",
     run.git.reset_hard(&previous)?;
     run.git.clean_untracked()?;
     reset_phase(run, number);
+    overrides.apply(&mut run.state);
     run.state.save(&run.paths)?;
     run_one(run, number, note, events, cancel)
 }
@@ -606,5 +668,56 @@ fn execute_locked(
             return Ok(status);
         }
         approve(run)?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flags_are_validated_and_default_clears() {
+        let o = Overrides::parse(Some("opus"), Some("default")).expect("valid");
+        assert_eq!(o.model, Some(Override::Set("opus".into())));
+        assert_eq!(o.effort, Some(Override::Clear));
+        assert_eq!(
+            Overrides::parse(None, None).expect("none"),
+            Overrides::default()
+        );
+        let err = Overrides::parse(Some("-x"), None)
+            .expect_err("flag-like")
+            .to_string();
+        assert!(err.starts_with("Invalid --model"), "{err}");
+        let err = Overrides::parse(None, Some("huge"))
+            .expect_err("bad")
+            .to_string();
+        assert!(
+            err.starts_with("Invalid --effort") && err.contains("xhigh"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn apply_sets_clears_and_leaves_alone() {
+        let mut state = RunState::new(
+            "r",
+            Path::new("p.md"),
+            None,
+            AgentKind::Claude,
+            "main",
+            "phasewise/r",
+            "abc",
+            &[(1, "A".into())],
+        );
+        Overrides::parse(Some("m"), Some("high"))
+            .expect("ok")
+            .apply(&mut state);
+        assert_eq!(state.model_override.as_deref(), Some("m"));
+        assert_eq!(state.effort_override.as_deref(), Some("high"));
+        Overrides::parse(None, Some("default"))
+            .expect("ok")
+            .apply(&mut state);
+        assert_eq!(state.model_override.as_deref(), Some("m"));
+        assert_eq!(state.effort_override, None);
     }
 }

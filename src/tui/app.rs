@@ -374,6 +374,8 @@ mod tests {
             attempts: 1,
             failure: None,
             has_checkpoint: checkpoint,
+            model: None,
+            effort: None,
         }
     }
 

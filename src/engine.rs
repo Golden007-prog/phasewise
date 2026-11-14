@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use jiff::Timestamp;
 
-use crate::agent::{Agent, AgentEvent, AgentParser};
+use crate::agent::{Agent, AgentEvent, AgentParser, LaunchOptions};
 use crate::git::{Git, checkpoint_message};
 use crate::plan::Plan;
 use crate::process::{GroupChild, spawn_in_group};
@@ -33,6 +33,9 @@ pub enum EngineEvent {
         title: String,
         attempt: u32,
         resumed: bool,
+        /// Effective model and effort of this attempt, when set.
+        model: Option<String>,
+        effort: Option<String>,
     },
     Agent {
         phase: usize,
@@ -132,6 +135,36 @@ impl PhaseContext<'_> {
     }
 }
 
+/// Effective model and effort of a phase, highest precedence first: the run
+/// override, the phase's settings block, the plan's front matter, nothing.
+/// The plan's own values apply only when the run uses the plan's agent, because
+/// a model name belongs to one agent.
+pub fn resolve_options(state: &RunState, plan: &Plan, phase: usize) -> LaunchOptions {
+    let same_agent = state.agent == plan.config.agent;
+    let phase_settings = plan.phases.iter().find(|p| p.number == phase);
+    let pick =
+        |over: &Option<String>, in_phase: Option<&Option<String>>, in_plan: &Option<String>| {
+            over.clone().or_else(|| {
+                if !same_agent {
+                    return None;
+                }
+                in_phase.and_then(Clone::clone).or_else(|| in_plan.clone())
+            })
+        };
+    LaunchOptions {
+        model: pick(
+            &state.model_override,
+            phase_settings.map(|p| &p.model),
+            &plan.config.model,
+        ),
+        effort: pick(
+            &state.effort_override,
+            phase_settings.map(|p| &p.effort),
+            &plan.config.effort,
+        ),
+    }
+}
+
 /// What the next agent launch sends.
 struct Launch {
     prompt: String,
@@ -198,6 +231,7 @@ pub fn run_phase(
     state.failure = None;
     state.session_id = None;
 
+    let options = resolve_options(ctx.state, ctx.plan, phase);
     let mut launch = Launch {
         prompt: base_prompt.clone(),
         resume_session: None,
@@ -207,6 +241,8 @@ pub fn run_phase(
         let attempt = {
             let state = ctx.phase_state(phase)?;
             state.attempts += 1;
+            state.model = options.model.clone();
+            state.effort = options.effort.clone();
             state.status = PhaseStatus::Running;
             state.attempts
         };
@@ -217,9 +253,11 @@ pub fn run_phase(
             title: title.clone(),
             attempt,
             resumed: launch.resume_session.is_some(),
+            model: options.model.clone(),
+            effort: options.effort.clone(),
         });
 
-        let run = run_agent(ctx, phase, attempt, &launch)?;
+        let run = run_agent(ctx, phase, attempt, &launch, &options)?;
         if let Some(status) = check_agent_run(ctx, phase, attempt, &run)? {
             return Ok(status);
         }
@@ -336,12 +374,13 @@ fn run_agent(
     phase: usize,
     attempt: u32,
     launch: &Launch,
+    options: &LaunchOptions,
 ) -> Result<AgentRun> {
     let root = ctx.git.root().to_path_buf();
     let extra = &ctx.settings.agent_args;
     let mut cmd = match &launch.resume_session {
-        Some(session) => ctx.agent.resume_command(&root, session, extra),
-        None => ctx.agent.new_session_command(&root, extra),
+        Some(session) => ctx.agent.resume_command(&root, session, options, extra),
+        None => ctx.agent.new_session_command(&root, options, extra),
     };
     let stderr_path = ctx.paths.agent_stderr_log(phase, attempt);
     let stderr_file = File::create(&stderr_path)
@@ -609,4 +648,70 @@ user.name and user.email), then run `phasewise retry` to run the phase again"
         cost_usd,
     });
     Ok(PhaseStatus::AwaitingReview)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::{self, AgentKind};
+
+    const PLAN: &str = "+++\nmodel = \"plan-m\"\neffort = \"low\"\n+++\n## A\n\nx\n\n```phasewise\nmodel = \"phase-m\"\n```\n\n## B\n\ny\n";
+
+    fn state(agent: AgentKind) -> RunState {
+        RunState::new(
+            "r",
+            std::path::Path::new("p.md"),
+            None,
+            agent,
+            "main",
+            "phasewise/r",
+            "abc",
+            &[(1, "A".into()), (2, "B".into())],
+        )
+    }
+
+    fn opts(model: Option<&str>, effort: Option<&str>) -> LaunchOptions {
+        LaunchOptions {
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn precedence_is_override_then_phase_then_plan_then_nothing() {
+        let plan = plan::parse(PLAN).expect("plan");
+        let mut s = state(AgentKind::Claude);
+        assert_eq!(
+            resolve_options(&s, &plan, 1),
+            opts(Some("phase-m"), Some("low"))
+        );
+        assert_eq!(
+            resolve_options(&s, &plan, 2),
+            opts(Some("plan-m"), Some("low"))
+        );
+        s.model_override = Some("cli-m".into());
+        s.effort_override = Some("max".into());
+        assert_eq!(
+            resolve_options(&s, &plan, 1),
+            opts(Some("cli-m"), Some("max"))
+        );
+        assert_eq!(
+            resolve_options(&s, &plan, 2),
+            opts(Some("cli-m"), Some("max"))
+        );
+        let bare = plan::parse("## A\n\nx\n").expect("plan");
+        assert_eq!(
+            resolve_options(&state(AgentKind::Claude), &bare, 1),
+            opts(None, None)
+        );
+    }
+
+    #[test]
+    fn plan_values_apply_only_to_the_plans_agent() {
+        let plan = plan::parse(PLAN).expect("plan");
+        let mut s = state(AgentKind::Codex);
+        assert_eq!(resolve_options(&s, &plan, 1), opts(None, None));
+        s.effort_override = Some("high".into());
+        assert_eq!(resolve_options(&s, &plan, 1), opts(None, Some("high")));
+    }
 }

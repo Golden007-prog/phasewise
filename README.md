@@ -78,14 +78,17 @@ Run `phasewise` with no arguments: with an active run in a terminal it opens the
 | `phasewise init` | Creates an example `phasewise.md` (never overwrites) and excludes `.phasewise/` from git. | |
 | `phasewise check [PLAN]` | Validates the plan and lists its phases and checks; runs nothing. | `PLAN`: plan path (default `phasewise.md` at the repository root) |
 | `phasewise doctor` | Checks git, claude and codex (presence, version) and whether this directory is a suitable repository. | |
-| `phasewise run [PLAN]` | Starts a run and launches phase 1; fails if a run is already active. | `--agent claude\|codex` (overrides the plan), `--auto` (chain phases until the end or the first failure) |
-| `phasewise next` | Approves the phase awaiting review and launches the next one. | `--auto` |
-| `phasewise retry` | Goes back to the checkpoint before the current phase and reruns it in a new session. | `--note <TEXT>` (appended to the phase prompt) |
+| `phasewise run [PLAN]` | Starts a run and launches phase 1; fails if a run is already active. | `--agent claude\|codex` (overrides the plan), `--auto` (chain phases until the end or the first failure), `--model <M>`, `--effort <E>` |
+| `phasewise next` | Approves the phase awaiting review and launches the next one. | `--auto`, `--model`, `--effort` |
+| `phasewise retry` | Goes back to the checkpoint before the current phase and reruns it in a new session. | `--note <TEXT>` (appended to the phase prompt), `--model`, `--effort` |
 | `phasewise rollback <N>` | Goes back to the checkpoint of phase N (0 = initial state); later phases become pending again. | `--yes` (skip the confirmation prompt) |
-| `phasewise status` | Shows a table of phases: state, attempts, changed files and cost if known. | |
+| `phasewise status` | Shows a table of phases: state, attempts, changed files, cost if known and model. | |
+| `phasewise models [--agent claude\|codex]` | Lists the models each agent offers (Codex: from `codex debug models`; Claude: the documented aliases). | `--agent` (default: both) |
 | `phasewise diff [N]` | Prints the diff of phase N (default: the last one with a checkpoint). | |
 | `phasewise review` | Opens the review TUI: phase list, Diff / Log / Verify tabs. | |
 | `phasewise abort` | Marks the run as abandoned and returns to the original branch; the run branch is kept. | |
+
+Model and effort: `--model <M>` and `--effort low|medium|high|xhigh|max` on `run`, `next` and `retry` are stored in the run and apply from then on; `default` removes the stored value. The plan can set `model` and `effort` in its front matter and per phase in a `phasewise` block (see `docs/plan-format.md`). Precedence, highest first: the flags, the phase block, the front matter, nothing (the agent's own default). The plan's values apply only when the run uses the plan's agent.
 
 Exit codes: `0` success, `1` usage or environment error, `3` a phase ended failed, `130` second Ctrl-C.
 
@@ -104,6 +107,8 @@ Command lines phasewise uses (the prompt is sent on stdin; `agent_args` from the
 
 - Claude Code: `claude -p --output-format stream-json --verbose --permission-mode acceptEdits --permission-prompts none --allowedTools Read,Edit,Write,Bash --disallowedTools "Bash(git push *)"`; a retry in the same session adds `--resume <session-id>`.
 - Codex: `codex exec --json --sandbox workspace-write -`; a retry in the same session uses `codex exec --json --sandbox workspace-write resume <session-id> -`.
+
+When a model or effort is set, Claude gets `--model <M> --effort <E>` after the fixed flags (before `--resume` and `agent_args`) and Codex gets `-m <M> -c model_reasoning_effort="<E>"` before the `resume` subcommand.
 
 Set `PHASEWISE_CLAUDE_BIN` or `PHASEWISE_CODEX_BIN` to use a different binary.
 
