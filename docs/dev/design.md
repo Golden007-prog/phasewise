@@ -21,7 +21,12 @@ with the code, and record the reason in `decisions.md`.
 | `agent/claude.rs`, `agent/codex.rs` | Command building and stdout translation per agent. |
 | `engine.rs` | One phase cycle: agent → verify → retries → checkpoint. Emits `EngineEvent`s. |
 | `ops.rs` | Run-level operations shared by CLI and TUI: start, approve/next, retry, rollback, abort, load active run. |
-| `tui/` | `phasewise review` (ratatui). |
+| `display.rs` | Formatting of engine events and statuses, shared by the CLI and the TUI. |
+| `doctor.rs` | `phasewise doctor`: presence and version of git, claude and codex, repository suitability. |
+| `tui/mod.rs` | `phasewise review`: terminal setup/restore, event loop, engine worker threads. |
+| `tui/app.rs` | Pure state machine: key in, `Command` out. |
+| `tui/data.rs` | Read-only loaders of run, diff, log and verify data. |
+| `tui/view.rs` | Rendering with ratatui (snapshot-tested). |
 
 The engine and `ops` never print. They report through `std::sync::mpsc::Sender<EngineEvent>`; the CLI and the TUI are the two consumers.
 

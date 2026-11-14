@@ -15,8 +15,25 @@ Module map, internal APIs and invariants: `docs/dev/design.md` (binding).
 Agent CLI facts and exact command lines: `docs/dev/agent-cli-notes.md`.
 Decisions and deviations from the original plan: `docs/dev/decisions.md`.
 
+Modules (`src/`): `cli` (clap, dispatch, exit codes), `display` (event and
+status formatting shared by CLI and TUI), `plan` (parser), `prompt` (all agent
+prompt texts), `git` (the only module that runs `git`), `state` (`state.json`,
+run layout, lock, recovery), `process` (process groups), `verify` (verification
+commands), `agent/` (`mod`, `claude`, `codex`: command lines and output
+parsers), `engine` (one phase cycle), `ops` (run-level operations shared by CLI
+and TUI), `doctor`, and `tui/` (`mod` terminal loop, `app` pure key/state
+machine, `data` read-only loaders, `view` rendering).
+
 The engine and `ops` never print or draw: they emit `EngineEvent`s through an
 `mpsc` channel; the CLI and the TUI are two consumers of that channel.
+
+Tests: unit tests live next to the code (`#[cfg(test)]`); integration tests are
+`tests/*.rs` (shared helpers in `tests/common/`), run against temporary git
+repositories and the fake agents in `tests/fakes/` (`fake-claude.sh`,
+`fake-codex.sh`); agent output captures are in `tests/fixtures/` (synthetic ones
+are marked `.synthetic`); TUI rendering is checked with `insta` snapshots in
+`src/tui/snapshots/`. `scripts/smoke-test.sh` is the only thing that calls a
+real agent and is never run by `cargo test`.
 
 ## Quality gate
 
