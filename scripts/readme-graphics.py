@@ -8,19 +8,22 @@ card of the terminal screens, and the diagram is a `git log --graph` of what a
 run does to your repository.
 
 GitHub shows an SVG used as an image without web fonts, so every text is drawn
-as outlines taken from DejaVu Sans and DejaVu Sans Mono (Bitstream Vera
-licence, free to embed). Each graphic comes in a light and a dark variant and
-in a wide and a narrow (phone) variant.
+as outlines. Prose is Source Sans Pro Regular and the program's own words
+(wordmark, branch names, hashes) are Inconsolata Regular, both under the SIL
+Open Font License, which allows embedding. The few symbols neither has (the
+star, the prompt arrow) come from DejaVu Sans Mono. Nothing is bold: emphasis
+comes from size and colour. Each graphic comes in a light and a dark variant
+and in a wide and a narrow (phone) variant.
 
 Usage:
-    python3 scripts/readme-graphics.py [--fonts DIR] [--out DIR]
+    python3 scripts/readme-graphics.py --fonts DIR [--out DIR]
 
-Needs fontTools (`pip install fonttools`). --fonts is the folder with
-DejaVuSans.ttf, DejaVuSansMono.ttf and DejaVuSansMono-Bold.ttf; by default
-matplotlib's copy is used when it is installed.
+Needs fontTools (`pip install fonttools`). DIR holds SourceSansPro-Regular.ttf,
+Inconsolata-Regular.ttf and DejaVuSansMono.ttf.
 """
 
 import argparse
+import math
 import pathlib
 import sys
 from xml.sax.saxutils import escape
@@ -54,38 +57,56 @@ HASHES = ["a3f9c21", "5be2d07", "91c4e3a"]
 
 
 class Face:
-    """A font that measures text and turns it into one SVG path."""
+    """A font that measures text and turns it into one SVG path. Characters the
+    font lacks are drawn from the fallback, scaled to the same size."""
 
-    def __init__(self, path):
+    def __init__(self, path, fallback=None):
         self.font = TTFont(path)
         self.glyphs = self.font.getGlyphSet()
         self.cmap = self.font.getBestCmap()
         self.upm = self.font["head"].unitsPerEm
         self.hmtx = self.font["hmtx"]
+        os2 = self.font["OS/2"]
+        self.cap = getattr(os2, "sCapHeight", 0) / self.upm or 0.7
+        self.xheight = getattr(os2, "sxHeight", 0) / self.upm or 0.5
+        self.fallback = fallback
 
-    def _name(self, char):
-        return self.cmap.get(ord(char), ".notdef")
+    def _source(self, char):
+        if ord(char) not in self.cmap and self.fallback and ord(char) in self.fallback.cmap:
+            return self.fallback._source(char)
+        return self, self.cmap.get(ord(char), ".notdef")
 
     def width(self, text, size):
-        return sum(self.hmtx[self._name(c)][0] for c in text) * size / self.upm
+        total = 0.0
+        for char in text:
+            face, name = self._source(char)
+            total += face.hmtx[name][0] * size / face.upm
+        return total
 
     def path(self, text, size, x, baseline):
-        scale = size / self.upm
-        pen = SVGPathPen(self.glyphs, ntos=lambda v: f"{v:.1f}".rstrip("0").rstrip("."))
+        pen = SVGPathPen(None, ntos=lambda v: f"{v:.2f}".rstrip("0").rstrip("."))
         cursor = x
         for char in text:
-            name = self._name(char)
-            self.glyphs[name].draw(TransformPen(pen, (scale, 0, 0, -scale, cursor, baseline)))
-            cursor += self.hmtx[name][0] * scale
+            face, name = self._source(char)
+            scale = size / face.upm
+            pen.glyphSet = face.glyphs
+            face.glyphs[name].draw(TransformPen(pen, (scale, 0, 0, -scale, cursor, baseline)))
+            cursor += face.hmtx[name][0] * scale
         return pen.getCommands()
+
+    def centre_offset(self, size):
+        """Distance from the middle of a line of text to its baseline: the
+        middle of the lowercase body and the capitals, which is where the eye
+        puts it."""
+        return (self.cap + self.xheight) / 4 * size
 
 
 class Fonts:
     def __init__(self, folder):
         folder = pathlib.Path(folder)
-        self.sans = Face(folder / "DejaVuSans.ttf")
-        self.mono = Face(folder / "DejaVuSansMono.ttf")
-        self.mono_bold = Face(folder / "DejaVuSansMono-Bold.ttf")
+        symbols = Face(folder / "DejaVuSansMono.ttf")
+        self.sans = Face(folder / "SourceSansPro-Regular.ttf", symbols)
+        self.mono = Face(folder / "Inconsolata-Regular.ttf", symbols)
 
 
 def wrap(face, text, size, max_width):
@@ -109,36 +130,59 @@ def svg(width, height, body, description):
     )
 
 
-def text(face, content, size, x, baseline, color, anchor="start"):
+def place(face, content, size, x, anchor):
     width = face.width(content, size)
     if anchor == "middle":
-        x -= width / 2
-    elif anchor == "end":
-        x -= width
-    return f'<path fill="{color}" d="{face.path(content, size, x, baseline)}"/>'
+        return x - width / 2
+    if anchor == "end":
+        return x - width
+    return x
+
+
+def text(face, content, size, x, baseline, color, anchor="start", opacity=None):
+    """Text whose baseline sits at the given y."""
+    extra = f' fill-opacity="{opacity}"' if opacity is not None else ""
+    return f'<path fill="{color}"{extra} d="{face.path(content, size, place(face, content, size, x, anchor), baseline)}"/>'
+
+
+def label(face, content, size, x, middle, color, anchor="start", opacity=None):
+    """Text whose visual middle sits at the given y."""
+    return text(face, content, size, x, middle + face.centre_offset(size), color, anchor, opacity)
 
 
 def stroke(d, color, width=3, dashed=False, cap="round"):
-    dash = ' stroke-dasharray="2 7"' if dashed else ""
+    dash = ' stroke-dasharray="1 7"' if dashed else ""
     return (
         f'<path d="{d}" fill="none" stroke="{color}" stroke-width="{width}" '
-        f'stroke-linecap="{cap}"{dash}/>'
+        f'stroke-linecap="{cap}" stroke-linejoin="round"{dash}/>'
     )
+
+
+def arc(radius, sweep, dx, dy):
+    """A circular arc to the point (dx, dy) away from the current one. Every
+    bend in the graphics is a true quarter circle that meets the straight
+    lines on both sides tangentially."""
+    return f"a{radius} {radius} 0 0 {sweep} {dx} {dy}"
 
 
 def done(cx, cy, colors, radius=9):
     """A phase that passed its checks: a filled node with a check."""
-    check = f"M{cx - 4} {cy + 0.5}L{cx - 1.2} {cy + 3.4}L{cx + 4.6} {cy - 3}"
+    k = radius / 9
+    check = (
+        f"M{cx - 4 * k:.2f} {cy + 0.2 * k:.2f}"
+        f"L{cx - 1.2 * k:.2f} {cy + 3 * k:.2f}"
+        f"L{cx + 4.2 * k:.2f} {cy - 3 * k:.2f}"
+    )
     return (
         f'<circle cx="{cx}" cy="{cy}" r="{radius}" fill="{colors["accent"]}"/>'
-        + stroke(check, colors["on_accent"], 2.2)
+        + stroke(check, colors["on_accent"], 2.2 * k)
     )
 
 
 def waiting(cx, cy, colors, radius=9):
     """A phase waiting for review: a ring."""
     return (
-        f'<circle cx="{cx}" cy="{cy}" r="{radius - 1}" fill="none" '
+        f'<circle cx="{cx}" cy="{cy}" r="{radius - 1.5}" fill="none" '
         f'stroke="{colors["accent"]}" stroke-width="3"/>'
     )
 
@@ -148,10 +192,15 @@ def plain(cx, cy, colors, radius=6):
     return f'<circle cx="{cx}" cy="{cy}" r="{radius}" fill="{colors["muted"]}"/>'
 
 
-def future(cx, cy, colors, radius=8):
+def future(cx, cy, colors, radius=9):
+    """The merge you have not made yet: a dotted ring."""
+    r = radius - 1.25
+    pitch = 2 * math.pi * r / 8  # eight dots, evenly spaced, no seam
     return (
-        f'<circle cx="{cx}" cy="{cy}" r="{radius - 1}" fill="none" '
-        f'stroke="{colors["muted"]}" stroke-width="2.4" stroke-dasharray="3 3.4"/>'
+        f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" '
+        f'stroke="{colors["muted"]}" stroke-width="2.5" '
+        f'stroke-dasharray="0.01 {pitch - 0.01:.3f}" stroke-linecap="round" '
+        f'transform="rotate(-90 {cx} {cy})"/>'
     )
 
 
@@ -161,25 +210,31 @@ PHASES = ["Define the subcommand", "Implement it", "Cover it with tests"]
 
 
 def phase_list(fonts, colors, x, middle):
-    """The phase list of the run screen: one done, one in review, one pending."""
-    size, step = 16, 34
+    """The phase list of the run screen on a character grid: prompt, status,
+    number, title. One done, one in review, one pending."""
+    size, step = 17, 36
+    cell = fonts.mono.width("0", size)
     top = middle - step
     body = []
+
+    def cell_at(column):
+        return x + (column + 0.5) * cell
+
     for index, title in enumerate(PHASES):
-        y = top + index * step + 5
+        y = top + index * step
         number = f"{index + 1}"
         if index == 0:
-            body.append(text(fonts.mono_bold, "\u2713", size, x + 22, y, colors["ok"]))
-            tone, face = colors["muted"], fonts.mono
+            body.append(label(fonts.mono, "✓", size, cell_at(2), y, colors["ok"], "middle"))
+            tone, opacity = colors["muted"], None
         elif index == 1:
-            body.append(text(fonts.mono_bold, "\u276f", size, x, y, colors["accent"]))
-            body.append(text(fonts.mono_bold, "\u25c6", size, x + 22, y, colors["accent"]))
-            tone, face = colors["fg"], fonts.mono_bold
+            body.append(label(fonts.mono, "❯", size, cell_at(0), y, colors["accent"], "middle"))
+            body.append(label(fonts.mono, "◆", size, cell_at(2), y, colors["accent"], "middle"))
+            tone, opacity = colors["fg"], None
         else:
-            body.append(text(fonts.mono, "\u00b7", size, x + 22, y, colors["muted"]))
-            tone, face = colors["muted"], fonts.mono
-        body.append(text(face, number, size, x + 48, y, tone))
-        body.append(text(face, title, size, x + 76, y, tone))
+            body.append(label(fonts.mono, "·", size, cell_at(2), y, colors["muted"], "middle", 0.7))
+            tone, opacity = colors["muted"], 0.7
+        body.append(label(fonts.mono, number, size, cell_at(4), y, tone, "middle", opacity))
+        body.append(label(fonts.mono, title, size, x + 6 * cell, y, tone, "start", opacity))
     return body
 
 
@@ -187,31 +242,38 @@ def card(theme, narrow, fonts):
     """The header card of the screens, large: star, name, tagline."""
     colors = THEMES[theme]
     width = 400 if narrow else 840
-    pad = 28 if narrow else 44
-    word = 36 if narrow else 54
-    tag = 15 if narrow else 21
-    meta = 12.5 if narrow else 14.5
-    star_w = fonts.mono_bold.width("✻ ", word)
-    base = 82 if narrow else 96
+    pad = 30 if narrow else 48
+    pad_y = 34 if narrow else 44
+    word = 40 if narrow else 58
+    tag = 16 if narrow else 22
+    meta = 13 if narrow else 15
+    mono = fonts.mono
+
+    # Stack the text block from the top of the capitals of the wordmark down
+    # to the baseline of the last line, so the padding above and below is equal.
+    base = pad_y + mono.cap * word
+    star_w = mono.width("✻ ", word)
     body = [
-        f'<rect x="1" y="1" width="{width - 2}" height="{{h}}" rx="14" fill="none" '
-        f'stroke="{colors["line"]}" stroke-width="2"/>',
-        text(fonts.mono_bold, "✻", word, pad, base, colors["accent"]),
-        text(fonts.mono_bold, "phasewise", word, pad + star_w, base, colors["fg"]),
+        text(mono, "✻", word, pad, base, colors["accent"]),
+        text(mono, "phasewise", word, pad + star_w, base, colors["fg"]),
     ]
-    y = base + (14 if narrow else 20) + tag
-    for line in wrap(fonts.sans, TAGLINE, tag, width - pad * 2):
+    y = base + (18 if narrow else 24) + fonts.sans.cap * tag
+    lines = wrap(fonts.sans, TAGLINE, tag, width - pad * 2)
+    for line in lines:
         body.append(text(fonts.sans, line, tag, pad, y, colors["muted"]))
-        y += tag * 1.45
-    y += 4
-    body.append(
-        text(fonts.mono, "Claude Code · Codex · git", meta, pad, y, colors["muted"])
+        y += tag * 1.4
+    y += (4 if narrow else 8)
+    body.append(text(mono, "Claude Code · Codex · git", meta, pad, y, colors["muted"], opacity=0.85))
+    height = round(y + pad_y - (6 if narrow else 4))
+    frame = (
+        f'<rect x="1" y="1" width="{width - 2}" height="{height - 2}" rx="14" fill="none" '
+        f'stroke="{colors["line"]}" stroke-width="2"/>'
     )
-    height = int(y + pad - 4)
     if not narrow:
-        body += phase_list(fonts, colors, 512, height / 2)
-    body[0] = body[0].replace("{h}", str(height - 2))
-    return svg(width, height, "".join(body), f"phasewise: {TAGLINE}")
+        divider_x = 496
+        body.append(stroke(f"M{divider_x} {pad_y}V{height - pad_y}", colors["line"], 1.5, cap="butt"))
+        body += phase_list(fonts, colors, 536, height / 2)
+    return svg(width, height, frame + "".join(body), f"phasewise: {TAGLINE}")
 
 
 # --- The run as a git graph ------------------------------------------------
@@ -222,84 +284,97 @@ LEGEND = [
     ("future", "your merge, when you decide"),
 ]
 
+NAME, NOTE, CAPTION = 14, 13.5, 12.5
+BEND = 36  # radius of every bend in the run graphs
+
 
 def mark(kind, cx, cy, colors):
-    return {"done": done, "waiting": waiting, "future": future}[kind](cx, cy, colors, 7)
+    return {"done": done, "waiting": waiting, "future": future}[kind](cx, cy, colors, 7.5)
+
+
+def legend(fonts, colors, x, middle):
+    body = []
+    for kind, words in LEGEND:
+        body.append(mark(kind, x + 8, middle, colors))
+        body.append(label(fonts.sans, words, NOTE, x + 24, middle, colors["muted"]))
+        x += 24 + fonts.sans.width(words, NOTE) + 32
+    return body
 
 
 def graph_wide(theme, fonts):
     colors = THEMES[theme]
-    width, height = 840, 276
-    main_y, run_y = 60, 166
-    x_fork, x_merge = 196, 780
-    xs = [340, 460, 580, 700]
-    sm, md = 13, 13
+    width, height = 840, 280
+    main_y, run_y = 62, 168
+    x_fork, x_merge = 216, 780
+    xs = [348, 468, 588, 708]
     body = [
-        # main: untouched
-        stroke(f"M{x_fork} {main_y}H{x_merge - 8}", colors["line"], 3),
-        stroke(f"M{x_merge + 8} {main_y}H{width - 14}", colors["line"], 3, dashed=True),
-        # the run branch
-        stroke(f"M{x_fork} {main_y}C{x_fork} {run_y - 30} {x_fork + 40} {run_y} {xs[0] - 9} {run_y}", colors["accent"]),
-        stroke(f"M{xs[0]} {run_y}H{xs[3] - 9}", colors["accent"]),
+        # main: untouched until the merge, then it carries on.
+        stroke(f"M{x_fork} {main_y}H{x_merge - 12}", colors["line"], 3),
+        stroke(f"M{x_merge + 12} {main_y}H{width - 3}", colors["line"], 3, dashed=True),
+        # The run branch leaves main at the fork and runs through the phases.
+        stroke(f"M{x_fork} {main_y}V{run_y - BEND}{arc(BEND, 0, BEND, BEND)}H{xs[3] - 12}", colors["accent"]),
+        # The merge: not made yet.
         stroke(
-            f"M{xs[3] + 9} {run_y}C{x_merge - 40} {run_y} {x_merge} {run_y - 30} {x_merge} {main_y + 9}",
+            f"M{xs[3] + 12} {run_y}H{x_merge - BEND}{arc(BEND, 0, BEND, -BEND)}V{main_y + 12}",
             colors["muted"], 3, dashed=True,
         ),
         plain(x_fork, main_y, colors),
-        future(x_merge, main_y, colors),
+        future(x_merge, main_y, colors, 9),
     ]
     for index, x in enumerate(xs):
         body.append(done(x, run_y, colors) if index < 3 else waiting(x, run_y, colors))
-        body.append(text(fonts.mono_bold, f"phase {index + 1}", md, x, run_y + 34, colors["fg"], "middle"))
-        label = HASHES[index] if index < 3 else "in review"
+        body.append(label(fonts.mono, f"phase {index + 1}", NAME, x, run_y + 36, colors["fg"], "middle"))
+        words = HASHES[index] if index < 3 else "in review"
         tone = colors["muted"] if index < 3 else colors["accent"]
-        body.append(text(fonts.mono, label, 12, x, run_y + 54, tone, "middle"))
-    # Lane names.
+        body.append(label(fonts.mono, words, CAPTION + 0.5, x, run_y + 56, tone, "middle"))
+    # Lane names, each a name over a plain note, centred on its lane.
     body += [
-        text(fonts.mono_bold, "main", sm, 0, main_y + 5, colors["fg"]),
-        text(fonts.sans, "your branch", 12.5, 0, main_y + 26, colors["muted"]),
-        text(fonts.mono_bold, "phasewise/", sm, 0, run_y - 2, colors["fg"]),
-        text(fonts.mono_bold, "<run-id>", sm, 0, run_y + 17, colors["fg"]),
-        text(fonts.sans, "untouched until you merge", 12.5, (x_fork + x_merge) / 2, main_y - 18, colors["muted"], "middle"),
+        label(fonts.mono, "main", NAME, 0, main_y - 10, colors["fg"]),
+        label(fonts.sans, "your branch", NOTE, 0, main_y + 11, colors["muted"]),
+        label(fonts.mono, "phasewise/<run-id>", NAME, 0, run_y - 10, colors["fg"]),
+        label(fonts.sans, "the run\u2019s own branch", NOTE, 0, run_y + 11, colors["muted"]),
+        label(fonts.sans, "untouched until you merge", NOTE, (x_fork + x_merge) / 2, main_y - 22, colors["muted"], "middle"),
     ]
-    # Legend.
-    x = 0
-    for kind, label in LEGEND:
-        body.append(mark(kind, x + 8, 250, colors))
-        body.append(text(fonts.sans, label, 12.5, x + 24, 254.5, colors["muted"]))
-        x += 24 + fonts.sans.width(label, 12.5) + 30
+    body += legend(fonts, colors, 0, height - 30)
     return svg(width, height, "".join(body), GRAPH_ALT)
 
 
 def graph_narrow(theme, fonts):
     colors = THEMES[theme]
     width, height = 400, 452
-    main_x, run_x = 14, 128
-    top_y, merge_y = 40, 396
-    ys = [152, 214, 276, 338]
+    main_x, run_x = 12, 120
+    top_y, merge_y = 36, 388
+    ys = [148, 208, 268, 328]
+    text_x = lambda x: x + 26
+    bend = 28
     body = [
-        stroke(f"M{main_x} {top_y}V{merge_y - 9}", colors["line"], 3),
-        stroke(f"M{main_x} {top_y}C{main_x} {ys[0] - 40} {run_x} {top_y + 30} {run_x} {ys[0] - 9}", colors["accent"]),
-        stroke(f"M{run_x} {ys[0]}V{ys[3] - 9}", colors["accent"]),
+        stroke(f"M{main_x} {top_y}V{merge_y - 12}", colors["line"], 3),
+        # Down from main, across, and down again onto the run's own lane.
         stroke(
-            f"M{run_x} {ys[3] + 9}C{run_x} {merge_y - 30} {main_x} {ys[3] + 30} {main_x} {merge_y - 9}",
+            f"M{main_x} {top_y}V{ys[0] - 12 - 2 * bend}{arc(bend, 0, bend, bend)}"
+            f"H{run_x - bend}{arc(bend, 1, bend, bend)}V{ys[0] - 12}",
+            colors["accent"],
+        ),
+        stroke(f"M{run_x} {ys[0]}V{ys[3] - 12}", colors["accent"]),
+        # The merge, not made yet: down, round the corner, and into main.
+        stroke(
+            f"M{run_x} {ys[3] + 12}V{merge_y - bend}{arc(bend, 1, -bend, bend)}H{main_x + 13}",
             colors["muted"], 3, dashed=True,
         ),
         plain(main_x, top_y, colors),
-        future(main_x, merge_y, colors),
-        text(fonts.mono_bold, "main", 13, main_x + 26, top_y + 5, colors["fg"]),
-        text(fonts.sans, "your branch, untouched until you merge", 12.5, main_x + 26, top_y + 25, colors["muted"]),
-        text(fonts.mono_bold, "phasewise/<run-id>", 13, run_x + 26, ys[0] - 36, colors["fg"]),
-        text(fonts.mono_bold, "merge", 13, main_x + 26, merge_y + 5, colors["fg"]),
-        text(fonts.sans, "when you decide", 12.5, main_x + 26, merge_y + 25, colors["muted"]),
+        future(main_x, merge_y, colors, 9),
+        label(fonts.mono, "main", NAME, text_x(main_x), top_y - 10, colors["fg"]),
+        label(fonts.sans, "your branch, untouched until you merge", NOTE, text_x(main_x), top_y + 11, colors["muted"]),
+        label(fonts.mono, "phasewise/<run-id>", NAME, text_x(run_x), ys[0] - 46, colors["fg"]),
+        label(fonts.mono, "merge", NAME, text_x(main_x), merge_y + 26, colors["fg"]),
+        label(fonts.sans, "your merge, when you decide", NOTE, text_x(main_x), merge_y + 47, colors["muted"]),
     ]
     for index, y in enumerate(ys):
         body.append(done(run_x, y, colors) if index < 3 else waiting(run_x, y, colors))
-        body.append(text(fonts.mono_bold, f"phase {index + 1}", 13, run_x + 26, y + 5, colors["fg"]))
-        label = HASHES[index] if index < 3 else "in review"
+        body.append(label(fonts.mono, f"phase {index + 1}", NAME, text_x(run_x), y - 10, colors["fg"]))
+        words = HASHES[index] if index < 3 else "in review"
         tone = colors["muted"] if index < 3 else colors["accent"]
-        body.append(text(fonts.mono, label, 12, run_x + 26, y + 24, tone))
-    y = 430
+        body.append(label(fonts.mono, words, CAPTION + 0.5, text_x(run_x), y + 11, tone))
     return svg(width, height, "".join(body), GRAPH_ALT)
 
 
@@ -310,24 +385,17 @@ GRAPH_ALT = (
 )
 
 
-def default_fonts():
-    try:
-        import matplotlib
-
-        return pathlib.Path(matplotlib.get_data_path()) / "fonts" / "ttf"
-    except ImportError:
-        return None
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--fonts", type=pathlib.Path, default=default_fonts())
+    parser.add_argument("--fonts", type=pathlib.Path, required=True)
     parser.add_argument(
         "--out", type=pathlib.Path, default=pathlib.Path(__file__).parent.parent / "assets" / "readme"
     )
     args = parser.parse_args()
-    if args.fonts is None or not (args.fonts / "DejaVuSans.ttf").exists():
-        sys.exit("DejaVu fonts not found: pass --fonts DIR (see the module docstring).")
+    needed = ["SourceSansPro-Regular.ttf", "Inconsolata-Regular.ttf", "DejaVuSansMono.ttf"]
+    missing = [name for name in needed if not (args.fonts / name).exists()]
+    if missing:
+        sys.exit(f"missing in {args.fonts}: {', '.join(missing)} (see the module docstring)")
     fonts = Fonts(args.fonts)
     args.out.mkdir(parents=True, exist_ok=True)
     count = 0
