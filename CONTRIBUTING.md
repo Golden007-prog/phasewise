@@ -72,8 +72,22 @@ cargo run --manifest-path /path/to/phasewise/Cargo.toml
 
 After `cargo build`, `scripts/smoke-test.sh claude` (or `codex`) runs a
 two-phase plan with the real, logged-in CLI in a throwaway repository and
-checks the result. It costs a few cents. Run it when an adapter changes or a new agent version misbehaves,
-and record the version that passed in [docs/agents.md](docs/agents.md).
+checks the result. It costs a few cents. Run it when an adapter changes or a
+new agent version misbehaves, and record the version that passed in
+[docs/agents.md](docs/agents.md).
+
+### README graphics
+
+The screen captures in `assets/readme/` come from the real rendering:
+
+```sh
+cargo test --all-features -- --ignored readme_screenshots
+```
+
+The title card and the diagram of a run are drawn by
+`scripts/readme-graphics.py`, which needs `pip install fonttools` and the
+DejaVu fonts (matplotlib ships them). Regenerate them after changing the look
+of the screens, and read the result in a browser, in light and dark mode.
 
 ## Pull requests
 

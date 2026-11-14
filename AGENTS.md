@@ -77,7 +77,9 @@ cargo test --all-features
   `scripts/smoke-test.sh` calls a real agent and costs money: run it only when
   asked.
 - README screenshots are generated from the real rendering:
-  `cargo test --all-features -- --ignored readme_screenshots`.
+  `cargo test --all-features -- --ignored readme_screenshots`. The title card
+  and the diagram of a run come from `python3 scripts/readme-graphics.py`
+  (needs `fonttools`).
 
 ## When behaviour changes
 

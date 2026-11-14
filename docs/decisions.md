@@ -701,3 +701,23 @@ findings:
   as it is.
 - **`plan --model` / `--effort` stay about the planning session.** They do not
   go into the plan: the plan holds the agent's own per-phase choice.
+
+## v0.3 — the README
+
+- **The README looks like the program.** Its title card is the header card of
+  the terminal screens (the `✻` star, bold name, grey details, a rounded box)
+  with the phase list of the run screen beside it, and the diagram of a run is
+  a `git log --graph` of what phasewise does to a repository: `main` untouched,
+  a run branch with one commit per phase, the merge left to the reader. Both
+  speak the visual language of the product instead of a generic banner and a
+  grid of icons.
+- **Text first.** Headings, steps and lists are Markdown, so they can be
+  searched, copied and read by screen readers; only the title card and the two
+  diagrams are images. They exist in light, dark, wide and narrow variants
+  chosen with `<picture>`, as the screen captures already were.
+- **Text drawn as outlines.** GitHub shows an SVG used as an image without web
+  fonts, so `scripts/readme-graphics.py` turns every text into paths with
+  DejaVu Sans and DejaVu Sans Mono (Bitstream Vera licence). The script is
+  kept in the repository so the graphics can be regenerated; it is not part of
+  the published crate.
+
