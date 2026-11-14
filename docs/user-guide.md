@@ -97,9 +97,16 @@ plan has a 20-minute limit; `esc` stops it.
 Read the plan before running it, especially the `verify` commands: they run on
 your machine. Edit anything you like; the home screen picks up the changes.
 
-`phasewise plan` options: `--agent`, `--model`, `--effort`, `--output PATH`
-(default `phasewise.md`) and `--force` to replace an existing file. The agent's
-raw output and every draft stay in `.phasewise/plans/<id>/`.
+The agent also chooses the model and effort of every phase, aiming for the
+cheapest that will do the job: a cheap model and low effort for mechanical
+work, the strongest for design or risky changes. It writes the choice in each
+phase's `phasewise` block, so you see it when you review the plan, and you can
+change it there or override it from the home screen or the command line.
+
+`phasewise plan` options: `--agent`, `--model`, `--effort` (these two choose
+the model and effort of the planning session itself, not of the phases),
+`--output PATH` (default `phasewise.md`) and `--force` to replace an existing
+file. The agent's raw output and every draft stay in `.phasewise/plans/<id>/`.
 
 ### By hand
 

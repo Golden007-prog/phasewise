@@ -136,7 +136,7 @@ pub enum Command {
         /// Agent that writes the plan and will run it (default: claude)
         #[arg(long, value_enum)]
         agent: Option<AgentArg>,
-        /// Model for the planning session and the plan's agent line
+        /// Model for the planning session (the plan chooses its own per phase)
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
         /// Effort for the planning session: low, medium, high, xhigh or max

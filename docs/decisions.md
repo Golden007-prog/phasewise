@@ -684,3 +684,20 @@ findings:
 - **`rust-version = "1.88"`** in `Cargo.toml`: the code uses let chains,
   stable since Rust 1.88, and ratatui 0.30 needs the same version.
 
+## v0.3 — models chosen by the planner
+
+- **The planning agent chooses the model and effort of every phase.** Before,
+  it was told to leave the model unset unless a phase clearly needed another,
+  so plans ran everything on the default and cost more than needed. Now the
+  prompt asks for the cheapest model and lowest effort that will do each phase
+  reliably, with three rules of thumb (mechanical, ordinary, hard), and for the
+  choice to be written in each phase's `phasewise` block, where the reviewer
+  sees it and can change it. Command-line and home-screen choices still win.
+- **Only the listed models, with their efforts.** The prompt lists the agent's
+  models with the efforts each supports and says to use only those names; the
+  front matter is not used, because it would apply to every phase. The
+  example in the prompt shows the cheapest listed model for an easy phase and
+  the first for a hard one, because an example without a model would be copied
+  as it is.
+- **`plan --model` / `--effort` stay about the planning session.** They do not
+  go into the plan: the plan holds the agent's own per-phase choice.

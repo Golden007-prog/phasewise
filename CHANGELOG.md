@@ -27,7 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Plans written by the agent.** `phasewise plan "<goal>"`, or `p` on the home
   screen, runs a read-only session that explores the project and writes
   `phasewise.md`. The plan is validated, repaired in the same session up to
-  twice, and written only when valid.
+  twice, and written only when valid. The agent picks the model and effort of
+  each phase (cheap for mechanical work, strong for hard work) and writes them
+  in the plan.
 - **Models and effort** per plan, per phase or per run, with the exact model
   names (`claude-opus-5-5`, …) and `phasewise models` to list them. The model
   the agent really used is recorded and shown.

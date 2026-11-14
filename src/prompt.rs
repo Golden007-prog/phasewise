@@ -129,22 +129,36 @@ pub const PLAN_END: &str = "PHASEWISE-PLAN>>>";
 pub fn plan_prompt(goal: &str, agent: AgentKind, models: Option<&[ModelInfo]>) -> String {
     let models_text = match models {
         Some(models) if !models.is_empty() => {
-            let mut lines: Vec<String> = models
+            let lines: Vec<String> = models
                 .iter()
                 .map(|m| {
-                    if m.description.is_empty() {
-                        format!("- {}", m.id)
-                    } else {
-                        format!("- {}: {}", m.id, m.description)
+                    let mut line = format!("- {}", m.id);
+                    if !m.description.is_empty() {
+                        line.push_str(&format!(": {}", m.description));
                     }
+                    if !m.efforts.is_empty() {
+                        line.push_str(&format!(" (efforts: {})", m.efforts.join(", ")));
+                    }
+                    line
                 })
                 .collect();
-            lines.push("Any other model name accepted by the agent's CLI also works.".to_string());
             lines.join("\n")
         }
         _ => "The list of models could not be read; any model name accepted by the agent's CLI \
-works."
+works. Use only names you are sure exist."
             .to_string(),
+    };
+    // The example shows the choice being made: the last listed model for the easy
+    // phase and the first for the hard one, when the list has at least two.
+    let (easy_settings, hard_settings) = match models {
+        Some([first, .., last]) => (
+            format!("model = \"{}\"\neffort = \"low\"", last.id),
+            format!("model = \"{}\"\neffort = \"high\"", first.id),
+        ),
+        _ => (
+            "effort = \"low\"".to_string(),
+            "effort = \"high\"".to_string(),
+        ),
     };
     format!(
         r#"You are writing an implementation plan for phasewise. phasewise is a tool that runs a
@@ -226,6 +240,10 @@ Shared context: a clap-based Rust CLI. Do not add dependencies.
 
 Add `stats` with a `--json` flag that prints `not implemented`.
 
+```phasewise
+{easy_settings}
+```
+
 ```verify
 cargo run -q -- stats --help
 ```
@@ -235,7 +253,7 @@ cargo run -q -- stats --help
 Print a summary, or one JSON object with `--json`.
 
 ```phasewise
-effort = "high"
+{hard_settings}
 ```
 ~~~
 
@@ -243,8 +261,21 @@ effort = "high"
 
 {models_text}
 
-Leave the model unset (do not write `model` anywhere) unless a phase clearly needs a stronger or a
-cheaper model than the default; then set it for that phase only, in a `phasewise` block.
+Choose the model and the effort of every phase yourself, and write them in that phase's `phasewise`
+block, so the person reviewing the plan sees the choice. The aim is the cheapest model and the lowest
+effort that will do the phase reliably:
+
+- Mechanical or well-specified work (renames, boilerplate, documentation, formatting, a change the
+  instructions spell out file by file): the fastest, cheapest model and a low effort.
+- Ordinary implementation and tests inside code the instructions describe: a capable mid-range model
+  and a medium effort.
+- Work that needs design or deep reasoning (architecture, concurrency, security, data migrations,
+  a bug whose cause is unknown, changes that touch many modules): the strongest model and a high effort.
+
+Use only model names from the list above, and only efforts that the chosen model supports when the list
+shows them. Do not set `model` or `effort` in the front matter (it would apply to every phase); use
+the `phasewise` block of each phase. A phase for which the agent's own default is the right choice may
+leave the block out.
 
 ## Output protocol
 
@@ -447,8 +478,48 @@ Do the second thing.
         assert!(p.contains("agent = \"codex\""));
         assert!(p.contains("- opus: Complex reasoning"));
         assert!(!p.contains("could not be read"));
+        assert!(p.contains("Choose the model and the effort of every phase yourself"));
         let p = plan_prompt("x", AgentKind::Claude, None);
         assert!(p.contains("could not be read; any model name accepted by the agent's CLI works"));
+    }
+
+    #[test]
+    fn plan_prompt_shows_the_efforts_of_each_model() {
+        let models = vec![
+            ModelInfo {
+                id: "a".into(),
+                name: "a".into(),
+                description: "Fast".into(),
+                efforts: vec!["low".into(), "high".into()],
+            },
+            ModelInfo {
+                id: "b".into(),
+                name: "b".into(),
+                description: String::new(),
+                efforts: Vec::new(),
+            },
+        ];
+        let p = plan_prompt("x", AgentKind::Codex, Some(&models));
+        assert!(p.contains("\n- a: Fast (efforts: low, high)\n"), "{p}");
+        assert!(p.contains("\n- b\n"), "{p}");
+    }
+
+    #[test]
+    fn plan_prompt_example_shows_the_model_choice() {
+        let model = |id: &str| ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            description: String::new(),
+            efforts: Vec::new(),
+        };
+        let models = vec![model("big"), model("mid"), model("small")];
+        let p = plan_prompt("x", AgentKind::Claude, Some(&models));
+        assert!(p.contains("```phasewise\nmodel = \"small\"\neffort = \"low\"\n```"));
+        assert!(p.contains("```phasewise\nmodel = \"big\"\neffort = \"high\"\n```"));
+        // Without a list the example names no model.
+        let p = plan_prompt("x", AgentKind::Claude, None);
+        assert!(p.contains("```phasewise\neffort = \"low\"\n```"));
+        assert!(!p.contains("model = \""));
     }
 
     #[test]
