@@ -10,7 +10,6 @@
 <p align="center">
   <a href="#quick-start"><b>Quick start</b></a> ·
   <a href="docs/user-guide.md">User guide</a> ·
-  <a href="docs/plan-format.md">Plan format</a> ·
   <a href="SECURITY.md">Security</a>
 </p>
 
