@@ -6,8 +6,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use super::app::{App, HELP_KEYS, Mode, Tab};
+use super::app::{App, Mode, Tab};
 use super::data::{DiffView, LogLine};
+use super::shared::{Level, Notice, ShortcutGroups, item};
 use crate::display::{EventLine, status_label};
 use crate::state::PhaseStatus;
 use crate::style::Role;
@@ -354,63 +355,149 @@ fn diff_line(line: &str) -> Line<'static> {
 }
 
 fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
+    let mut keys = app.footer();
+    if app.mode == Mode::Normal {
+        keys.push(item("?", "shortcuts"));
+    }
+    // The message comes first so that a narrow terminal cuts the footer.
     let mut spans = Vec::new();
-    for (key, what) in app.available_keys() {
-        spans.push(Span::styled(key, role_style(Role::Heading)));
-        spans.push(Span::styled(format!(" {what}  "), role_style(Role::Dim)));
+    if let Some(notice) = &app.message {
+        spans.push(notice_span(notice));
+        spans.push(Span::raw("  "));
     }
-    if let Some(message) = &app.message {
-        spans.push(Span::styled(
-            message.clone(),
-            Style::new().fg(Color::Yellow),
-        ));
-    }
+    spans.extend(footer_spans(&keys));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// `key action` pairs for a footer line.
+pub(super) fn footer_spans(keys: &[(String, String)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (key, what) in keys {
+        spans.push(Span::styled(key.clone(), role_style(Role::Heading)));
+        spans.push(Span::styled(format!(" {what}  "), role_style(Role::Dim)));
+    }
+    spans
+}
+
+/// A message with its glyph, in the colour of its level.
+pub(super) fn notice_span(notice: &Notice) -> Span<'static> {
+    let (glyph, role) = match notice.level {
+        Level::Ok => ("✓ ", Role::Ok),
+        Level::Warn => ("! ", Role::Warn),
+        Level::Error => ("✗ ", Role::Fail),
+        Level::Info => ("", Role::Default),
+    };
+    Span::styled(format!("{glyph}{}", notice.text), role_style(role))
+}
+
+/// Body of a two-row confirmation: description, blank, then the rows with
+/// the highlighted one marked.
+pub(super) fn confirm_body(
+    description: &str,
+    action: &str,
+    cancel: &str,
+    row: usize,
+) -> Vec<Line<'static>> {
+    let mark = |n: usize, label: &str| {
+        let (pointer, style) = if row == n - 1 {
+            ("❯", role_style(Role::Accent).add_modifier(Modifier::BOLD))
+        } else {
+            (" ", Style::new())
+        };
+        Line::from(vec![
+            Span::styled(pointer, role_style(Role::Accent)),
+            Span::styled(format!(" {n}. {label}"), style),
+        ])
+    };
+    let mut lines = Vec::new();
+    if !description.is_empty() {
+        lines.push(Line::raw(description.to_string()));
+        lines.push(Line::raw(""));
+    }
+    lines.push(mark(1, action));
+    lines.push(mark(2, cancel));
+    lines
+}
+
+/// Body of the shortcuts popup: the groups with their keys.
+pub(super) fn shortcut_lines(groups: &ShortcutGroups) -> Vec<Line<'static>> {
+    let width = groups
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|(key, _)| key.chars().count()))
+        .max()
+        .unwrap_or(0);
+    let mut lines = Vec::new();
+    for (i, (group, rows)) in groups.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::styled(group.to_string(), role_style(Role::Heading)));
+        for (key, what) in rows {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{key:<width$}"), role_style(Role::Accent)),
+                Span::raw(format!("  {what}")),
+            ]));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "Press any key to close.",
+        role_style(Role::Dim),
+    ));
+    lines
+}
+
 fn draw_popup(frame: &mut Frame, app: &App, area: Rect) {
-    let (title, body): (&str, Vec<Line>) = match &app.mode {
+    let view = &app.view;
+    let (title, body): (String, Vec<Line>) = match &app.mode {
         Mode::Normal => return,
-        Mode::ConfirmRollback(n) => (
-            " Rollback ",
-            vec![
-                Line::raw(format!("Roll back to the checkpoint of phase {n}?")),
-                Line::raw("Later phases are reset and their changes discarded."),
-                Line::raw(""),
-                Line::raw("y: confirm   any other key: cancel"),
-            ],
+        Mode::ConfirmRollback(n, row) => (
+            if *n == 0 {
+                "Roll back to the start?".to_string()
+            } else {
+                format!("Roll back to phase {n}?")
+            },
+            confirm_body(
+                "Later phases are reset and their changes discarded.",
+                "Roll back",
+                "Cancel",
+                *row,
+            ),
         ),
-        Mode::ConfirmInterrupt => (
-            " Interrupt ",
-            vec![
-                Line::raw("Interrupt the running phase?"),
-                Line::raw(""),
-                Line::raw("y: confirm   any other key: cancel"),
-            ],
+        Mode::ConfirmInterrupt(row) => (
+            app.running.map_or("Interrupt the phase?".to_string(), |n| {
+                format!("Interrupt phase {n}?")
+            }),
+            confirm_body("", "Interrupt", "Keep running", *row),
         ),
-        Mode::ConfirmQuit => (
-            " Quit ",
-            vec![
-                Line::raw("A phase is running. Interrupt it and quit?"),
-                Line::raw(""),
-                Line::raw("y: confirm   any other key: cancel"),
-            ],
+        Mode::ConfirmQuit(row) => (
+            "Quit phasewise?".to_string(),
+            confirm_body(
+                if app.running.is_some() {
+                    "The running phase is interrupted."
+                } else {
+                    "The plan being written is discarded."
+                },
+                "Quit",
+                "Keep working",
+                *row,
+            ),
         ),
-        Mode::Help => (
-            " Keys ",
-            HELP_KEYS
-                .iter()
-                .map(|(key, what)| {
-                    Line::from(vec![
-                        Span::styled(format!("{key:<12}"), role_style(Role::Heading)),
-                        Span::raw(*what),
-                    ])
-                })
-                .chain([Line::raw(""), Line::raw("Press any key to close.")])
-                .collect(),
+        Mode::ConfirmAbandon(row) => (
+            format!("Abandon run {}?", view.run_id),
+            confirm_body(
+                &format!(
+                    "The run stops for good. Uncommitted changes are saved in a commit on {}, which is kept, and the repository goes back to {}.",
+                    view.run_branch, view.original_branch
+                ),
+                "Abandon it",
+                "Cancel",
+                *row,
+            ),
         ),
+        Mode::Help => ("Shortcuts".to_string(), shortcut_lines(&App::shortcuts())),
         Mode::Note(buffer) => (
-            " Retry ",
+            "Retry".to_string(),
             vec![
                 Line::raw("Note for the agent (optional):"),
                 Line::raw(format!("> {buffer}_")),
@@ -419,7 +506,7 @@ fn draw_popup(frame: &mut Frame, app: &App, area: Rect) {
             ],
         ),
     };
-    render_popup(frame, area, title, body, POPUP_WIDTH);
+    render_popup(frame, area, &format!(" {title} "), body, POPUP_WIDTH);
 }
 
 /// Rows a line takes when wrapped at `width` columns (greedy, by words).
@@ -649,9 +736,33 @@ mod tests {
     fn rollback_confirmation_popup() {
         let mut app = app();
         with_diff(&mut app);
-        app.mode = Mode::ConfirmRollback(2);
+        app.mode = Mode::ConfirmRollback(2, 0);
         let terminal = render(&mut app, 100, 30);
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn abandon_confirmation_names_the_branches_and_marks_the_row() {
+        let mut app = app();
+        app.mode = Mode::ConfirmAbandon(1);
+        let text = format!("{}", render(&mut app, 100, 30).backend());
+        assert!(text.contains("Abandon run 20260101-120000?"), "{text}");
+        assert!(text.contains("goes back to main"), "{text}");
+        assert!(text.contains("❯ 2. Cancel"), "{text}");
+    }
+
+    #[test]
+    fn footer_and_notice_are_drawn_on_the_last_row() {
+        let mut app = app();
+        app.message = Some(Notice::warn("Interrupt the running phase first (x)."));
+        let text = format!("{}", render(&mut app, 100, 30).backend());
+        assert!(
+            text.contains("! Interrupt the running phase first (x).  n approve  r retry"),
+            "{text}"
+        );
+        app.message = None;
+        let text = format!("{}", render(&mut app, 100, 30).backend());
+        assert!(text.contains("esc home  q quit  ? shortcuts"), "{text}");
     }
 
     #[test]

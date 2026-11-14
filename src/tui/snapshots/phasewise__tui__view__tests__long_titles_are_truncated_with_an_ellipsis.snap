@@ -21,4 +21,4 @@ expression: terminal.backend()
 "│                      ││                                                      │"
 "│                      ││                                                      │"
 "└──────────────────────┘└──────────────────────────────────────────────────────┘"
-"j/k phase  Tab tab  PgUp/PgDn scroll  r retry  b rollback  ? help  q quit       "
+"n approve  r retry  b roll back  tab view  esc home  q quit  ? shortcuts        "

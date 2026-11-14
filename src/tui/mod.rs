@@ -4,6 +4,7 @@ pub mod app;
 pub mod data;
 pub mod home;
 mod home_view;
+pub mod shared;
 pub mod view;
 
 use std::io::IsTerminal;
@@ -18,24 +19,30 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 
 use crate::agent::{ModelInfo, agent_for};
 use crate::display::{failure_kind_label, first_line_short, plan_event_line, plan_header};
 use crate::engine::EngineEvent;
-use crate::ops::{self, NextOutcome, PlanEvent, PlanOutcome, PlanRequest, Run};
-use crate::plan::{self, AgentKind};
+use crate::ops::{
+    self, AbortOutcome, NextOutcome, Overrides, PlanEvent, PlanOutcome, PlanRequest, Run,
+};
+use crate::plan::AgentKind;
 use crate::process;
-use crate::state::{PhaseStatus, RunState};
+use crate::state::{PhaseStatus, RunState, RunStatus};
 use crate::style::Styler;
 use app::{App, Command, Tab};
-use home::{Home, HomeCommand, PlanLaunch, Probe};
+use data::HomeData;
+use home::{Home, HomeCommand, Mode as HomeMode, PlanLaunch, Probe};
+use shared::{Notice, spinner_frame};
 
 const NO_RUN: &str = "No run yet. Start one with `phasewise run`.";
 const NEEDS_TERMINAL: &str = "phasewise review needs an interactive terminal. Run it from a terminal, or use `phasewise status` and `phasewise diff`.";
 const NEEDS_TERMINAL_HOME: &str = "phasewise needs an interactive terminal for its home screen. Run it from a terminal, or use `phasewise --help` to see the commands.";
 const POLL: Duration = Duration::from_millis(100);
 const REFRESH_EVERY: Duration = Duration::from_millis(250);
+/// How often the home screen reloads its data by itself.
+const HOME_RELOAD_EVERY: Duration = Duration::from_secs(2);
 /// How long the TUI loop may go without a turn, while a signal is pending or
 /// the parent process has ended, before the watchdog ends phasewise.
 const STUCK_AFTER: Duration = Duration::from_secs(30);
@@ -118,6 +125,8 @@ struct Worker {
     events: Receiver<EngineEvent>,
 }
 
+/// The run screen: the review state, its worker, channel and caches. It
+/// lives on while the home screen is shown.
 struct Tui<'a> {
     cwd: &'a Path,
     app: App,
@@ -126,14 +135,16 @@ struct Tui<'a> {
     worker: Option<Worker>,
     last_refresh: Instant,
     refresh_pending: bool,
-    quitting: bool,
-    /// Set by SIGINT/SIGTERM/SIGHUP (the first one acts like a confirmed quit).
-    signalled: Arc<AtomicBool>,
-    /// A closed terminal acts like a signal (see `ParentWatch`).
-    parent: process::ParentWatch,
     /// Something changed since the last draw. Drawing only then keeps an idle
     /// TUI silent (no output every poll).
     dirty: bool,
+}
+
+/// Which screen is visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Screen {
+    Home,
+    Run,
 }
 
 /// Opens the review TUI. Refuses without a run or without a terminal.
@@ -146,61 +157,44 @@ pub fn run(cwd: &Path) -> Result<ExitCode> {
         eprintln!("{NEEDS_TERMINAL}");
         return Ok(ExitCode::from(1));
     }
-    let signalled = process::install_signal_handler(None)?;
-    start_hangup_watchdog(Arc::clone(&signalled));
-    let mut tui = Tui::new(cwd, run, signalled);
-    tui.load_caches();
-    let mut terminal = ratatui::try_init()?;
-    let _guard = TerminalGuard;
-    run_review(&mut tui, &mut terminal)?;
-    Ok(ExitCode::SUCCESS)
+    let data = data::load_home(cwd)?;
+    launch(cwd, data, Some(run), Screen::Run)
 }
 
-/// The review loop; on an error it stops the agent and waits for it first.
-fn run_review(tui: &mut Tui, terminal: &mut DefaultTerminal) -> Result<()> {
-    if let Err(err) = tui.event_loop(terminal) {
-        // Stop the agent and wait for it before reporting the error.
-        tui.interrupt();
-        if let Some(worker) = tui.worker.take() {
-            let _ = join_beating(worker.handle);
-        }
-        return Err(err);
-    }
-    Ok(())
-}
-
-/// Opens the home screen (no active run, inside a git repository). Starting a
-/// run from it switches to the review screen in the same terminal session.
+/// Opens the TUI inside a git repository: on the run screen when the current
+/// run is active, else on the home screen.
 pub fn run_home(cwd: &Path) -> Result<ExitCode> {
     if !std::io::stdout().is_terminal() {
         eprintln!("{NEEDS_TERMINAL_HOME}");
         return Ok(ExitCode::from(1));
     }
     let data = data::load_home(cwd)?;
+    // A run that cannot be read must not keep the home screen from opening.
+    let run = ops::load_current(cwd).ok().flatten();
+    let screen = if run
+        .as_ref()
+        .is_some_and(|run| run.state.status == RunStatus::Active)
+    {
+        Screen::Run
+    } else {
+        Screen::Home
+    };
+    launch(cwd, data, run, screen)
+}
+
+/// Sets the terminal up and runs the one loop; on an error it stops every
+/// worker and waits for them before reporting it.
+fn launch(cwd: &Path, data: HomeData, run: Option<Run>, screen: Screen) -> Result<ExitCode> {
     let signalled = process::install_signal_handler(None)?;
     start_hangup_watchdog(Arc::clone(&signalled));
-    let mut home_tui = HomeTui::new(cwd, Home::new(data), Arc::clone(&signalled));
-    home_tui.spawn_probes();
+    let mut ui = Ui::new(cwd, Home::new(data), run, screen, signalled);
+    ui.home.spawn_probes();
     let mut terminal = ratatui::try_init()?;
     let _guard = TerminalGuard;
-    let started = match home_tui.event_loop(&mut terminal) {
-        Ok(started) => started,
-        Err(err) => {
-            home_tui.interrupt();
-            if let Some(worker) = home_tui.worker.take() {
-                let _ = join_beating(worker.handle);
-            }
-            return Err(err);
-        }
-    };
-    let Some(run) = started else {
-        return Ok(ExitCode::SUCCESS);
-    };
-    // The same worker as review's `n`, running the phases of the new run.
-    let mut tui = Tui::new(cwd, run, signalled);
-    tui.spawn(|run, tx, cancel| ops::execute(run, false, tx, cancel).map(NextOutcome::Ran));
-    tui.load_caches();
-    run_review(&mut tui, &mut terminal)?;
+    if let Err(err) = ui.event_loop(&mut terminal) {
+        ui.stop_all();
+        return Err(err);
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -208,6 +202,8 @@ pub fn run_home(cwd: &Path) -> Result<ExitCode> {
 enum Background {
     Version(AgentKind, Probe),
     Models(AgentKind, Result<Vec<ModelInfo>, String>),
+    /// The plan commit ended: the short SHA, or git's error.
+    Committed(Result<String, String>),
 }
 
 /// The planning running in its own thread.
@@ -218,23 +214,25 @@ struct PlanWorker {
     started: Instant,
 }
 
+/// The home screen: its state, the planning worker and the background
+/// channel. It always exists.
 struct HomeTui<'a> {
     cwd: &'a Path,
     home: Home,
     worker: Option<PlanWorker>,
     background: Receiver<Background>,
     background_tx: mpsc::Sender<Background>,
-    quitting: bool,
-    signalled: Arc<AtomicBool>,
-    /// A closed terminal acts like a signal (see `ParentWatch`).
-    parent: process::ParentWatch,
+    /// The commit thread, while it runs.
+    commit: Option<JoinHandle<()>>,
+    /// Start the run with these choices when the commit succeeds.
+    then_start: Option<(AgentKind, Overrides)>,
     dirty: bool,
-    /// Set when a run was started: the loop ends and review takes over.
+    /// Set when a run was started: the loop shows the run screen.
     started: Option<Run>,
 }
 
 impl<'a> HomeTui<'a> {
-    fn new(cwd: &'a Path, home: Home, signalled: Arc<AtomicBool>) -> HomeTui<'a> {
+    fn new(cwd: &'a Path, home: Home) -> HomeTui<'a> {
         let (background_tx, background) = mpsc::channel();
         HomeTui {
             cwd,
@@ -242,9 +240,8 @@ impl<'a> HomeTui<'a> {
             worker: None,
             background,
             background_tx,
-            quitting: false,
-            signalled,
-            parent: process::ParentWatch::new(),
+            commit: None,
+            then_start: None,
             dirty: true,
             started: None,
         }
@@ -275,70 +272,46 @@ impl<'a> HomeTui<'a> {
         });
     }
 
-    /// Runs until the user quits (`None`) or starts a run (`Some`).
-    fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<Option<Run>> {
-        loop {
-            beat();
-            if let Some(run) = self.started.take() {
-                return Ok(Some(run));
-            }
-            if self.dirty {
-                terminal.draw(|frame| home_view::draw(frame, &self.home))?;
-                self.dirty = false;
-            }
-            if !self.quitting
-                && (self.signalled.load(Ordering::SeqCst) || self.parent.parent_gone())
-            {
-                self.execute(HomeCommand::Quit);
-                self.dirty = true;
-            }
-            if self.quitting && self.worker.is_none() {
-                return Ok(None);
-            }
-            if event::poll(POLL)? {
-                self.dirty = true;
-                if let Event::Key(key) = event::read()?
-                    && key.kind != KeyEventKind::Release
-                    && !self.quitting
-                    && let Some(command) = self.home.handle_key(key)
-                {
-                    self.execute(command);
-                }
-            }
-            self.drain_background();
-            self.drain_plan_events();
-            self.finish_worker();
+    /// Commits the plan file in its own thread (hooks may be slow).
+    fn spawn_commit(&mut self, then_start: Option<(AgentKind, Overrides)>) {
+        if self.commit.is_some() {
+            return;
         }
+        let tx = self.background_tx.clone();
+        let cwd: PathBuf = self.cwd.to_path_buf();
+        let path = self.home.data.plan_path.clone();
+        self.commit = Some(thread::spawn(move || {
+            let result = ops::commit_plan(&cwd, &path).map_err(|err| format!("{err:#}"));
+            let _ = tx.send(Background::Committed(result));
+        }));
+        self.then_start = then_start;
+        self.home.begin_commit();
     }
 
+    /// Runs a command of the home screen; quitting and opening the run
+    /// screen belong to the loop.
     fn execute(&mut self, command: HomeCommand) {
         match command {
-            HomeCommand::Quit => {
-                if self.worker.is_some() {
-                    self.interrupt();
-                    self.home.message = Some(
-                        "Interrupting… phasewise will exit when the agent has stopped".to_string(),
-                    );
-                }
-                self.quitting = true;
-            }
-            HomeCommand::Reload => {
-                if self.reload() {
-                    self.home.message = Some("Plan checked again.".to_string());
-                }
-            }
-            HomeCommand::Start { agent, overrides } => {
-                match ops::start(self.cwd, &self.home.data.plan_path, Some(agent), &overrides) {
-                    Ok(run) => self.started = Some(run),
-                    Err(err) => self.home.show_start_error(&err),
-                }
+            HomeCommand::Quit | HomeCommand::OpenRun => {}
+            HomeCommand::Start { agent, overrides } => self.start_run(agent, &overrides),
+            HomeCommand::Commit => self.spawn_commit(None),
+            HomeCommand::CommitAndStart { agent, overrides } => {
+                self.spawn_commit(Some((agent, overrides)));
             }
             HomeCommand::Plan(launch) => self.start_planning(launch),
             HomeCommand::CancelPlan => {
                 self.interrupt();
-                self.home.message = Some("Cancelling the planning…".to_string());
+                self.home.message = Some(Notice::info("Stopping the planning…"));
             }
             HomeCommand::LoadModels(kind) => self.spawn_models(kind),
+        }
+        self.dirty = true;
+    }
+
+    fn start_run(&mut self, agent: AgentKind, overrides: &Overrides) {
+        match ops::start(self.cwd, &self.home.data.plan_path, Some(agent), overrides) {
+            Ok(run) => self.started = Some(run),
+            Err(err) => self.home.show_start_error(&err),
         }
     }
 
@@ -355,11 +328,11 @@ impl<'a> HomeTui<'a> {
         // The file did not exist when the screen was loaded: ask again rather
         // than fail with the CLI's `--force` advice.
         if !launch.force && self.home.data.plan_path.exists() {
-            self.reload();
-            self.home.message = Some(format!(
-                "{} was created meanwhile. Press p again to replace it, or c to check it.",
-                plan::DEFAULT_PLAN_FILE
-            ));
+            self.reload(false);
+            self.home.message = Some(Notice::warn(format!(
+                "{} was created meanwhile. Press p again to replace it.",
+                self.home.plan_name()
+            )));
             return;
         }
         let timeout = match ops::plan_timeout() {
@@ -392,13 +365,29 @@ impl<'a> HomeTui<'a> {
         self.home.begin_planning();
     }
 
-    fn drain_background(&mut self) {
+    fn drain_background(&mut self, quitting: bool) {
         while let Ok(message) = self.background.try_recv() {
             match message {
                 Background::Version(kind, probe) => self.home.set_probe(kind, probe),
                 Background::Models(kind, result) => self.home.set_models(kind, result),
+                Background::Committed(result) => self.commit_done(&result, quitting),
             }
             self.dirty = true;
+        }
+    }
+
+    fn commit_done(&mut self, result: &Result<String, String>, quitting: bool) {
+        if let Some(handle) = self.commit.take() {
+            // The thread has sent its result; it ends at once.
+            let _ = handle.join();
+        }
+        let ok = self.home.commit_finished(result);
+        self.reload(false);
+        if let Some((agent, overrides)) = self.then_start.take()
+            && ok
+            && !quitting
+        {
+            self.start_run(agent, &overrides);
         }
     }
 
@@ -428,7 +417,7 @@ impl<'a> HomeTui<'a> {
     }
 
     /// When the planning has ended: joins it, reloads the plan and reports.
-    fn finish_worker(&mut self) {
+    fn finish_worker(&mut self, quitting: bool) {
         if !self.worker.as_ref().is_some_and(|w| w.handle.is_finished()) {
             return;
         }
@@ -445,32 +434,321 @@ impl<'a> HomeTui<'a> {
         self.dirty = true;
         // A failed reload leaves an error message; the report of the planning
         // keeps priority when it has a message of its own.
-        self.reload();
-        if self.quitting {
+        self.reload(false);
+        if quitting {
             return;
         }
         let report = home::plan_report(&result, &self.home.data.root);
         self.home.plan_finished(report);
     }
 
-    /// Loads the home data again, keeping the user's choices. False on error.
-    fn reload(&mut self) -> bool {
-        self.dirty = true;
+    /// Loads the home data again, keeping the user's choices. A quiet reload
+    /// (the periodic one) reports nothing on failure and redraws only when
+    /// the data changed. False on error.
+    fn reload(&mut self, quiet: bool) -> bool {
         match data::load_home(self.cwd) {
             Ok(data) => {
-                self.home.set_data(data);
+                if self.home.set_data(data) || !quiet {
+                    self.dirty = true;
+                }
                 true
             }
             Err(err) => {
-                self.home.message = Some(format!("Error: {err}"));
+                if !quiet {
+                    self.home.message = Some(Notice::error(format!("Error: {err}")));
+                    self.dirty = true;
+                }
                 false
             }
         }
     }
 }
 
+/// The two screens and the one loop that drives them.
+struct Ui<'a> {
+    cwd: &'a Path,
+    screen: Screen,
+    home: HomeTui<'a>,
+    /// The state of the current run, when the repository has one.
+    run: Option<Tui<'a>>,
+    quitting: bool,
+    /// Set by SIGINT/SIGTERM/SIGHUP (the first one acts like a confirmed quit).
+    signalled: Arc<AtomicBool>,
+    /// A closed terminal acts like a signal (see `ParentWatch`).
+    parent: process::ParentWatch,
+    /// Clock of the spinner.
+    clock: Instant,
+    last_frame: usize,
+    next_reload: Instant,
+}
+
+impl<'a> Ui<'a> {
+    fn new(
+        cwd: &'a Path,
+        home: Home,
+        run: Option<Run>,
+        screen: Screen,
+        signalled: Arc<AtomicBool>,
+    ) -> Ui<'a> {
+        let run = run.map(|run| {
+            let mut tui = Tui::new(cwd, run);
+            tui.load_caches();
+            tui
+        });
+        Ui {
+            cwd,
+            screen,
+            home: HomeTui::new(cwd, home),
+            run,
+            quitting: false,
+            signalled,
+            parent: process::ParentWatch::new(),
+            clock: Instant::now(),
+            last_frame: 0,
+            next_reload: Instant::now() + HOME_RELOAD_EVERY,
+        }
+    }
+
+    fn any_worker(&self) -> bool {
+        self.home.worker.is_some()
+            || self.home.commit.is_some()
+            || self.run.as_ref().is_some_and(|t| t.worker.is_some())
+    }
+
+    fn visible_dirty(&self) -> bool {
+        match self.screen {
+            Screen::Home => self.home.dirty,
+            Screen::Run => self.run.as_ref().is_some_and(|t| t.dirty),
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        match self.screen {
+            Screen::Home => self.home.dirty = true,
+            Screen::Run => {
+                if let Some(tui) = &mut self.run {
+                    tui.dirty = true;
+                }
+            }
+        }
+    }
+
+    fn animating(&self) -> bool {
+        match self.screen {
+            Screen::Home => self.home.home.animating(),
+            Screen::Run => self.run.as_ref().is_some_and(|t| t.app.animating()),
+        }
+    }
+
+    /// Tells each screen what the other one is doing and moves the spinner.
+    fn tick(&mut self) {
+        let busy = self.run.as_ref().is_some_and(|t| t.worker.is_some());
+        let planning = self.home.worker.is_some();
+        self.home.home.run_busy = busy;
+        let frame = spinner_frame(self.clock.elapsed());
+        self.home.home.frame = frame;
+        if let Some(tui) = &mut self.run {
+            tui.app.planning_busy = planning;
+            tui.app.frame = frame;
+        }
+        if frame != self.last_frame {
+            self.last_frame = frame;
+            if self.animating() {
+                self.mark_dirty();
+            }
+        }
+    }
+
+    fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        loop {
+            beat();
+            self.tick();
+            if self.visible_dirty() {
+                match (self.screen, &mut self.run) {
+                    (Screen::Run, Some(tui)) => {
+                        terminal.draw(|frame| view::draw(frame, &mut tui.app))?;
+                        tui.dirty = false;
+                    }
+                    _ => {
+                        terminal.draw(|frame| home_view::draw(frame, &self.home.home))?;
+                        self.home.dirty = false;
+                    }
+                }
+            }
+            if !self.quitting
+                && (self.signalled.load(Ordering::SeqCst) || self.parent.parent_gone())
+            {
+                self.quit_now();
+                self.mark_dirty();
+            }
+            if self.quitting && !self.any_worker() {
+                return Ok(());
+            }
+            if event::poll(POLL)? {
+                // Any key or resize may change what is shown.
+                self.mark_dirty();
+                // A resize needs nothing more than the redraw of the next turn.
+                if let Event::Key(key) = event::read()?
+                    && key.kind != KeyEventKind::Release
+                    // While quitting only drawing continues; keys are ignored.
+                    && !self.quitting
+                {
+                    self.on_key(key);
+                }
+            }
+            self.pump();
+        }
+    }
+
+    /// The background work of every turn, whatever the screen.
+    fn pump(&mut self) {
+        if self.screen == Screen::Run && self.run.is_none() {
+            self.screen = Screen::Home;
+            self.home.dirty = true;
+        }
+        self.home.drain_background(self.quitting);
+        self.home.drain_plan_events();
+        self.home.finish_worker(self.quitting);
+        if let Some(tui) = &mut self.run {
+            tui.drain_events();
+            tui.finish_worker();
+            if tui.refresh_pending && tui.last_refresh.elapsed() >= REFRESH_EVERY {
+                tui.refresh();
+            }
+        }
+        if let Some(run) = self.home.started.take() {
+            self.begin_run(run);
+        }
+        self.auto_reload();
+    }
+
+    /// While the home screen is shown and idle, the data reloads by itself.
+    fn auto_reload(&mut self) {
+        if self.screen != Screen::Home
+            || self.home.home.mode != HomeMode::Normal
+            || self.home.commit.is_some()
+            || Instant::now() < self.next_reload
+        {
+            return;
+        }
+        self.next_reload = Instant::now() + HOME_RELOAD_EVERY;
+        self.home.reload(true);
+    }
+
+    fn on_key(&mut self, key: KeyEvent) {
+        match self.screen {
+            Screen::Home => {
+                if let Some(command) = self.home.home.handle_key(key) {
+                    match command {
+                        HomeCommand::Quit => self.quit_now(),
+                        HomeCommand::OpenRun => self.open_run(),
+                        other => self.home.execute(other),
+                    }
+                }
+            }
+            Screen::Run => {
+                let Some(tui) = &mut self.run else {
+                    self.screen = Screen::Home;
+                    return;
+                };
+                if let Some(command) = tui.app.handle_key(key) {
+                    match command {
+                        Command::Quit => self.quit_now(),
+                        Command::Home => self.go_home(),
+                        other => tui.execute(other),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Interrupts every worker; the loop ends when they have stopped.
+    fn quit_now(&mut self) {
+        self.home.interrupt();
+        if let Some(tui) = &self.run {
+            tui.interrupt();
+        }
+        if self.any_worker() {
+            let notice = Notice::info("Stopping… phasewise exits when the work has stopped.");
+            self.home.home.message = Some(notice.clone());
+            if let Some(tui) = &mut self.run {
+                tui.app.message = Some(notice);
+            }
+        }
+        self.quitting = true;
+    }
+
+    /// After an error: stops every worker and waits for them.
+    fn stop_all(&mut self) {
+        self.home.interrupt();
+        if let Some(worker) = self.home.worker.take() {
+            let _ = join_beating(worker.handle);
+        }
+        if let Some(handle) = self.home.commit.take() {
+            let _ = join_beating(handle);
+        }
+        if let Some(tui) = &mut self.run {
+            tui.interrupt();
+            if let Some(worker) = tui.worker.take() {
+                let _ = join_beating(worker.handle);
+            }
+        }
+    }
+
+    /// Run screen to home screen: the data reloads on arrival.
+    fn go_home(&mut self) {
+        self.screen = Screen::Home;
+        self.home.reload(false);
+        self.home.dirty = true;
+        self.next_reload = Instant::now() + HOME_RELOAD_EVERY;
+    }
+
+    /// Home screen to run screen for the current run (active or finished).
+    fn open_run(&mut self) {
+        let run = match ops::load_current(self.cwd) {
+            Ok(Some(run)) => run,
+            Ok(None) => {
+                self.home.home.message = Some(Notice::error(NO_RUN));
+                return;
+            }
+            Err(err) => {
+                self.home.home.message = Some(Notice::error(format!("Error: {err}")));
+                return;
+            }
+        };
+        match &mut self.run {
+            Some(tui) if tui.run.state.run_id == run.state.run_id => tui.refresh(),
+            // A worker belongs to its run: only an idle state is replaced.
+            Some(tui) if tui.worker.is_some() => {}
+            _ => {
+                let mut tui = Tui::new(self.cwd, run);
+                tui.load_caches();
+                self.run = Some(tui);
+            }
+        }
+        self.show_run();
+    }
+
+    /// A run was started from the home screen: its phases start running.
+    fn begin_run(&mut self, run: Run) {
+        let mut tui = Tui::new(self.cwd, run);
+        tui.spawn(|run, tx, cancel| ops::execute(run, false, tx, cancel).map(NextOutcome::Ran));
+        tui.load_caches();
+        self.run = Some(tui);
+        self.home.reload(true);
+        self.show_run();
+    }
+
+    fn show_run(&mut self) {
+        self.screen = Screen::Run;
+        if let Some(tui) = &mut self.run {
+            tui.dirty = true;
+        }
+    }
+}
+
 impl<'a> Tui<'a> {
-    fn new(cwd: &'a Path, run: Run, signalled: Arc<AtomicBool>) -> Tui<'a> {
+    fn new(cwd: &'a Path, run: Run) -> Tui<'a> {
         Tui {
             cwd,
             app: App::new(data::load_run_view(&run)),
@@ -478,73 +756,24 @@ impl<'a> Tui<'a> {
             worker: None,
             last_refresh: Instant::now(),
             refresh_pending: false,
-            quitting: false,
-            signalled,
-            parent: process::ParentWatch::new(),
             dirty: true,
         }
     }
 }
 
 impl Tui<'_> {
-    fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        loop {
-            beat();
-            if self.dirty {
-                terminal.draw(|frame| view::draw(frame, &mut self.app))?;
-                self.dirty = false;
-            }
-            if !self.quitting
-                && (self.signalled.load(Ordering::SeqCst) || self.parent.parent_gone())
-            {
-                self.execute(Command::Quit);
-                self.dirty = true;
-            }
-            if self.quitting && self.worker.is_none() {
-                return Ok(());
-            }
-            if event::poll(POLL)? {
-                // Any key or resize may change what is shown.
-                self.dirty = true;
-                match event::read()? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        // While quitting only drawing continues; keys are ignored.
-                        if !self.quitting
-                            && let Some(command) = self.app.handle_key(key)
-                        {
-                            self.execute(command);
-                        }
-                    }
-                    // A resize needs nothing more than the redraw of the next turn.
-                    _ => {}
-                }
-            }
-            self.drain_events();
-            self.finish_worker();
-            if self.refresh_pending && self.last_refresh.elapsed() >= REFRESH_EVERY {
-                self.refresh();
-            }
-        }
-    }
-
+    /// Runs a command of the run screen; quitting and going home belong to
+    /// the loop.
     fn execute(&mut self, command: Command) {
         match command {
-            Command::Quit => {
-                if self.worker.is_some() {
-                    self.interrupt();
-                    self.app.message = Some(
-                        "Interrupting… phasewise will exit when the agent has stopped".to_string(),
-                    );
-                }
-                self.quitting = true;
-            }
+            Command::Quit | Command::Home => {}
             Command::Reload => self.refresh(),
             Command::Interrupt => {
                 self.interrupt();
-                self.app.message = Some(match self.app.running {
+                self.app.message = Some(Notice::info(match self.app.running {
                     Some(n) => format!("Interrupting phase {n}…"),
                     None => "Interrupting…".to_string(),
-                });
+                }));
             }
             Command::Next => self.spawn(|run, tx, cancel| {
                 ops::next(run, false, &ops::Overrides::default(), tx, cancel)
@@ -554,7 +783,9 @@ impl Tui<'_> {
                     .map(NextOutcome::Ran)
             }),
             Command::Rollback(k) => self.rollback(k),
+            Command::Abandon => self.abandon(),
         }
+        self.dirty = true;
     }
 
     fn interrupt(&self) {
@@ -575,11 +806,11 @@ impl Tui<'_> {
         let mut run = match ops::load_current(self.cwd) {
             Ok(Some(run)) => run,
             Ok(None) => {
-                self.app.message = Some(format!("Error: {NO_RUN}"));
+                self.app.message = Some(Notice::error(format!("Error: {NO_RUN}")));
                 return;
             }
             Err(err) => {
-                self.app.message = Some(format!("Error: {err}"));
+                self.app.message = Some(Notice::error(format!("Error: {err}")));
                 return;
             }
         };
@@ -596,9 +827,9 @@ impl Tui<'_> {
 
     fn rollback(&mut self, k: usize) {
         if self.worker.is_some() {
-            self.app.message = Some(
-                "A phase is running; wait for it to finish or press x to interrupt it.".to_string(),
-            );
+            self.app.message = Some(Notice::warn(
+                "A phase is running; wait for it to finish or press x to interrupt it.",
+            ));
             return;
         }
         let result = ops::load_current(self.cwd)
@@ -606,9 +837,25 @@ impl Tui<'_> {
             .and_then(|mut run| ops::rollback(&mut run, k, None));
         self.refresh();
         self.app.message = Some(match result {
-            Ok(()) if k == 0 => "Rolled back to the initial state.".to_string(),
-            Ok(()) => format!("Rolled back to the checkpoint of phase {k}."),
-            Err(err) => format!("Error: {err}"),
+            Ok(()) if k == 0 => Notice::ok("Rolled back to the initial state."),
+            Ok(()) => Notice::ok(format!("Rolled back to the checkpoint of phase {k}.")),
+            Err(err) => Notice::error(format!("Error: {err}")),
+        });
+    }
+
+    /// `ops::abort` is quick, so it runs right here.
+    fn abandon(&mut self) {
+        if self.worker.is_some() {
+            self.app.message = Some(Notice::warn("Interrupt the running phase first (x)."));
+            return;
+        }
+        let result = ops::load_current(self.cwd)
+            .and_then(|run| run.ok_or_else(|| anyhow!(NO_RUN)))
+            .and_then(|mut run| ops::abort(&mut run).map(|outcome| (outcome, run)));
+        self.refresh();
+        self.app.message = Some(match result {
+            Ok((outcome, run)) => abandon_notice(&outcome, &run.state),
+            Err(err) => Notice::error(format!("Error: {err}")),
         });
     }
 
@@ -650,7 +897,7 @@ impl Tui<'_> {
         });
         self.app.running = None;
         self.refresh();
-        self.app.message = Some(outcome_message(&result, &self.run.state));
+        self.app.message = Some(outcome_notice(&result, &self.run.state));
     }
 
     /// Reloads the run and the caches of the selected phase.
@@ -664,7 +911,7 @@ impl Tui<'_> {
                 self.app.set_view(data::load_run_view(&self.run));
             }
             Ok(None) => {}
-            Err(err) => self.app.message = Some(format!("Error: {err}")),
+            Err(err) => self.app.message = Some(Notice::error(format!("Error: {err}"))),
         }
         self.load_caches();
     }
@@ -695,14 +942,32 @@ fn at_log_end(scroll: u16, len: usize, page: u16) -> bool {
     usize::from(scroll) >= len.saturating_sub(usize::from(page))
 }
 
+/// The message shown when the run was abandoned.
+fn abandon_notice(outcome: &AbortOutcome, state: &RunState) -> Notice {
+    let place = if outcome.switched {
+        format!("Back on {}", outcome.current_branch)
+    } else {
+        format!("Still on {}", outcome.current_branch)
+    };
+    let saved = outcome
+        .leftovers_sha
+        .as_ref()
+        .map(|sha| format!("; uncommitted changes saved in {sha}"))
+        .unwrap_or_default();
+    Notice::ok(format!(
+        "Run abandoned. {place}; branch {} kept{saved}.",
+        state.run_branch
+    ))
+}
+
 /// The message shown when a worker ends.
-fn outcome_message(result: &Result<NextOutcome>, state: &RunState) -> String {
+fn outcome_notice(result: &Result<NextOutcome>, state: &RunState) -> Notice {
     match result {
-        Err(err) => format!("Error: {err}"),
-        Ok(NextOutcome::Completed) => format!(
+        Err(err) => Notice::error(format!("Error: {err}")),
+        Ok(NextOutcome::Completed) => Notice::ok(format!(
             "All phases done. To integrate: git switch {} && git merge --squash {} && git commit",
             state.original_branch, state.run_branch
-        ),
+        )),
         Ok(NextOutcome::Ran(PhaseStatus::Failed)) => {
             match state
                 .phases
@@ -710,15 +975,15 @@ fn outcome_message(result: &Result<NextOutcome>, state: &RunState) -> String {
                 .find(|p| p.status == PhaseStatus::Failed)
             {
                 Some(phase) => match &phase.failure {
-                    Some(failure) => format!(
+                    Some(failure) => Notice::error(format!(
                         "Phase {} failed ({}): {}",
                         phase.number,
                         failure_kind_label(failure.kind),
                         first_line_short(&failure.detail)
-                    ),
-                    None => format!("Phase {} failed.", phase.number),
+                    )),
+                    None => Notice::error(format!("Phase {} failed.", phase.number)),
                 },
-                None => "The phase failed.".to_string(),
+                None => Notice::error("The phase failed."),
             }
         }
         Ok(NextOutcome::Ran(_)) => {
@@ -728,7 +993,9 @@ fn outcome_message(result: &Result<NextOutcome>, state: &RunState) -> String {
                 .rev()
                 .find(|p| p.status == PhaseStatus::AwaitingReview)
                 .map_or(0, |p| p.number);
-            format!("Phase {number} is ready for review. Press n to approve it and continue.")
+            Notice::ok(format!(
+                "Phase {number} is ready for review. Press n to approve it and continue."
+            ))
         }
     }
 }
@@ -785,8 +1052,12 @@ mod tests {
             phase(1, PhaseStatus::Done, None),
             phase(2, PhaseStatus::AwaitingReview, None),
         ]);
-        let msg = outcome_message(&Ok(NextOutcome::Ran(PhaseStatus::AwaitingReview)), &s);
-        assert!(msg.starts_with("Phase 2 is ready for review"), "{msg}");
+        let msg = outcome_notice(&Ok(NextOutcome::Ran(PhaseStatus::AwaitingReview)), &s);
+        assert!(
+            msg.text.starts_with("Phase 2 is ready for review"),
+            "{msg:?}"
+        );
+        assert_eq!(msg.level, shared::Level::Ok);
     }
 
     #[test]
@@ -796,23 +1067,30 @@ mod tests {
             detail: "cargo test failed\nmore".into(),
         };
         let s = state(vec![phase(1, PhaseStatus::Failed, Some(failure))]);
-        let msg = outcome_message(&Ok(NextOutcome::Ran(PhaseStatus::Failed)), &s);
-        assert_eq!(msg, "Phase 1 failed (verify_failed): cargo test failed");
+        let msg = outcome_notice(&Ok(NextOutcome::Ran(PhaseStatus::Failed)), &s);
+        assert_eq!(
+            msg.text,
+            "Phase 1 failed (verify_failed): cargo test failed"
+        );
+        assert_eq!(msg.level, shared::Level::Error);
     }
 
     #[test]
     fn completed_message_has_the_merge_hint() {
         let s = state(vec![phase(1, PhaseStatus::Done, None)]);
-        let msg = outcome_message(&Ok(NextOutcome::Completed), &s);
-        assert!(msg.contains("All phases done"));
-        assert!(msg.contains("git switch main && git merge --squash phasewise/r && git commit"));
+        let msg = outcome_notice(&Ok(NextOutcome::Completed), &s);
+        assert!(msg.text.contains("All phases done"));
+        assert!(
+            msg.text
+                .contains("git switch main && git merge --squash phasewise/r && git commit")
+        );
     }
 
     #[test]
     fn error_message_is_prefixed() {
         let s = state(vec![]);
-        let msg = outcome_message(&Err(anyhow!("boom")), &s);
-        assert_eq!(msg, "Error: boom");
+        let msg = outcome_notice(&Err(anyhow!("boom")), &s);
+        assert_eq!(msg, Notice::error("Error: boom"));
     }
 
     #[test]
@@ -823,6 +1101,29 @@ mod tests {
         assert!(is_stuck(long, false, true));
         assert!(!is_stuck(long, false, false));
         assert!(!is_stuck(short, true, true));
+    }
+
+    #[test]
+    fn abandon_notice_says_where_the_repository_is() {
+        let s = state(vec![]);
+        let outcome = AbortOutcome {
+            current_branch: "main".into(),
+            switched: true,
+            leftovers_sha: Some("abc1234".into()),
+        };
+        assert_eq!(
+            abandon_notice(&outcome, &s).text,
+            "Run abandoned. Back on main; branch phasewise/r kept; uncommitted changes saved in abc1234."
+        );
+        let stayed = AbortOutcome {
+            current_branch: "other".into(),
+            switched: false,
+            leftovers_sha: None,
+        };
+        assert_eq!(
+            abandon_notice(&stayed, &s).text,
+            "Run abandoned. Still on other; branch phasewise/r kept."
+        );
     }
 
     #[test]

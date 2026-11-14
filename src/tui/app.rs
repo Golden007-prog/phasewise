@@ -3,6 +3,9 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::data::{DiffView, LogLine, RunView};
+use super::shared::{
+    Choice, FooterItem, Notice, ShortcutGroups, confirm_key, edit_text, item, picker_footer,
+};
 use crate::state::PhaseStatus;
 
 const DEFAULT_PAGE: u16 = 10;
@@ -34,31 +37,20 @@ impl Tab {
     }
 }
 
+/// Confirmation modes hold the highlighted row: 0 is the action, 1 cancels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
-    ConfirmRollback(usize),
-    ConfirmInterrupt,
-    ConfirmQuit,
+    /// Phase to roll back to, highlighted row.
+    ConfirmRollback(usize, usize),
+    ConfirmInterrupt(usize),
+    ConfirmQuit(usize),
+    ConfirmAbandon(usize),
     /// Optional note for a retry, being typed.
     Note(String),
     /// Popup listing every key.
     Help,
 }
-
-/// Every key of the review screen, for the help popup.
-pub const HELP_KEYS: [(&str, &str); 10] = [
-    ("j / Down", "next phase"),
-    ("k / Up", "previous phase"),
-    ("Tab", "switch tab (Diff, Log, Verify)"),
-    ("PgUp / PgDn", "scroll the right panel"),
-    ("n", "approve the phase and run the next one"),
-    ("r", "retry the phase, with an optional note"),
-    ("b", "roll back to the checkpoint of the phase"),
-    ("x", "interrupt the running phase"),
-    ("?", "show or hide this help"),
-    ("q / Ctrl-C", "quit"),
-];
 
 /// What the event loop must do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +60,10 @@ pub enum Command {
     Retry(Option<String>),
     Rollback(usize),
     Interrupt,
+    /// Abandon the run (`ops::abort`), already confirmed.
+    Abandon,
+    /// Go back to the home screen.
+    Home,
     /// Reload the caches of the (newly) selected phase.
     Reload,
 }
@@ -84,7 +80,11 @@ pub struct App {
     pub mode: Mode,
     /// Phase run by a worker thread, if any.
     pub running: Option<usize>,
-    pub message: Option<String>,
+    /// The home screen is planning (set by the loop, for the quit question).
+    pub planning_busy: bool,
+    /// Spinner frame, set by the loop from the elapsed time.
+    pub frame: usize,
+    pub message: Option<Notice>,
     pub diff: DiffView,
     pub log: Vec<LogLine>,
     pub verify: String,
@@ -111,6 +111,8 @@ impl App {
             page: DEFAULT_PAGE,
             mode: Mode::Normal,
             running: None,
+            planning_busy: false,
+            frame: 0,
             message: None,
             diff: DiffView::default(),
             log: Vec::new(),
@@ -141,23 +143,29 @@ impl App {
         }
         self.message = None;
         // Ctrl-C works from every popup and input: it closes it and then acts
-        // as in the main view (quit, or ask first while a phase runs).
+        // as in the main view (quit, or ask first while work runs). While the
+        // quit question is open it confirms.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if matches!(self.mode, Mode::ConfirmQuit(_)) {
+                self.mode = Mode::Normal;
+                return Some(Command::Quit);
+            }
             self.mode = Mode::Normal;
         }
         match self.mode.clone() {
             Mode::Normal => self.key_normal(key),
-            Mode::ConfirmRollback(n) => {
-                self.mode = Mode::Normal;
-                is_yes(key).then_some(Command::Rollback(n))
+            Mode::ConfirmRollback(n, row) => self.confirm(
+                key,
+                row,
+                |row| Mode::ConfirmRollback(n, row),
+                Command::Rollback(n),
+            ),
+            Mode::ConfirmInterrupt(row) => {
+                self.confirm(key, row, Mode::ConfirmInterrupt, Command::Interrupt)
             }
-            Mode::ConfirmInterrupt => {
-                self.mode = Mode::Normal;
-                is_yes(key).then_some(Command::Interrupt)
-            }
-            Mode::ConfirmQuit => {
-                self.mode = Mode::Normal;
-                is_yes(key).then_some(Command::Quit)
+            Mode::ConfirmQuit(row) => self.confirm(key, row, Mode::ConfirmQuit, Command::Quit),
+            Mode::ConfirmAbandon(row) => {
+                self.confirm(key, row, Mode::ConfirmAbandon, Command::Abandon)
             }
             Mode::Note(buffer) => self.key_note(key, buffer),
             Mode::Help => {
@@ -168,29 +176,44 @@ impl App {
         }
     }
 
+    fn confirm(
+        &mut self,
+        key: KeyEvent,
+        row: usize,
+        again: impl FnOnce(usize) -> Mode,
+        command: Command,
+    ) -> Option<Command> {
+        match confirm_key(key, row) {
+            Choice::Act => {
+                self.mode = Mode::Normal;
+                Some(command)
+            }
+            Choice::Cancel => {
+                self.mode = Mode::Normal;
+                None
+            }
+            Choice::Row(row) => {
+                self.mode = again(row);
+                None
+            }
+        }
+    }
+
     fn key_note(&mut self, key: KeyEvent, mut buffer: String) -> Option<Command> {
         match key.code {
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
                 let note = buffer.trim();
-                Some(Command::Retry((!note.is_empty()).then(|| note.to_string())))
+                return Some(Command::Retry((!note.is_empty()).then(|| note.to_string())));
             }
-            KeyCode::Esc => {
-                self.mode = Mode::Normal;
-                None
+            KeyCode::Esc => self.mode = Mode::Normal,
+            _ => {
+                if edit_text(&mut buffer, key) {
+                    self.mode = Mode::Note(buffer);
+                }
             }
-            KeyCode::Backspace => {
-                buffer.pop();
-                self.mode = Mode::Note(buffer);
-                None
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                buffer.push(c);
-                self.mode = Mode::Note(buffer);
-                None
-            }
-            _ => None,
         }
+        None
     }
 
     fn key_normal(&mut self, key: KeyEvent) -> Option<Command> {
@@ -198,6 +221,8 @@ impl App {
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit(),
             KeyCode::Char('q') => self.quit(),
+            KeyCode::Esc => Some(Command::Home),
+            KeyCode::Char('A') => self.abandon(),
             KeyCode::Char('?') => {
                 self.mode = Mode::Help;
                 None
@@ -231,14 +256,14 @@ impl App {
             KeyCode::Char('b') => match self.why_not_rollback() {
                 None => {
                     self.selected_number()
-                        .inspect(|&n| self.mode = Mode::ConfirmRollback(n));
+                        .inspect(|&n| self.mode = Mode::ConfirmRollback(n, 0));
                     None
                 }
                 Some(why) => self.refuse(why),
             },
             KeyCode::Char('x') => {
                 if self.running.is_some() {
-                    self.mode = Mode::ConfirmInterrupt;
+                    self.mode = Mode::ConfirmInterrupt(0);
                     None
                 } else {
                     self.refuse("No phase is running.".to_string())
@@ -249,13 +274,24 @@ impl App {
     }
 
     fn refuse(&mut self, why: String) -> Option<Command> {
-        self.message = Some(why);
+        self.message = Some(Notice::warn(why));
+        None
+    }
+
+    fn abandon(&mut self) -> Option<Command> {
+        if self.running.is_some() {
+            return self.refuse("Interrupt the running phase first (x).".to_string());
+        }
+        if !self.view.active {
+            return self.refuse("The run is already finished.".to_string());
+        }
+        self.mode = Mode::ConfirmAbandon(0);
         None
     }
 
     fn quit(&mut self) -> Option<Command> {
-        if self.running.is_some() {
-            self.mode = Mode::ConfirmQuit;
+        if self.running.is_some() || self.planning_busy {
+            self.mode = Mode::ConfirmQuit(0);
             None
         } else {
             Some(Command::Quit)
@@ -333,43 +369,86 @@ impl App {
         }
     }
 
-    /// Keys shown in the bottom bar for the current state.
-    pub fn available_keys(&self) -> Vec<(&'static str, &'static str)> {
+    /// True while something on this screen moves (a phase runs).
+    pub fn animating(&self) -> bool {
+        self.running.is_some()
+            || self
+                .view
+                .phases
+                .iter()
+                .any(|p| matches!(p.status, PhaseStatus::Running | PhaseStatus::Verifying))
+    }
+
+    /// Footer items for the current state, highest priority first. The `?`
+    /// item is not in the list: the renderer appends it.
+    pub fn footer(&self) -> Vec<FooterItem> {
         match self.mode {
-            Mode::ConfirmRollback(_) | Mode::ConfirmInterrupt | Mode::ConfirmQuit => {
-                return vec![("y", "confirm"), ("any other key", "cancel")];
-            }
-            Mode::Note(_) => return vec![("Enter", "retry"), ("Esc", "cancel")],
-            Mode::Help => return vec![("any key", "close")],
+            Mode::ConfirmRollback(..)
+            | Mode::ConfirmInterrupt(_)
+            | Mode::ConfirmQuit(_)
+            | Mode::ConfirmAbandon(_) => return picker_footer(2),
+            Mode::Note(_) => return vec![item("enter", "retry"), item("esc", "cancel")],
+            Mode::Help => return vec![item("any key", "close")],
             Mode::Normal => {}
         }
-        let mut keys = vec![("j/k", "phase"), ("Tab", "tab"), ("PgUp/PgDn", "scroll")];
-        if self.why_not_next().is_none() {
-            keys.push(("n", "next"));
-        }
-        if self.why_not_retry().is_none() {
-            keys.push(("r", "retry"));
-        }
-        if self.why_not_rollback().is_none() {
-            keys.push(("b", "rollback"));
-        }
+        let tail = [item("tab", "view"), item("esc", "home"), item("q", "quit")];
+        let mut keys = Vec::new();
+        let status = self.view.phases.get(self.selected).map(|p| p.status);
         if self.running.is_some() {
-            keys.push(("x", "interrupt"));
+            keys.push(item("x", "interrupt"));
+        } else if self.view.active && status == Some(PhaseStatus::AwaitingReview) {
+            keys.extend([
+                item("n", "approve"),
+                item("r", "retry"),
+                item("b", "roll back"),
+            ]);
+        } else if self.view.active && status == Some(PhaseStatus::Failed) {
+            keys.extend([item("r", "retry"), item("b", "roll back")]);
+        } else {
+            keys.push(item("j/k", "phase"));
         }
-        keys.push(("?", "help"));
-        keys.push(("q", "quit"));
+        keys.extend(tail);
         keys
     }
-}
 
-fn is_yes(key: KeyEvent) -> bool {
-    key.code == KeyCode::Char('y') && !key.modifiers.contains(KeyModifiers::CONTROL)
+    /// Every key of the screen in groups, for the `?` popup.
+    pub fn shortcuts() -> ShortcutGroups {
+        vec![
+            (
+                "Phases",
+                vec![
+                    ("j / k", "select the next or previous phase"),
+                    ("tab", "switch between Diff, Log and Verify"),
+                    ("PgUp / PgDn", "scroll the right panel"),
+                ],
+            ),
+            (
+                "Run",
+                vec![
+                    ("n", "approve the phase and run the next one"),
+                    ("r", "retry the phase, with an optional note"),
+                    ("b", "roll back to the checkpoint of the phase"),
+                    ("x", "interrupt the running phase"),
+                    ("A", "abandon the run"),
+                ],
+            ),
+            (
+                "General",
+                vec![
+                    ("esc", "back to the home screen"),
+                    ("?", "show or hide the shortcuts"),
+                    ("q / Ctrl-C", "quit"),
+                ],
+            ),
+        ]
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::data::PhaseView;
+    use crate::tui::shared::Level;
 
     fn phase(number: usize, status: PhaseStatus, checkpoint: bool) -> PhaseView {
         PhaseView {
@@ -479,20 +558,12 @@ mod tests {
             phase(2, PhaseStatus::Failed, false),
         ]);
         assert_eq!(failed.handle_key(key('n')), None);
-        assert_eq!(
-            failed.message.as_deref(),
-            Some("Phase 2 failed: press r to retry it.")
-        );
+        assert_eq!(text(&failed), Some("Phase 2 failed: press r to retry it."));
 
         let mut running = reviewing();
         running.running = Some(2);
         assert_eq!(running.handle_key(key('n')), None);
-        assert!(
-            running
-                .message
-                .as_deref()
-                .is_some_and(|m| m.contains("running"))
-        );
+        assert!(text(&running).is_some_and(|m| m.contains("running")));
 
         let mut inactive = reviewing();
         inactive.view.active = false;
@@ -566,7 +637,7 @@ mod tests {
     fn rollback_needs_a_checkpoint_and_confirmation() {
         let mut a = reviewing();
         a.handle_key(key('b'));
-        assert_eq!(a.mode, Mode::ConfirmRollback(2));
+        assert_eq!(a.mode, Mode::ConfirmRollback(2, 0));
         assert_eq!(a.handle_key(key('y')), Some(Command::Rollback(2)));
         assert_eq!(a.mode, Mode::Normal);
 
@@ -577,11 +648,7 @@ mod tests {
         a.handle_key(key('j'));
         a.handle_key(key('b'));
         assert_eq!(a.mode, Mode::Normal);
-        assert!(
-            a.message
-                .as_deref()
-                .is_some_and(|m| m.contains("no checkpoint"))
-        );
+        assert!(text(&a).is_some_and(|m| m.contains("no checkpoint")));
     }
 
     #[test]
@@ -602,10 +669,10 @@ mod tests {
 
         a.running = Some(3);
         a.handle_key(key('x'));
-        assert_eq!(a.mode, Mode::ConfirmInterrupt);
+        assert_eq!(a.mode, Mode::ConfirmInterrupt(0));
         assert_eq!(a.handle_key(key('y')), Some(Command::Interrupt));
         a.handle_key(key('x'));
-        assert_eq!(a.handle_key(key('q')), None);
+        assert_eq!(a.handle_key(key('n')), None);
         assert_eq!(a.mode, Mode::Normal);
     }
 
@@ -616,13 +683,13 @@ mod tests {
         a.mode = Mode::Note("half a note".into());
         assert_eq!(a.handle_key(ctrl_c), Some(Command::Quit));
         assert_eq!(a.mode, Mode::Normal);
-        a.mode = Mode::ConfirmRollback(1);
+        a.mode = Mode::ConfirmRollback(1, 0);
         assert_eq!(a.handle_key(ctrl_c), Some(Command::Quit));
         // While a phase runs it still asks first.
         a.running = Some(1);
         a.mode = Mode::Help;
         assert_eq!(a.handle_key(ctrl_c), None);
-        assert_eq!(a.mode, Mode::ConfirmQuit);
+        assert_eq!(a.mode, Mode::ConfirmQuit(0));
     }
 
     #[test]
@@ -634,31 +701,161 @@ mod tests {
 
         a.running = Some(3);
         assert_eq!(a.handle_key(key('q')), None);
-        assert_eq!(a.mode, Mode::ConfirmQuit);
+        assert_eq!(a.mode, Mode::ConfirmQuit(0));
         assert_eq!(a.handle_key(key('y')), Some(Command::Quit));
-        assert_eq!(a.handle_key(ctrl_c), None);
-        assert_eq!(a.mode, Mode::ConfirmQuit);
+        a.handle_key(key('q'));
+        // Ctrl-C while the question is open confirms.
+        assert_eq!(a.handle_key(ctrl_c), Some(Command::Quit));
+        a.handle_key(key('q'));
         assert_eq!(a.handle_key(key('n')), None);
         assert_eq!(a.mode, Mode::Normal);
     }
 
+    fn keys(a: &App) -> Vec<String> {
+        a.footer().into_iter().map(|(k, _)| k).collect()
+    }
+
+    fn text(a: &App) -> Option<&str> {
+        a.message.as_ref().map(|n| n.text.as_str())
+    }
+
     #[test]
-    fn available_keys_follow_the_state() {
-        let names = |a: &App| a.available_keys().iter().map(|k| k.0).collect::<Vec<_>>();
+    fn footer_follows_the_state() {
         let a = reviewing();
-        assert_eq!(
-            names(&a),
-            ["j/k", "Tab", "PgUp/PgDn", "n", "r", "b", "?", "q"]
-        );
+        assert_eq!(keys(&a), ["n", "r", "b", "tab", "esc", "q"]);
         let mut running = reviewing();
         running.running = Some(3);
-        assert_eq!(names(&running), ["j/k", "Tab", "PgUp/PgDn", "x", "?", "q"]);
+        assert_eq!(keys(&running), ["x", "tab", "esc", "q"]);
+        let failed = app(vec![
+            phase(1, PhaseStatus::Done, true),
+            phase(2, PhaseStatus::Failed, false),
+        ]);
+        assert_eq!(keys(&failed), ["r", "b", "tab", "esc", "q"]);
+        let mut other = reviewing();
+        other.selected = 0;
+        assert_eq!(keys(&other), ["j/k", "tab", "esc", "q"]);
+        other.view.active = false;
+        other.selected = 1;
+        assert_eq!(keys(&other), ["j/k", "tab", "esc", "q"]);
         let mut note = reviewing();
         note.mode = Mode::Note(String::new());
-        assert_eq!(names(&note), ["Enter", "Esc"]);
+        assert_eq!(keys(&note), ["enter", "esc"]);
         let mut confirm = reviewing();
-        confirm.mode = Mode::ConfirmQuit;
-        assert_eq!(names(&confirm), ["y", "any other key"]);
+        confirm.mode = Mode::ConfirmQuit(0);
+        assert_eq!(keys(&confirm), ["enter", "1–2", "esc"]);
+        confirm.mode = Mode::Help;
+        assert_eq!(keys(&confirm), ["any key"]);
+        assert!(keys(&a).iter().all(|k| k != "?"));
+    }
+
+    #[test]
+    fn shortcuts_are_grouped_and_mention_the_new_keys() {
+        let groups = App::shortcuts();
+        let all: Vec<&str> = groups
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().map(|(k, _)| *k))
+            .collect();
+        assert!(all.contains(&"A") && all.contains(&"esc"));
+        assert_eq!(groups.len(), 3);
+    }
+
+    #[test]
+    fn esc_goes_home_only_in_normal_mode() {
+        let mut a = reviewing();
+        assert_eq!(a.handle_key(code(KeyCode::Esc)), Some(Command::Home));
+        a.handle_key(key('r'));
+        assert_eq!(a.handle_key(code(KeyCode::Esc)), None);
+        assert_eq!(a.mode, Mode::Normal);
+        a.handle_key(key('?'));
+        assert_eq!(a.handle_key(code(KeyCode::Esc)), None);
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn abandon_is_confirmed_and_refused_while_running_or_finished() {
+        let mut a = reviewing();
+        assert_eq!(a.handle_key(key('A')), None);
+        assert_eq!(a.mode, Mode::ConfirmAbandon(0));
+        assert_eq!(a.handle_key(key('y')), Some(Command::Abandon));
+        assert_eq!(a.mode, Mode::Normal);
+        a.handle_key(key('A'));
+        assert_eq!(a.handle_key(key('j')), None);
+        assert_eq!(a.mode, Mode::ConfirmAbandon(1));
+        assert_eq!(a.handle_key(code(KeyCode::Enter)), None);
+        assert_eq!(a.mode, Mode::Normal);
+
+        let mut running = reviewing();
+        running.running = Some(2);
+        assert_eq!(running.handle_key(key('A')), None);
+        assert_eq!(running.mode, Mode::Normal);
+        assert_eq!(
+            text(&running),
+            Some("Interrupt the running phase first (x).")
+        );
+
+        let mut done = reviewing();
+        done.view.active = false;
+        assert_eq!(done.handle_key(key('A')), None);
+        assert_eq!(done.mode, Mode::Normal);
+        assert_eq!(text(&done), Some("The run is already finished."));
+        assert_eq!(done.message.as_ref().map(|n| n.level), Some(Level::Warn));
+    }
+
+    #[test]
+    fn confirmations_take_digits_arrows_enter_and_ignore_other_keys() {
+        let mut a = reviewing();
+        a.handle_key(key('b'));
+        assert_eq!(a.handle_key(key('z')), None);
+        assert_eq!(a.mode, Mode::ConfirmRollback(2, 0));
+        a.handle_key(code(KeyCode::Down));
+        assert_eq!(a.mode, Mode::ConfirmRollback(2, 1));
+        a.handle_key(key('k'));
+        assert_eq!(a.mode, Mode::ConfirmRollback(2, 0));
+        assert_eq!(
+            a.handle_key(code(KeyCode::Enter)),
+            Some(Command::Rollback(2))
+        );
+        a.handle_key(key('b'));
+        assert_eq!(a.handle_key(key('1')), Some(Command::Rollback(2)));
+        a.handle_key(key('b'));
+        assert_eq!(a.handle_key(key('2')), None);
+        assert_eq!(a.mode, Mode::Normal);
+        a.handle_key(key('b'));
+        assert_eq!(a.handle_key(code(KeyCode::Esc)), None);
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn quit_asks_while_the_home_screen_is_planning() {
+        let mut a = reviewing();
+        a.planning_busy = true;
+        assert_eq!(a.handle_key(key('q')), None);
+        assert_eq!(a.mode, Mode::ConfirmQuit(0));
+        assert_eq!(a.handle_key(key('y')), Some(Command::Quit));
+    }
+
+    #[test]
+    fn the_note_takes_ctrl_u_and_ctrl_w() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut a = reviewing();
+        a.handle_key(key('r'));
+        for c in "fix the bug".chars() {
+            a.handle_key(key(c));
+        }
+        a.handle_key(ctrl('w'));
+        assert_eq!(a.mode, Mode::Note("fix the ".into()));
+        a.handle_key(ctrl('u'));
+        assert_eq!(a.mode, Mode::Note(String::new()));
+    }
+
+    #[test]
+    fn animating_while_a_phase_runs() {
+        let mut a = reviewing();
+        assert!(!a.animating());
+        a.running = Some(2);
+        assert!(a.animating());
+        let running = app(vec![phase(1, PhaseStatus::Running, false)]);
+        assert!(running.animating());
     }
 
     #[test]

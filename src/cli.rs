@@ -246,15 +246,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         None => {
             let cwd = current_dir()?;
-            // On a terminal: the review screen for an active run, the home screen
-            // inside a git repository; otherwise show the help.
-            if std::io::stdout().is_terminal() {
-                if ops::load_active(&cwd).ok().flatten().is_some() {
-                    return crate::tui::run(&cwd);
-                }
-                if Git::discover(&cwd).is_ok() {
-                    return crate::tui::run_home(&cwd);
-                }
+            // On a terminal inside a git repository: the TUI, which opens on the
+            // run screen for an active run and on the home screen otherwise;
+            // outside one, show the help.
+            if std::io::stdout().is_terminal() && Git::discover(&cwd).is_ok() {
+                return crate::tui::run_home(&cwd);
             }
             Cli::command().print_long_help()?;
             Ok(ExitCode::SUCCESS)

@@ -1,33 +1,27 @@
 //! Home screen state machine: keys in, commands out. No terminal, no I/O.
 
 use std::path::Path;
+use std::time::Instant;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::data::{HomeData, PlanState};
+use super::data::{HomeData, PlanState, RunSummary};
+use super::shared::{
+    Choice, FooterItem, Notice, ShortcutGroups, confirm_key, digit_row, edit_text, item,
+    picker_footer,
+};
 use crate::agent::{LaunchOptions, ModelInfo};
 use crate::display::{EventLine, money, phase_count};
 use crate::ops::{Override, Overrides, PlanOutcome, PlanResult};
 use crate::plan::{self, AgentKind};
 
-/// Status line text for a key refused while the agent writes the plan.
-const PLANNING_BUSY: &str = "Planning in progress — press x to cancel";
+/// Shown for a key refused while the agent writes the plan.
+const PLANNING_BUSY: &str = "Wait for the plan or stop it first (esc).";
+const RUN_ACTIVE: &str = "A run is active. Open it (enter) to finish or abandon it.";
+const COMMITTING: &str = "Wait for the commit to finish.";
 const NO_PLAN: &str =
     "There is no plan: press p to write one with the agent, or run `phasewise init`.";
-const INVALID_PLAN: &str = "The plan is invalid: fix it and press c to check again, press p to write one with the agent, or run `phasewise init`.";
-
-/// Every key of the home screen, for the help popup.
-pub const HELP_KEYS: [(&str, &str); 9] = [
-    ("a", "switch the agent (resets the model)"),
-    ("m", "choose the model"),
-    ("e", "choose the effort"),
-    ("p", "write the plan with the agent"),
-    ("c", "check the plan again"),
-    ("Enter", "start a run"),
-    ("x", "cancel the planning"),
-    ("?", "show or hide this help"),
-    ("q / Ctrl-C", "quit"),
-];
+const INVALID_PLAN: &str = "The plan is invalid: fix it in your editor (this screen updates on its own), press p to write one with the agent, or run `phasewise init`.";
 
 /// The commit command for a plan that is not committed yet.
 pub fn commit_hint() -> String {
@@ -63,12 +57,15 @@ pub enum ModelItem {
     Custom,
 }
 
+/// Confirmation modes hold the highlighted row: 0 is the action, 1 cancels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Help,
-    /// Quit asked while the agent writes the plan.
-    ConfirmQuit,
+    /// Quit asked while something runs.
+    ConfirmQuit(usize),
+    /// Stop the plan being written?
+    ConfirmStopPlan(usize),
     /// Index into the model popup rows.
     ModelPopup(usize),
     /// Custom model name, being typed.
@@ -78,7 +75,9 @@ pub enum Mode {
     /// The goal for the plan, being typed.
     GoalInput(String),
     /// Replace the existing plan file? Holds the goal.
-    ConfirmReplace(String),
+    ConfirmReplace(String, usize),
+    /// The plan is not committed: commit it and start the run?
+    ConfirmCommitStart(usize),
     /// Lines of an error, shown until closed.
     Error(Vec<String>),
 }
@@ -97,14 +96,21 @@ pub struct PlanLaunch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HomeCommand {
     Quit,
-    /// Load the plan and the repository data again.
-    Reload,
     /// Start a run with the plan, with the agent shown on the screen (always
     /// passed, so a plan edited on disk meanwhile cannot change it).
     Start {
         agent: AgentKind,
         overrides: Overrides,
     },
+    /// Commit the plan file in the background.
+    Commit,
+    /// Commit the plan, then start the run if the commit succeeded.
+    CommitAndStart {
+        agent: AgentKind,
+        overrides: Overrides,
+    },
+    /// Show the run screen for the current run.
+    OpenRun,
     /// Write a plan with the agent in a worker.
     Plan(PlanLaunch),
     CancelPlan,
@@ -139,8 +145,14 @@ pub struct Home {
     claude_models: ModelsState,
     codex_models: ModelsState,
     pub mode: Mode,
-    pub message: Option<String>,
+    pub message: Option<Notice>,
     pub planning: Option<Planning>,
+    /// When the plan commit started, while it runs.
+    pub committing: Option<Instant>,
+    /// A phase of the current run is running (set by the loop every turn).
+    pub run_busy: bool,
+    /// Spinner frame, set by the loop from the elapsed time.
+    pub frame: usize,
 }
 
 impl Home {
@@ -162,12 +174,28 @@ impl Home {
             mode: Mode::Normal,
             message: None,
             planning: None,
+            committing: None,
+            run_busy: false,
+            frame: 0,
         }
     }
 
-    /// Replaces the repository data, keeping the user's choices.
-    pub fn set_data(&mut self, data: HomeData) {
+    /// Replaces the repository data, keeping the user's choices. True when
+    /// the data was different.
+    pub fn set_data(&mut self, data: HomeData) -> bool {
+        let changed = self.data != data;
         self.data = data;
+        changed
+    }
+
+    /// The current run, when it is active.
+    pub fn active_run(&self) -> Option<&RunSummary> {
+        self.data.run.as_ref().filter(|run| run.active())
+    }
+
+    /// The plan file name as shown: relative to the repository root.
+    pub fn plan_name(&self) -> String {
+        shown(&self.data.plan_path, &self.data.root)
     }
 
     pub fn probe(&self, kind: AgentKind) -> &Probe {
@@ -275,9 +303,37 @@ impl Home {
         match report {
             PlanReport::Success(text) => {
                 self.mode = Mode::Normal;
-                self.message = Some(text);
+                self.message = Some(Notice::ok(text));
             }
             PlanReport::Failure(lines) => self.mode = Mode::Error(lines),
+        }
+    }
+
+    /// The commit thread started.
+    pub fn begin_commit(&mut self) {
+        self.committing = Some(Instant::now());
+    }
+
+    /// The commit ended: reports it. True when it succeeded.
+    pub fn commit_finished(&mut self, result: &Result<String, String>) -> bool {
+        self.committing = None;
+        match result {
+            Ok(sha) => {
+                self.message = Some(Notice::ok(format!(
+                    "Committed {} ({sha})",
+                    self.plan_name()
+                )));
+                true
+            }
+            Err(error) => {
+                let mut lines = vec![format!("Could not commit {}", self.plan_name())];
+                lines.extend(error.lines().map(str::to_string));
+                lines.push(String::new());
+                lines.push("Commit it yourself:".to_string());
+                lines.push(format!("  {}", commit_hint()));
+                self.mode = Mode::Error(lines);
+                false
+            }
         }
     }
 
@@ -288,7 +344,7 @@ impl Home {
         if self.data.plan_uncommitted {
             lines.push(format!(
                 "{} is not committed. Commit it first:",
-                plan::DEFAULT_PLAN_FILE
+                self.plan_name()
             ));
             lines.push(format!("  {}", commit_hint()));
             lines.push(String::new());
@@ -303,8 +359,13 @@ impl Home {
         }
         self.message = None;
         // Ctrl-C works from every popup and input: it closes it and then acts
-        // as in the main view (quit, or ask first while planning).
+        // as in the main view (quit, or ask first while work runs). While the
+        // quit question is open it confirms.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if matches!(self.mode, Mode::ConfirmQuit(_)) {
+                self.mode = Mode::Normal;
+                return Some(HomeCommand::Quit);
+            }
             self.mode = Mode::Normal;
         }
         match self.mode.clone() {
@@ -314,17 +375,24 @@ impl Home {
                 self.mode = Mode::Normal;
                 None
             }
-            Mode::ConfirmQuit => {
-                self.mode = Mode::Normal;
-                is_yes(key).then_some(HomeCommand::Quit)
+            Mode::ConfirmQuit(row) => self.confirm(key, row, Mode::ConfirmQuit, HomeCommand::Quit),
+            Mode::ConfirmStopPlan(row) => {
+                self.confirm(key, row, Mode::ConfirmStopPlan, HomeCommand::CancelPlan)
             }
             Mode::ModelPopup(selected) => self.key_model_popup(key, selected),
             Mode::ModelInput(buffer) => self.key_model_input(key, buffer),
             Mode::EffortPopup(selected) => self.key_effort_popup(key, selected),
             Mode::GoalInput(buffer) => self.key_goal(key, buffer),
-            Mode::ConfirmReplace(goal) => {
-                self.mode = Mode::Normal;
-                is_yes(key).then(|| HomeCommand::Plan(self.launch(goal, true)))
+            Mode::ConfirmReplace(goal, row) => {
+                let command = HomeCommand::Plan(self.launch(goal.clone(), true));
+                self.confirm(key, row, |row| Mode::ConfirmReplace(goal, row), command)
+            }
+            Mode::ConfirmCommitStart(row) => {
+                let command = HomeCommand::CommitAndStart {
+                    agent: self.agent,
+                    overrides: self.overrides(),
+                };
+                self.confirm(key, row, Mode::ConfirmCommitStart, command)
             }
             Mode::Error(_) => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'))
@@ -332,6 +400,30 @@ impl Home {
                 {
                     self.mode = Mode::Normal;
                 }
+                None
+            }
+        }
+    }
+
+    /// A two-row confirmation: the key acts, cancels or moves the highlight.
+    fn confirm(
+        &mut self,
+        key: KeyEvent,
+        row: usize,
+        again: impl FnOnce(usize) -> Mode,
+        command: HomeCommand,
+    ) -> Option<HomeCommand> {
+        match confirm_key(key, row) {
+            Choice::Act => {
+                self.mode = Mode::Normal;
+                Some(command)
+            }
+            Choice::Cancel => {
+                self.mode = Mode::Normal;
+                None
+            }
+            Choice::Row(row) => {
+                self.mode = again(row);
                 None
             }
         }
@@ -349,8 +441,15 @@ impl Home {
         }
     }
 
+    fn overrides(&self) -> Overrides {
+        Overrides {
+            model: self.model.clone().map(Override::Set),
+            effort: self.effort.clone().map(Override::Set),
+        }
+    }
+
     fn refuse(&mut self, why: &str) -> Option<HomeCommand> {
-        self.message = Some(why.to_string());
+        self.message = Some(Notice::warn(why));
         None
     }
 
@@ -362,22 +461,39 @@ impl Home {
                 .flatten();
         }
         let planning = self.planning.is_some();
+        let run_active = self.active_run().is_some();
         match key.code {
             KeyCode::Char('q') => self.quit(),
             KeyCode::Char('?') => {
                 self.mode = Mode::Help;
                 None
             }
+            KeyCode::Esc => {
+                if planning {
+                    self.mode = Mode::ConfirmStopPlan(0);
+                }
+                None
+            }
             KeyCode::Char('x') => {
                 if planning {
-                    Some(HomeCommand::CancelPlan)
+                    self.mode = Mode::ConfirmStopPlan(0);
+                    None
                 } else {
                     self.refuse("No plan is being written.")
                 }
             }
-            KeyCode::Char('a' | 'm' | 'e' | 'p' | 'c') | KeyCode::Enter if planning => {
+            KeyCode::Char('o' | 'a' | 'm' | 'e' | 'p' | 'c') | KeyCode::Enter if planning => {
                 self.refuse(PLANNING_BUSY)
             }
+            KeyCode::Enter if run_active => Some(HomeCommand::OpenRun),
+            KeyCode::Char('o') => {
+                if self.data.run.is_some() {
+                    Some(HomeCommand::OpenRun)
+                } else {
+                    self.refuse("There is no run to open.")
+                }
+            }
+            KeyCode::Char('a' | 'm' | 'e' | 'p' | 'c') if run_active => self.refuse(RUN_ACTIVE),
             KeyCode::Char('a') => {
                 self.agent = match self.agent {
                     AgentKind::Claude => AgentKind::Codex,
@@ -398,18 +514,26 @@ impl Home {
                 None
             }
             KeyCode::Char('p') => {
+                if self.committing.is_some() {
+                    return self.refuse(COMMITTING);
+                }
                 self.mode = Mode::GoalInput(String::new());
                 None
             }
-            KeyCode::Char('c') => Some(HomeCommand::Reload),
+            KeyCode::Char('c') => self.commit(),
             KeyCode::Enter => self.start(),
             _ => None,
         }
     }
 
+    /// Whether anything runs that quitting would interrupt.
+    fn busy(&self) -> bool {
+        self.planning.is_some() || self.run_busy
+    }
+
     fn quit(&mut self) -> Option<HomeCommand> {
-        if self.planning.is_some() {
-            self.mode = Mode::ConfirmQuit;
+        if self.busy() {
+            self.mode = Mode::ConfirmQuit(0);
             None
         } else {
             Some(HomeCommand::Quit)
@@ -441,24 +565,49 @@ impl Home {
         }
     }
 
+    fn commit(&mut self) -> Option<HomeCommand> {
+        if self.committing.is_some() {
+            return self.refuse(COMMITTING);
+        }
+        if self.data.plan_uncommitted {
+            return Some(HomeCommand::Commit);
+        }
+        let why = if self.data.plan == PlanState::Missing {
+            "There is no plan to commit.".to_string()
+        } else {
+            format!("{} is already committed.", self.plan_name())
+        };
+        self.refuse(&why)
+    }
+
     fn start(&mut self) -> Option<HomeCommand> {
         match &self.data.plan {
             PlanState::Valid(_) => {}
             PlanState::Missing => return self.refuse(NO_PLAN),
             PlanState::Invalid(_) => return self.refuse(INVALID_PLAN),
         }
+        if self.committing.is_some() {
+            return self.refuse(COMMITTING);
+        }
+        if self.data.plan_uncommitted {
+            self.mode = Mode::ConfirmCommitStart(0);
+            return None;
+        }
         Some(HomeCommand::Start {
             agent: self.agent,
-            overrides: Overrides {
-                model: self.model.clone().map(Override::Set),
-                effort: self.effort.clone().map(Override::Set),
-            },
+            overrides: self.overrides(),
         })
     }
 
     fn key_model_popup(&mut self, key: KeyEvent, selected: usize) -> Option<HomeCommand> {
         let items = self.model_items();
         let last = items.len().saturating_sub(1);
+        if let Some(row) = digit_row(key) {
+            if row <= last {
+                self.choose_model(&items, row);
+            }
+            return None;
+        }
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char('j') | KeyCode::Down => {
@@ -467,21 +616,25 @@ impl Home {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.mode = Mode::ModelPopup(selected.saturating_sub(1));
             }
-            KeyCode::Enter => match items.get(selected.min(last)) {
-                Some(ModelItem::Default) => {
-                    self.model = None;
-                    self.mode = Mode::Normal;
-                }
-                Some(ModelItem::Model(id, _)) => {
-                    self.model = Some(id.clone());
-                    self.mode = Mode::Normal;
-                }
-                Some(ModelItem::Custom) => self.mode = Mode::ModelInput(String::new()),
-                None => self.mode = Mode::Normal,
-            },
+            KeyCode::Enter => self.choose_model(&items, selected.min(last)),
             _ => {}
         }
         None
+    }
+
+    fn choose_model(&mut self, items: &[ModelItem], row: usize) {
+        match items.get(row) {
+            Some(ModelItem::Default) => {
+                self.model = None;
+                self.mode = Mode::Normal;
+            }
+            Some(ModelItem::Model(id, _)) => {
+                self.model = Some(id.clone());
+                self.mode = Mode::Normal;
+            }
+            Some(ModelItem::Custom) => self.mode = Mode::ModelInput(String::new()),
+            None => self.mode = Mode::Normal,
+        }
     }
 
     fn key_model_input(&mut self, key: KeyEvent, mut buffer: String) -> Option<HomeCommand> {
@@ -498,19 +651,17 @@ impl Home {
                             self.model = Some(name.to_string());
                             self.mode = Mode::Normal;
                         }
-                        Err(why) => self.message = Some(format!("Invalid model: {why}.")),
+                        Err(why) => {
+                            self.message = Some(Notice::warn(format!("Invalid model: {why}.")));
+                        }
                     }
                 }
             }
-            KeyCode::Backspace => {
-                buffer.pop();
-                self.mode = Mode::ModelInput(buffer);
+            _ => {
+                if edit_text(&mut buffer, key) {
+                    self.mode = Mode::ModelInput(buffer);
+                }
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                buffer.push(c);
-                self.mode = Mode::ModelInput(buffer);
-            }
-            _ => {}
         }
         None
     }
@@ -518,6 +669,13 @@ impl Home {
     fn key_effort_popup(&mut self, key: KeyEvent, selected: usize) -> Option<HomeCommand> {
         let items = Self::effort_items();
         let last = items.len() - 1;
+        if let Some(row) = digit_row(key) {
+            if row <= last {
+                self.effort = items[row].map(str::to_string);
+                self.mode = Mode::Normal;
+            }
+            return None;
+        }
         match key.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Char('j') | KeyCode::Down => {
@@ -541,55 +699,109 @@ impl Home {
             KeyCode::Enter => {
                 let goal = buffer.trim().to_string();
                 if goal.is_empty() {
-                    self.message =
-                        Some("Say what you want to do first, or press Esc to cancel.".to_string());
+                    self.message = Some(Notice::warn(
+                        "Say what you want to do first, or press Esc to cancel.",
+                    ));
                 } else if self.data.plan == PlanState::Missing {
                     self.mode = Mode::Normal;
                     return Some(HomeCommand::Plan(self.launch(goal, false)));
                 } else {
-                    self.mode = Mode::ConfirmReplace(goal);
+                    self.mode = Mode::ConfirmReplace(goal, 0);
                 }
             }
-            KeyCode::Backspace => {
-                buffer.pop();
-                self.mode = Mode::GoalInput(buffer);
+            _ => {
+                if edit_text(&mut buffer, key) {
+                    self.mode = Mode::GoalInput(buffer);
+                }
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                buffer.push(c);
-                self.mode = Mode::GoalInput(buffer);
-            }
-            _ => {}
         }
         None
     }
 
-    /// Keys shown in the bottom bar for the current state.
-    pub fn available_keys(&self) -> Vec<(&'static str, &'static str)> {
-        match self.mode {
-            Mode::ConfirmQuit | Mode::ConfirmReplace(_) => {
-                return vec![("y", "confirm"), ("any other key", "cancel")];
+    /// True while something on this screen moves: planning, the commit, a
+    /// phase of the run, or the model list of an open popup loading.
+    pub fn animating(&self) -> bool {
+        self.planning.is_some()
+            || self.committing.is_some()
+            || self.run_busy
+            || (matches!(self.mode, Mode::ModelPopup(_))
+                && matches!(self.models(self.agent), ModelsState::Loading))
+    }
+
+    /// Footer items for the current state, highest priority first. The `?`
+    /// item is not in the list: the renderer appends it.
+    pub fn footer(&self) -> Vec<FooterItem> {
+        match &self.mode {
+            Mode::ConfirmQuit(_)
+            | Mode::ConfirmStopPlan(_)
+            | Mode::ConfirmReplace(..)
+            | Mode::ConfirmCommitStart(_) => return picker_footer(2),
+            Mode::ModelPopup(_) => return picker_footer(self.model_items().len()),
+            Mode::EffortPopup(_) => return picker_footer(Self::effort_items().len()),
+            Mode::ModelInput(_) => return vec![item("enter", "use it"), item("esc", "cancel")],
+            Mode::GoalInput(_) => {
+                return vec![item("enter", "write the plan"), item("esc", "cancel")];
             }
-            Mode::ModelPopup(_) | Mode::EffortPopup(_) => {
-                return vec![("j/k", "move"), ("Enter", "choose"), ("Esc", "close")];
-            }
-            Mode::ModelInput(_) => return vec![("Enter", "use it"), ("Esc", "cancel")],
-            Mode::GoalInput(_) => return vec![("Enter", "write the plan"), ("Esc", "cancel")],
-            Mode::Help => return vec![("any key", "close")],
-            Mode::Error(_) => return vec![("Esc", "close")],
+            Mode::Help => return vec![item("any key", "close")],
+            Mode::Error(_) => return vec![item("enter", "close")],
             Mode::Normal => {}
         }
         if self.planning.is_some() {
-            return vec![("x", "cancel"), ("?", "help"), ("q", "quit")];
+            return vec![item("esc", "stop"), item("q", "quit")];
         }
+        if self.active_run().is_some() {
+            return vec![item("enter", "open run"), item("q", "quit")];
+        }
+        let (agent, model, effort) = (item("a", "agent"), item("m", "model"), item("e", "effort"));
+        let mut keys = Vec::new();
+        match &self.data.plan {
+            PlanState::Valid(_) => {
+                keys.push(item("enter", "start"));
+                if self.data.plan_uncommitted {
+                    keys.push(item("c", "commit"));
+                }
+                keys.extend([item("p", "new plan"), model, agent, effort]);
+            }
+            PlanState::Missing => keys.extend([item("p", "write a plan"), agent, model, effort]),
+            PlanState::Invalid(_) => keys.extend([item("p", "new plan"), agent, model, effort]),
+        }
+        keys.push(item("q", "quit"));
+        keys
+    }
+
+    /// Every key of the screen in groups, for the `?` popup.
+    pub fn shortcuts() -> ShortcutGroups {
         vec![
-            ("a", "agent"),
-            ("m", "model"),
-            ("e", "effort"),
-            ("p", "plan"),
-            ("c", "check again"),
-            ("Enter", "start"),
-            ("?", "help"),
-            ("q", "quit"),
+            (
+                "Run",
+                vec![
+                    ("enter", "start the run, or open the active one"),
+                    ("o", "open the last run"),
+                ],
+            ),
+            (
+                "Plan",
+                vec![
+                    ("p", "write a new plan with the agent"),
+                    ("c", "commit the plan"),
+                ],
+            ),
+            (
+                "Settings",
+                vec![
+                    ("a", "switch the agent (resets the model)"),
+                    ("m", "choose the model"),
+                    ("e", "choose the effort"),
+                ],
+            ),
+            (
+                "General",
+                vec![
+                    ("esc", "stop the plan being written"),
+                    ("?", "show or hide the shortcuts"),
+                    ("q / Ctrl-C", "quit"),
+                ],
+            ),
         ]
     }
 }
@@ -607,10 +819,6 @@ fn error_lines(err: &anyhow::Error) -> Vec<String> {
         }
     }
     lines
-}
-
-fn is_yes(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('y' | 'Y')) && !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 /// A path shown relative to the repository root when it is inside it.
@@ -681,7 +889,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::tui::data::{HomePhase, PlanProblem, PlanSummary};
+    use crate::state::{PhaseStatus, RunStatus};
+    use crate::tui::data::{HomePhase, PlanProblem, PlanSummary, RunPhaseSummary};
+    use crate::tui::shared::Level;
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -721,7 +931,12 @@ mod tests {
             plan_path: PathBuf::from("/work/demo/phasewise.md"),
             plan,
             plan_uncommitted: false,
+            run: None,
         }
+    }
+
+    fn text(h: &Home) -> Option<&str> {
+        h.message.as_ref().map(|n| n.text.as_str())
     }
 
     fn home_with(plan: PlanState) -> Home {
@@ -871,11 +1086,7 @@ mod tests {
         // Empty: refused, input stays.
         h.handle_key(code(KeyCode::Enter));
         assert!(matches!(h.mode, Mode::ModelInput(_)));
-        assert!(
-            h.message
-                .as_deref()
-                .is_some_and(|m| m.starts_with("Invalid model"))
-        );
+        assert!(text(&h).is_some_and(|m| m.starts_with("Invalid model")));
         type_text(&mut h, "bad name");
         h.handle_key(code(KeyCode::Enter));
         assert_eq!(h.mode, Mode::ModelInput("bad name".into()));
@@ -992,17 +1203,17 @@ mod tests {
     }
 
     #[test]
-    fn plan_over_an_existing_file_asks_and_only_y_confirms() {
+    fn plan_over_an_existing_file_asks_and_y_or_1_confirms() {
         for existing in [
             PlanState::Valid(summary(AgentKind::Claude)),
             PlanState::Invalid(Vec::new()),
         ] {
-            for yes in ['y', 'Y'] {
+            for yes in ['y', 'Y', '1'] {
                 let mut h = home_with(existing.clone());
                 h.handle_key(key('p'));
                 type_text(&mut h, "goal");
                 assert_eq!(h.handle_key(code(KeyCode::Enter)), None);
-                assert_eq!(h.mode, Mode::ConfirmReplace("goal".into()));
+                assert_eq!(h.mode, Mode::ConfirmReplace("goal".into(), 0));
                 match h.handle_key(key(yes)) {
                     Some(HomeCommand::Plan(launch)) => {
                         assert!(launch.force);
@@ -1012,7 +1223,7 @@ mod tests {
                 }
                 assert_eq!(h.mode, Mode::Normal);
             }
-            for no in [key('n'), code(KeyCode::Enter), code(KeyCode::Esc), key('q')] {
+            for no in [key('n'), key('2'), code(KeyCode::Esc)] {
                 let mut h = home_with(existing.clone());
                 h.handle_key(key('p'));
                 type_text(&mut h, "goal");
@@ -1024,22 +1235,38 @@ mod tests {
     }
 
     #[test]
-    fn keys_are_refused_while_planning_but_x_and_help_work() {
+    fn keys_are_refused_while_planning_but_esc_x_and_help_work() {
         let mut h = valid();
         h.begin_planning();
-        for c in ['a', 'm', 'e', 'p', 'c'] {
+        for c in ['a', 'm', 'e', 'p', 'c', 'o'] {
             assert_eq!(h.handle_key(key(c)), None);
-            assert_eq!(h.message.as_deref(), Some(PLANNING_BUSY), "key {c}");
+            assert_eq!(text(&h), Some(PLANNING_BUSY), "key {c}");
             assert_eq!(h.mode, Mode::Normal);
         }
         assert_eq!(h.handle_key(code(KeyCode::Enter)), None);
-        assert_eq!(h.message.as_deref(), Some(PLANNING_BUSY));
+        assert_eq!(text(&h), Some(PLANNING_BUSY));
         assert_eq!(h.agent, AgentKind::Claude);
-        assert_eq!(h.handle_key(key('x')), Some(HomeCommand::CancelPlan));
+        for stop in [key('x'), code(KeyCode::Esc)] {
+            assert_eq!(h.handle_key(stop), None);
+            assert_eq!(h.mode, Mode::ConfirmStopPlan(0));
+            assert_eq!(h.handle_key(key('y')), Some(HomeCommand::CancelPlan));
+            assert_eq!(h.mode, Mode::Normal);
+        }
+        h.handle_key(key('x'));
+        assert_eq!(h.handle_key(key('n')), None);
+        assert_eq!(h.mode, Mode::Normal);
         h.handle_key(key('?'));
         assert_eq!(h.mode, Mode::Help);
         h.handle_key(key('?'));
         assert_eq!(h.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn esc_does_nothing_on_home_without_planning() {
+        let mut h = valid();
+        assert_eq!(h.handle_key(code(KeyCode::Esc)), None);
+        assert_eq!(h.mode, Mode::Normal);
+        assert!(h.message.is_none());
     }
 
     #[test]
@@ -1062,24 +1289,27 @@ mod tests {
         h.begin_planning();
         h.mode = Mode::EffortPopup(0);
         assert_eq!(h.handle_key(ctrl_c), None);
-        assert_eq!(h.mode, Mode::ConfirmQuit);
+        assert_eq!(h.mode, Mode::ConfirmQuit(0));
     }
 
     #[test]
-    fn quit_is_immediate_when_idle_and_confirmed_while_planning() {
+    fn quit_is_immediate_when_idle_and_confirmed_while_working() {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let mut h = valid();
         assert_eq!(h.handle_key(key('q')), Some(HomeCommand::Quit));
         assert_eq!(h.handle_key(ctrl_c), Some(HomeCommand::Quit));
         h.begin_planning();
         assert_eq!(h.handle_key(key('q')), None);
-        assert_eq!(h.mode, Mode::ConfirmQuit);
+        assert_eq!(h.mode, Mode::ConfirmQuit(0));
         assert_eq!(h.handle_key(key('y')), Some(HomeCommand::Quit));
         h.handle_key(key('q'));
         assert_eq!(h.handle_key(key('n')), None);
         assert_eq!(h.mode, Mode::Normal);
         assert_eq!(h.handle_key(ctrl_c), None);
-        assert_eq!(h.mode, Mode::ConfirmQuit);
+        assert_eq!(h.mode, Mode::ConfirmQuit(0));
+        // Ctrl-C while the question is open confirms.
+        assert_eq!(h.handle_key(ctrl_c), Some(HomeCommand::Quit));
+        assert_eq!(h.mode, Mode::Normal);
     }
 
     #[test]
@@ -1095,12 +1325,12 @@ mod tests {
     fn enter_is_refused_without_a_valid_plan() {
         let mut missing = home_with(PlanState::Missing);
         assert_eq!(missing.handle_key(code(KeyCode::Enter)), None);
-        assert!(missing.message.as_deref().is_some_and(|m| {
+        assert!(text(&missing).is_some_and(|m| {
             m.contains("press p to write one with the agent, or run `phasewise init`")
         }));
         let mut invalid = home_with(PlanState::Invalid(Vec::new()));
         assert_eq!(invalid.handle_key(code(KeyCode::Enter)), None);
-        assert!(invalid.message.as_deref().is_some_and(|m| {
+        assert!(text(&invalid).is_some_and(|m| {
             m.contains("press p to write one with the agent, or run `phasewise init`")
         }));
     }
@@ -1141,8 +1371,12 @@ mod tests {
     }
 
     #[test]
-    fn c_reloads() {
-        assert_eq!(valid().handle_key(key('c')), Some(HomeCommand::Reload));
+    fn quit_asks_while_a_phase_of_the_run_runs() {
+        let mut h = valid();
+        h.run_busy = true;
+        assert_eq!(h.handle_key(key('q')), None);
+        assert_eq!(h.mode, Mode::ConfirmQuit(0));
+        assert_eq!(h.handle_key(code(KeyCode::Enter)), Some(HomeCommand::Quit));
     }
 
     #[test]
@@ -1227,27 +1461,272 @@ mod tests {
         assert_eq!(planning.header.as_deref(), Some("▶ Planning · claude"));
         assert_eq!(planning.lines, line.into_iter().collect::<Vec<_>>());
         h.plan_finished(PlanReport::Success("ok".into()));
-        assert_eq!(
-            (h.planning.clone(), h.message.as_deref()),
-            (None, Some("ok"))
-        );
+        assert_eq!((h.planning.clone(), text(&h)), (None, Some("ok")));
+        assert_eq!(h.message.as_ref().map(|n| n.level), Some(Level::Ok));
         h.begin_planning();
         h.plan_finished(PlanReport::Failure(vec!["bad".into()]));
         assert_eq!(h.mode, Mode::Error(vec!["bad".into()]));
         assert_eq!(h.planning, None);
     }
 
+    fn keys(h: &Home) -> Vec<String> {
+        h.footer().into_iter().map(|(k, _)| k).collect()
+    }
+
     #[test]
-    fn available_keys_follow_the_state() {
-        let names = |h: &Home| h.available_keys().iter().map(|k| k.0).collect::<Vec<_>>();
+    fn footer_follows_the_state() {
         let mut h = valid();
-        assert_eq!(names(&h), ["a", "m", "e", "p", "c", "Enter", "?", "q"]);
+        assert_eq!(keys(&h), ["enter", "p", "m", "a", "e", "q"]);
+        h.data.plan_uncommitted = true;
+        assert_eq!(keys(&h), ["enter", "c", "p", "m", "a", "e", "q"]);
+        assert_eq!(
+            keys(&home_with(PlanState::Missing)),
+            ["p", "a", "m", "e", "q"]
+        );
+        assert_eq!(
+            keys(&home_with(PlanState::Invalid(Vec::new()))),
+            ["p", "a", "m", "e", "q"]
+        );
         h.begin_planning();
-        assert_eq!(names(&h), ["x", "?", "q"]);
-        h.mode = Mode::ConfirmQuit;
-        assert_eq!(names(&h), ["y", "any other key"]);
+        assert_eq!(keys(&h), ["esc", "q"]);
+        h.mode = Mode::ConfirmQuit(0);
+        assert_eq!(keys(&h), ["enter", "1–2", "esc"]);
         h.mode = Mode::Error(Vec::new());
-        assert_eq!(names(&h), ["Esc"]);
+        assert_eq!(keys(&h), ["enter"]);
+        let mut active = valid();
+        active.data.run = Some(run_summary(RunStatus::Active));
+        assert_eq!(keys(&active), ["enter", "q"]);
+        let mut popup = valid();
+        popup.mode = Mode::EffortPopup(0);
+        assert_eq!(keys(&popup), ["enter", "1–6", "esc"]);
+        assert!(keys(&valid()).iter().all(|k| k != "?"));
+    }
+
+    #[test]
+    fn shortcut_groups_cover_the_new_keys() {
+        let all: Vec<&str> = Home::shortcuts()
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().map(|(k, _)| *k))
+            .collect();
+        for k in ["enter", "o", "p", "c", "a", "m", "e", "esc", "?"] {
+            assert!(all.contains(&k), "{k}");
+        }
+        assert!(!all.contains(&"x"));
+    }
+
+    fn run_summary(status: RunStatus) -> RunSummary {
+        RunSummary {
+            id: "20260101-120000".into(),
+            status,
+            run_branch: "phasewise/20260101-120000".into(),
+            original_branch: "main".into(),
+            phases: vec![RunPhaseSummary {
+                number: 1,
+                title: "First".into(),
+                status: PhaseStatus::AwaitingReview,
+                started_at: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn c_commits_only_an_uncommitted_plan() {
+        let mut h = valid();
+        assert_eq!(h.handle_key(key('c')), None);
+        assert_eq!(text(&h), Some("phasewise.md is already committed."));
+        let mut missing = home_with(PlanState::Missing);
+        assert_eq!(missing.handle_key(key('c')), None);
+        assert_eq!(text(&missing), Some("There is no plan to commit."));
+        h.data.plan_uncommitted = true;
+        assert_eq!(h.handle_key(key('c')), Some(HomeCommand::Commit));
+        h.begin_commit();
+        assert!(h.animating());
+        assert_eq!(h.handle_key(key('c')), None);
+        assert_eq!(text(&h), Some(COMMITTING));
+        assert_eq!(h.handle_key(code(KeyCode::Enter)), None);
+        assert_eq!(text(&h), Some(COMMITTING));
+        assert_eq!(h.handle_key(key('p')), None);
+        assert_eq!(h.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn commit_result_is_reported_as_a_notice_or_an_error_popup() {
+        let mut h = valid();
+        h.begin_commit();
+        assert!(h.commit_finished(&Ok("abc1234".into())));
+        assert_eq!(h.committing, None);
+        assert_eq!(text(&h), Some("Committed phasewise.md (abc1234)"));
+        assert_eq!(h.message.as_ref().map(|n| n.level), Some(Level::Ok));
+        h.begin_commit();
+        assert!(!h.commit_finished(&Err("hook failed\nsecond line".into())));
+        assert_eq!(
+            h.mode,
+            Mode::Error(vec![
+                "Could not commit phasewise.md".into(),
+                "hook failed".into(),
+                "second line".into(),
+                String::new(),
+                "Commit it yourself:".into(),
+                format!("  {}", commit_hint()),
+            ])
+        );
+    }
+
+    #[test]
+    fn enter_on_an_uncommitted_plan_asks_to_commit_and_start() {
+        let mut h = valid();
+        h.data.plan_uncommitted = true;
+        h.model = Some("opus".into());
+        assert_eq!(h.handle_key(code(KeyCode::Enter)), None);
+        assert_eq!(h.mode, Mode::ConfirmCommitStart(0));
+        let expected = HomeCommand::CommitAndStart {
+            agent: AgentKind::Claude,
+            overrides: Overrides {
+                model: Some(Override::Set("opus".into())),
+                effort: None,
+            },
+        };
+        assert_eq!(h.handle_key(key('y')), Some(expected.clone()));
+        assert_eq!(h.mode, Mode::Normal);
+        h.handle_key(code(KeyCode::Enter));
+        assert_eq!(h.handle_key(code(KeyCode::Enter)), Some(expected));
+        h.handle_key(code(KeyCode::Enter));
+        h.handle_key(code(KeyCode::Down));
+        assert_eq!(h.mode, Mode::ConfirmCommitStart(1));
+        assert_eq!(h.handle_key(code(KeyCode::Enter)), None);
+        assert_eq!(h.mode, Mode::Normal);
+        h.handle_key(code(KeyCode::Enter));
+        assert_eq!(h.handle_key(key('n')), None);
+        assert_eq!(h.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn enter_opens_the_active_run_and_blocks_the_plan_keys() {
+        let mut h = valid();
+        h.data.run = Some(run_summary(RunStatus::Active));
+        assert_eq!(
+            h.handle_key(code(KeyCode::Enter)),
+            Some(HomeCommand::OpenRun)
+        );
+        for c in ['p', 'c', 'a', 'm', 'e'] {
+            assert_eq!(h.handle_key(key(c)), None);
+            assert_eq!(
+                text(&h),
+                Some("A run is active. Open it (enter) to finish or abandon it."),
+                "key {c}"
+            );
+            assert_eq!(h.mode, Mode::Normal);
+        }
+        assert_eq!(h.agent, AgentKind::Claude);
+    }
+
+    #[test]
+    fn o_opens_a_finished_run_and_is_refused_without_one() {
+        let mut h = valid();
+        assert_eq!(h.handle_key(key('o')), None);
+        assert!(h.message.is_some());
+        for status in [RunStatus::Completed, RunStatus::Aborted] {
+            h.data.run = Some(run_summary(status));
+            assert_eq!(h.handle_key(key('o')), Some(HomeCommand::OpenRun));
+            // A finished run does not stop starting a new one.
+            assert!(matches!(
+                h.handle_key(code(KeyCode::Enter)),
+                Some(HomeCommand::Start { .. })
+            ));
+            assert_eq!(h.handle_key(key('a')), None);
+            assert_eq!(h.agent, AgentKind::Codex);
+            h.handle_key(key('a'));
+        }
+    }
+
+    #[test]
+    fn digits_choose_rows_in_the_pickers() {
+        let mut h = valid();
+        h.handle_key(key('m'));
+        h.set_models(AgentKind::Claude, Ok(models()));
+        h.handle_key(key('3'));
+        assert_eq!(h.model.as_deref(), Some("sonnet"));
+        assert_eq!(h.mode, Mode::Normal);
+        h.handle_key(key('m'));
+        h.handle_key(key('9'));
+        assert!(matches!(h.mode, Mode::ModelPopup(_)), "out of range");
+        h.handle_key(key('4'));
+        assert!(matches!(h.mode, Mode::ModelInput(_)));
+        h.handle_key(code(KeyCode::Esc));
+        h.handle_key(key('m'));
+        h.handle_key(key('1'));
+        assert_eq!(h.model, None);
+
+        h.handle_key(key('e'));
+        h.handle_key(key('4'));
+        assert_eq!(h.effort.as_deref(), Some("high"));
+        assert_eq!(h.mode, Mode::Normal);
+        h.handle_key(key('e'));
+        h.handle_key(key('1'));
+        assert_eq!(h.effort, None);
+    }
+
+    #[test]
+    fn text_inputs_take_ctrl_u_and_ctrl_w() {
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut h = home_with(PlanState::Missing);
+        h.handle_key(key('p'));
+        type_text(&mut h, "add a CLI tool");
+        h.handle_key(ctrl('w'));
+        assert_eq!(h.mode, Mode::GoalInput("add a CLI ".into()));
+        h.handle_key(ctrl('u'));
+        assert_eq!(h.mode, Mode::GoalInput(String::new()));
+        h.handle_key(code(KeyCode::Esc));
+        h.handle_key(key('m'));
+        h.handle_key(key('2'));
+        type_text(&mut h, "my model");
+        h.handle_key(ctrl('w'));
+        assert_eq!(h.mode, Mode::ModelInput("my ".into()));
+        h.handle_key(ctrl('u'));
+        assert_eq!(h.mode, Mode::ModelInput(String::new()));
+    }
+
+    #[test]
+    fn confirmations_move_with_arrows_and_ignore_other_keys() {
+        let mut h = valid();
+        h.begin_planning();
+        h.handle_key(key('q'));
+        assert_eq!(h.handle_key(key('z')), None);
+        assert_eq!(h.mode, Mode::ConfirmQuit(0));
+        h.handle_key(key('j'));
+        assert_eq!(h.mode, Mode::ConfirmQuit(1));
+        h.handle_key(code(KeyCode::Up));
+        assert_eq!(h.mode, Mode::ConfirmQuit(0));
+        h.handle_key(key('j'));
+        assert_eq!(h.handle_key(code(KeyCode::Enter)), None);
+        assert_eq!(h.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn set_data_reports_whether_anything_changed() {
+        let mut h = valid();
+        let same = h.data.clone();
+        assert!(!h.set_data(same.clone()));
+        let mut other = same;
+        other.branch = "dev".into();
+        assert!(h.set_data(other));
+    }
+
+    #[test]
+    fn animating_while_planning_committing_a_run_or_loading_models() {
+        let mut h = valid();
+        assert!(!h.animating());
+        h.begin_planning();
+        assert!(h.animating());
+        h.plan_finished(PlanReport::Success("ok".into()));
+        assert!(!h.animating());
+        h.run_busy = true;
+        assert!(h.animating());
+        h.run_busy = false;
+        h.handle_key(key('m'));
+        assert!(h.animating(), "model list loading");
+        h.set_models(AgentKind::Claude, Ok(models()));
+        assert!(!h.animating());
     }
 
     fn outcome(result: PlanResult, cost: Option<f64>) -> anyhow::Result<PlanOutcome> {

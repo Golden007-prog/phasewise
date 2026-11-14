@@ -3,17 +3,20 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use super::data::{PlanState, PlanSummary};
-use super::home::{HELP_KEYS, Home, Mode, ModelItem, Probe, commit_hint};
+use super::data::{PlanState, PlanSummary, RunSummary};
+use super::home::{Home, Mode, ModelItem, Probe, commit_hint};
+use super::shared::{item, spinner};
 use super::view::{
-    MIN_HEIGHT, MIN_WIDTH, draw_too_small, event_spans, render_popup, role_style, truncate,
+    MIN_HEIGHT, MIN_WIDTH, confirm_body, draw_too_small, event_spans, footer_spans, notice_span,
+    render_popup, role_style, shortcut_lines, truncate,
 };
-use crate::display::{first_line_short, model_name, phase_count};
+use crate::display::{first_line_short, model_name, phase_count, status_label};
 use crate::plan::AgentKind;
+use crate::state::{PhaseStatus, RunStatus};
 use crate::style::Role;
 
 /// Width of the settings panel.
@@ -62,24 +65,81 @@ fn draw_header(frame: &mut Frame, home: &Home, area: Rect) {
 
 /// The plan file name as shown: relative to the repository root.
 fn plan_file(home: &Home) -> String {
-    home.data
-        .plan_path
-        .strip_prefix(&home.data.root)
-        .unwrap_or(&home.data.plan_path)
-        .display()
-        .to_string()
+    home.plan_name()
+}
+
+/// The active run instead of the plan: its branch and the state of each phase.
+fn draw_run_card(frame: &mut Frame, home: &Home, run: &RunSummary, area: Rect) {
+    let block = Block::new().borders(Borders::ALL).title(" Run ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let dim = role_style(Role::Dim);
+    let mut lines = vec![
+        Line::styled("Run in progress", role_style(Role::Heading)),
+        Line::styled(run.run_branch.clone(), dim),
+        Line::raw(""),
+    ];
+    for phase in &run.phases {
+        let (glyph, role) = match phase.status {
+            PhaseStatus::Pending => ("·", Role::Dim),
+            PhaseStatus::Running | PhaseStatus::Verifying => (spinner(home.frame), Role::Accent),
+            PhaseStatus::AwaitingReview => ("◆", Role::Warn),
+            PhaseStatus::Done => ("✓", Role::Ok),
+            PhaseStatus::Failed => ("✗", Role::Fail),
+        };
+        let state = match phase.status {
+            PhaseStatus::Pending => String::new(),
+            PhaseStatus::Running | PhaseStatus::Verifying => phase.started_at.map_or_else(
+                || status_label(phase.status).to_string(),
+                |at| format!("{} {}", status_label(phase.status), elapsed_since(at)),
+            ),
+            other => status_label(other).to_string(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(glyph, role_style(role)),
+            Span::raw(format!(" {:>2}  {}", phase.number, phase.title)),
+            Span::styled(format!("   {state}"), dim),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// `2m 13s` since `at`.
+fn elapsed_since(at: jiff::Timestamp) -> String {
+    let secs = (jiff::Timestamp::now().as_second() - at.as_second()).max(0);
+    if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 fn draw_plan(frame: &mut Frame, home: &Home, area: Rect) {
+    if let Some(run) = home.active_run() {
+        draw_run_card(frame, home, run, area);
+        return;
+    }
     let block = Block::new().borders(Borders::ALL).title(" Plan ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = usize::from(inner.width);
     let dim = role_style(Role::Dim);
-    let mut lines = vec![Line::from(vec![
+    let mut lines = Vec::new();
+    if let Some(run) = &home.data.run {
+        let how = match run.status {
+            RunStatus::Completed => "completed",
+            RunStatus::Aborted => "abandoned",
+            RunStatus::Active => "active",
+        };
+        lines.push(Line::styled(
+            format!("Last run {} · {how} · o to open", run.id),
+            dim,
+        ));
+    }
+    lines.push(Line::from(vec![
         Span::styled("file ", dim),
         Span::raw(plan_file(home)),
-    ])];
+    ]));
     match &home.data.plan {
         PlanState::Missing => {
             lines.push(Line::styled("missing", role_style(Role::Warn)));
@@ -124,17 +184,20 @@ fn draw_plan(frame: &mut Frame, home: &Home, area: Rect) {
             }
             lines.push(Line::raw(""));
             lines.push(Line::styled(
-                "Fix the file and press c, or press p to write a new one.",
+                "Fix the file in your editor (this screen updates on its own), or press p to write a new one.",
                 dim,
             ));
         }
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn push_uncommitted(lines: &mut Vec<Line<'static>>, home: &Home) {
     if home.data.plan_uncommitted {
-        lines.push(Line::styled("not committed", role_style(Role::Warn)));
+        lines.push(Line::styled(
+            "not committed: press c to commit it, or run",
+            role_style(Role::Warn),
+        ));
         lines.push(Line::styled(commit_hint(), role_style(Role::Dim)));
     }
 }
@@ -267,23 +330,37 @@ fn draw_settings(frame: &mut Frame, home: &Home, area: Rect) {
 }
 
 fn draw_status(frame: &mut Frame, home: &Home, area: Rect) {
-    if let Some(message) = &home.message {
+    let mut message_area = area;
+    if let Some(started) = home.committing {
+        let [activity, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        message_area = rest;
         frame.render_widget(
-            Paragraph::new(message.clone())
-                .style(Style::new().fg(Color::Yellow))
-                .wrap(Wrap { trim: true }),
-            area,
+            Paragraph::new(Line::from(vec![
+                Span::styled(spinner(home.frame), role_style(Role::Accent)),
+                Span::raw(format!(
+                    " Committing {}… {}s",
+                    plan_file(home),
+                    started.elapsed().as_secs()
+                )),
+            ])),
+            activity,
+        );
+    }
+    if let Some(notice) = &home.message {
+        frame.render_widget(
+            Paragraph::new(Line::from(notice_span(notice))).wrap(Wrap { trim: true }),
+            message_area,
         );
     }
 }
 
 fn draw_keys(frame: &mut Frame, home: &Home, area: Rect) {
-    let mut spans = Vec::new();
-    for (key, what) in home.available_keys() {
-        spans.push(Span::styled(key, role_style(Role::Heading)));
-        spans.push(Span::styled(format!(" {what}  "), role_style(Role::Dim)));
+    let mut keys = home.footer();
+    if home.mode == Mode::Normal {
+        keys.push(item("?", "shortcuts"));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(Paragraph::new(Line::from(footer_spans(&keys))), area);
 }
 
 /// The last `max` characters of `text`, with `…` in front when it was cut,
@@ -313,27 +390,42 @@ fn draw_popup(frame: &mut Frame, home: &Home, area: Rect) {
             draw_list_popup(frame, area, " Effort ", rows, *selected, None);
             return;
         }
-        Mode::Help => (
-            " Keys ",
-            HELP_KEYS
-                .iter()
-                .map(|(key, what)| {
-                    Line::from(vec![
-                        Span::styled(format!("{key:<12}"), role_style(Role::Heading)),
-                        Span::raw(*what),
-                    ])
-                })
-                .chain([Line::raw(""), Line::raw("Press any key to close.")])
-                .collect(),
-        ),
-        Mode::ConfirmQuit => (
-            " Quit ",
-            vec![
-                Line::raw("The agent is writing the plan. Cancel it and quit?"),
-                Line::raw(""),
-                Line::raw("y: confirm   any other key: cancel"),
-            ],
-        ),
+        Mode::Help => {
+            let body = shortcut_lines(&Home::shortcuts());
+            render_popup(frame, area, " Shortcuts ", body, POPUP_WIDTH);
+            return;
+        }
+        Mode::ConfirmQuit(row) => {
+            let why = if home.planning.is_some() {
+                "The plan being written is discarded."
+            } else {
+                "The running phase is interrupted."
+            };
+            let body = confirm_body(why, "Quit", "Keep working", *row);
+            render_popup(frame, area, " Quit phasewise? ", body, POPUP_WIDTH);
+            return;
+        }
+        Mode::ConfirmStopPlan(row) => {
+            let body = confirm_body(
+                "The plan being written is discarded.",
+                "Stop planning",
+                "Keep working",
+                *row,
+            );
+            render_popup(frame, area, " Stop planning? ", body, POPUP_WIDTH);
+            return;
+        }
+        Mode::ConfirmCommitStart(row) => {
+            let body = confirm_body(
+                "A run needs a clean working tree. Commit the plan and start the run?",
+                "Commit and start",
+                "Cancel",
+                *row,
+            );
+            let title = format!(" {} is not committed ", plan_file(home));
+            render_popup(frame, area, &title, body, POPUP_WIDTH);
+            return;
+        }
         Mode::GoalInput(buffer) => (
             " Plan ",
             vec![
@@ -343,14 +435,17 @@ fn draw_popup(frame: &mut Frame, home: &Home, area: Rect) {
                 Line::raw("Enter: write the plan   Esc: cancel"),
             ],
         ),
-        Mode::ConfirmReplace(_) => (
-            " Replace plan ",
-            vec![
-                Line::raw(format!("Replace {}? (y/N)", plan_file(home))),
-                Line::raw(""),
-                Line::raw("y: replace   any other key: cancel"),
-            ],
-        ),
+        Mode::ConfirmReplace(_, row) => {
+            let body = confirm_body(
+                "The agent writes a new plan in its place. Your current file is overwritten.",
+                "Replace it",
+                "Cancel",
+                *row,
+            );
+            let title = format!(" Replace {}? ", plan_file(home));
+            render_popup(frame, area, &title, body, POPUP_WIDTH);
+            return;
+        }
         Mode::ModelInput(buffer) => (
             " Model ",
             vec![
@@ -459,7 +554,9 @@ mod tests {
     use crate::agent::ModelInfo;
     use crate::display::{EventLine, plan_event_line};
     use crate::ops::PlanEvent;
-    use crate::tui::data::{HomeData, HomePhase, PlanProblem};
+    use crate::state::{PhaseStatus, RunStatus};
+    use crate::tui::data::{HomeData, HomePhase, PlanProblem, RunPhaseSummary, RunSummary};
+    use crate::tui::shared::Notice;
 
     fn data(plan: PlanState) -> HomeData {
         HomeData {
@@ -469,6 +566,7 @@ mod tests {
             plan_path: PathBuf::from("/work/demo/phasewise.md"),
             plan,
             plan_uncommitted: false,
+            run: None,
         }
     }
 
@@ -618,7 +716,7 @@ mod tests {
     #[test]
     fn replace_confirmation() {
         let mut home = home(valid_plan());
-        home.mode = Mode::ConfirmReplace("goal".into());
+        home.mode = Mode::ConfirmReplace("goal".into(), 1);
         let terminal = render(&home);
         insta::assert_snapshot!(terminal.backend());
     }
@@ -717,16 +815,84 @@ mod tests {
     #[test]
     fn status_message_is_shown() {
         let mut home = home(valid_plan());
-        home.message = Some(
-            "Plan written to phasewise.md (3 phases, $0.12). Review it, commit it, then press Enter."
-                .into(),
-        );
+        home.message = Some(Notice::ok(
+            "Plan written to phasewise.md (3 phases, $0.12). Review it, commit it, then press Enter.",
+        ));
         let terminal = render(&home);
         let text = format!("{}", terminal.backend());
         assert!(
             text.contains("Plan written to phasewise.md (3 phases, $0.12). Review it, commit it,"),
             "{text}"
         );
+    }
+
+    fn run_summary(status: RunStatus) -> RunSummary {
+        let phase = |number, title: &str, status| RunPhaseSummary {
+            number,
+            title: title.into(),
+            status,
+            started_at: None,
+        };
+        RunSummary {
+            id: "20260101-120000".into(),
+            status,
+            run_branch: "phasewise/20260101-120000".into(),
+            original_branch: "main".into(),
+            phases: vec![
+                phase(1, "Scaffold the project", PhaseStatus::Done),
+                phase(2, "Add the parser", PhaseStatus::Running),
+                phase(3, "Write the docs", PhaseStatus::Pending),
+            ],
+        }
+    }
+
+    #[test]
+    fn active_run_card() {
+        let mut home = home(valid_plan());
+        home.data.run = Some(run_summary(RunStatus::Active));
+        let terminal = render(&home);
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn last_run_line_for_a_finished_run() {
+        let mut home = home(valid_plan());
+        home.data.run = Some(run_summary(RunStatus::Aborted));
+        let text = format!("{}", render(&home).backend());
+        assert!(
+            text.contains("Last run 20260101-120000 · abandoned · o to open"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn commit_in_progress_and_new_confirmations() {
+        let mut home = home(valid_plan());
+        home.data.plan_uncommitted = true;
+        home.begin_commit();
+        let text = format!("{}", render(&home).backend());
+        assert!(text.contains("Committing phasewise.md…"), "{text}");
+        home.committing = None;
+        home.mode = Mode::ConfirmCommitStart(0);
+        let text = format!("{}", render(&home).backend());
+        assert!(text.contains("phasewise.md is not committed"), "{text}");
+        assert!(text.contains("❯ 1. Commit and start"), "{text}");
+        assert!(text.contains("2. Cancel"), "{text}");
+        assert!(text.contains("enter choose"), "{text}");
+        home.mode = Mode::ConfirmStopPlan(1);
+        let text = format!("{}", render(&home).backend());
+        assert!(text.contains("❯ 2. Keep working"), "{text}");
+    }
+
+    #[test]
+    fn notice_levels_show_their_glyph() {
+        let mut home = home(valid_plan());
+        home.message = Some(Notice::error("boom"));
+        let text = format!("{}", render(&home).backend());
+        assert!(text.contains("✗ boom"), "{text}");
+        home.message = Some(Notice::warn("careful"));
+        let text = format!("{}", render(&home).backend());
+        assert!(text.contains("! careful"), "{text}");
     }
 
     #[test]

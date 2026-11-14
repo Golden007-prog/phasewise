@@ -14,6 +14,7 @@ use crate::git::Git;
 use crate::ops::Run;
 use crate::plan::{self, AgentKind};
 use crate::state::{PhaseStatus, RunStatus};
+use jiff::Timestamp;
 
 /// One line of the Log tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,6 +269,32 @@ pub enum PlanState {
     Invalid(Vec<PlanProblem>),
 }
 
+/// One phase of the current run, as the home screen shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPhaseSummary {
+    pub number: usize,
+    pub title: String,
+    pub status: PhaseStatus,
+    /// When the phase started (for the elapsed time of a running one).
+    pub started_at: Option<Timestamp>,
+}
+
+/// The current run of the repository, of any status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSummary {
+    pub id: String,
+    pub status: RunStatus,
+    pub run_branch: String,
+    pub original_branch: String,
+    pub phases: Vec<RunPhaseSummary>,
+}
+
+impl RunSummary {
+    pub fn active(&self) -> bool {
+        self.status == RunStatus::Active
+    }
+}
+
 /// What the home screen shows about the repository and its plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HomeData {
@@ -282,6 +309,8 @@ pub struct HomeData {
     pub plan: PlanState,
     /// The plan file has changes that are not committed.
     pub plan_uncommitted: bool,
+    /// The current run (any status), if the repository has one.
+    pub run: Option<RunSummary>,
 }
 
 /// Loads the home data for the repository that contains `cwd`.
@@ -306,6 +335,27 @@ pub fn load_home_from(git: &Git) -> Result<HomeData> {
             .dirty_paths()?
             .iter()
             .any(|p| p == plan::DEFAULT_PLAN_FILE);
+    // A run that cannot be read is left out: the home screen must still open.
+    let run = crate::ops::load_from_git(git)
+        .ok()
+        .flatten()
+        .map(|run| RunSummary {
+            id: run.state.run_id.clone(),
+            status: run.state.status,
+            run_branch: run.state.run_branch.clone(),
+            original_branch: run.state.original_branch.clone(),
+            phases: run
+                .state
+                .phases
+                .iter()
+                .map(|p| RunPhaseSummary {
+                    number: p.number,
+                    title: p.title.clone(),
+                    status: p.status,
+                    started_at: p.started_at,
+                })
+                .collect(),
+        });
     Ok(HomeData {
         root,
         repo_name,
@@ -313,6 +363,7 @@ pub fn load_home_from(git: &Git) -> Result<HomeData> {
         plan_path,
         plan,
         plan_uncommitted,
+        run,
     })
 }
 

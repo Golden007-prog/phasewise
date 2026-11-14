@@ -297,7 +297,7 @@ pub fn load_current(cwd: &Path) -> Result<Option<Run>> {
     load_from_git(&git)
 }
 
-fn load_from_git(git: &Git) -> Result<Option<Run>> {
+pub(crate) fn load_from_git(git: &Git) -> Result<Option<Run>> {
     let Some(run_id) = PhasewiseDir::new(git.root()).read_current()? else {
         return Ok(None);
     };
