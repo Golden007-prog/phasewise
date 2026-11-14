@@ -122,3 +122,21 @@ deviates from the original plan, with the reason.
   `result`; the summary joins them.
 - **`doctor` does not check logins**: the plan scopes it to presence, version
   and repository; login subcommands could reach the network.
+
+## Build phase 6
+
+- **`ops::retry/rollback/abort`** share `check_active_unlocked` and
+  `check_on_run_branch` with `check_can_advance`. `retry` targets the
+  highest-numbered `failed`/`awaiting_review` phase; `retry` and `rollback`
+  keep `attempts` and clear everything else of the reset phases.
+- **`ops::prepare_rollback`** (public) validates a rollback and returns the
+  target SHA so the CLI can describe it before asking for confirmation.
+- **Orphan recovery notice:** `Run.recovered` lists phases `load_with_recovery`
+  marked failed; the CLI prints the notice once to stderr (stdout stays clean
+  for `diff`). Every run-reading command goes through `ops::load_current`.
+- **`abort`** off the run branch only marks the run aborted; on it, leftovers
+  are committed (`phasewise: abort — uncommitted changes`) before switching.
+- **Fake agent:** new `broken_once` mode (marker file in `FAKE_LOG_DIR`) fails
+  the first fresh session and its resume, then succeeds on a later fresh one.
+- Error messages across `src/` now end with what to do (git failures, schema
+  version, lock, missing phase).

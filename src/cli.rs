@@ -173,12 +173,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Some(Command::Doctor) => doctor(),
         Some(Command::Run { plan, agent, auto }) => run_command(plan, agent, auto),
         Some(Command::Next { auto }) => next_command(auto),
-        Some(Command::Retry { .. }) => not_implemented("retry"),
-        Some(Command::Rollback { .. }) => not_implemented("rollback"),
+        Some(Command::Retry { note }) => retry_command(note),
+        Some(Command::Rollback { n, yes }) => rollback_command(n as usize, yes),
         Some(Command::Status) => status(),
         Some(Command::Diff { n }) => diff(n),
         Some(Command::Review) => not_implemented("review"),
-        Some(Command::Abort) => not_implemented("abort"),
+        Some(Command::Abort) => abort_command(),
     }
 }
 
@@ -309,10 +309,112 @@ fn run_command(plan: Option<PathBuf>, agent: Option<AgentArg>, auto: bool) -> Re
 }
 
 fn next_command(auto: bool) -> Result<ExitCode> {
-    let run = ops::load_current(&current_dir()?)?.ok_or_else(|| anyhow!(NO_RUN))?;
+    let run = load_run()?;
     drive(run, move |run, events, cancel| {
         ops::next(run, auto, events, cancel)
     })
+}
+
+/// Loads the latest run; says once if a phase left running was marked failed.
+fn load_run() -> Result<Run> {
+    let run = ops::load_current(&current_dir()?)?.ok_or_else(|| anyhow!(NO_RUN))?;
+    announce_recovery(&run);
+    Ok(run)
+}
+
+fn announce_recovery(run: &Run) {
+    for number in &run.recovered {
+        eprintln!(
+            "Phase {number} was left running by a previous phasewise process and is now marked failed (interrupted)."
+        );
+    }
+}
+
+fn retry_command(note: Option<String>) -> Result<ExitCode> {
+    let run = load_run()?;
+    drive(run, move |run, events, cancel| {
+        ops::retry(run, note.as_deref(), events, cancel).map(NextOutcome::Ran)
+    })
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(7).collect()
+}
+
+fn rollback_command(k: usize, yes: bool) -> Result<ExitCode> {
+    let mut run = load_run()?;
+    let sha = ops::prepare_rollback(&run, k)?;
+    let target = if k == 0 {
+        "the initial state (before phase 1)".to_string()
+    } else {
+        format!("the checkpoint of phase {k}")
+    };
+    println!(
+        "This goes back to {target} ({}) on {}:",
+        short_sha(&sha),
+        run.state.run_branch
+    );
+    println!("  git reset --hard {} and git clean -fd", short_sha(&sha));
+    println!(
+        "Changes after it are discarded and untracked files are deleted (ignored files are kept)."
+    );
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(anyhow!(
+                "Rollback needs confirmation and stdin is not a terminal. Pass --yes to confirm."
+            ));
+        }
+        print!("Continue? [y/N] ");
+        let _ = std::io::stdout().flush();
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("Cannot read the answer from stdin. Pass --yes to confirm.")?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Nothing changed.");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    ops::rollback(&mut run, k)?;
+    println!("Rolled back to {target} ({}).", short_sha(&sha));
+    let later = run.state.phases.iter().filter(|p| p.number > k).count();
+    if later > 0 {
+        println!("{later} later phase(s) are pending again.");
+    }
+    println!("Next: `phasewise next` runs the next phase.");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn abort_command() -> Result<ExitCode> {
+    let mut run = load_run()?;
+    let outcome = ops::abort(&mut run)?;
+    let state = &run.state;
+    println!("Run {} aborted.", state.run_id);
+    if let Some(sha) = &outcome.leftovers_sha {
+        println!(
+            "Uncommitted changes were saved in commit {} on {}.",
+            short_sha(sha),
+            state.run_branch
+        );
+    }
+    if outcome.switched {
+        println!("You are back on {}.", outcome.current_branch);
+    } else {
+        println!(
+            "You are on {}; it was not changed because you were not on the run branch.",
+            outcome.current_branch
+        );
+    }
+    println!(
+        "The run branch {} is kept. To use or remove it:",
+        state.run_branch
+    );
+    println!(
+        "  git switch {} && git merge --squash {} && git commit   integrate its work",
+        state.original_branch, state.run_branch
+    );
+    println!("  git branch -D {}   delete it", state.run_branch);
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The shared cancel flag; the first Ctrl-C sets it, the second one exits.
@@ -541,6 +643,7 @@ fn status() -> Result<ExitCode> {
         println!("{NO_RUN}");
         return Ok(ExitCode::SUCCESS);
     };
+    announce_recovery(&run);
     let state = &run.state;
     let run_status = match state.status {
         RunStatus::Active => "active",
@@ -645,7 +748,7 @@ fn next_step_hint(run: &Run) -> String {
 }
 
 fn diff(n: Option<u32>) -> Result<ExitCode> {
-    let run = ops::load_current(&current_dir()?)?.ok_or_else(|| anyhow!(NO_RUN))?;
+    let run = load_run()?;
     let state = &run.state;
     let number = match n {
         Some(n) => {

@@ -28,6 +28,20 @@ pub struct Run {
     pub paths: RunPaths,
     pub state: RunState,
     pub plan: Plan,
+    /// Phases that were left `running`/`verifying` by a dead process and were
+    /// marked `failed` (interrupted) while loading. The CLI reports them once.
+    pub recovered: Vec<usize>,
+}
+
+/// What `abort` did, for the caller to report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbortOutcome {
+    /// The branch checked out now.
+    pub current_branch: String,
+    /// True when `abort` switched to the original branch.
+    pub switched: bool,
+    /// Commit holding uncommitted changes found on the run branch, if any.
+    pub leftovers_sha: Option<String>,
 }
 
 /// How `next` ended.
@@ -50,7 +64,11 @@ pub fn start(cwd: &Path, plan_path: &Path, agent_override: Option<AgentKind>) ->
     check_repository(&git)?;
     let original_branch = git
         .current_branch()?
-        .ok_or_else(|| anyhow!("HEAD is detached"))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "HEAD is detached. Switch to a branch (`git switch <branch>`), then run phasewise again."
+            )
+        })?;
 
     git.ensure_excluded(".phasewise/")?;
     let run_id = new_run_id(Timestamp::now());
@@ -85,6 +103,7 @@ pub fn start(cwd: &Path, plan_path: &Path, agent_override: Option<AgentKind>) ->
         paths,
         state,
         plan,
+        recovered: Vec::new(),
     })
 }
 
@@ -155,13 +174,22 @@ fn load_from_git(git: &Git) -> Result<Option<Run>> {
     if !paths.state_file().exists() {
         return Ok(None);
     }
+    let before = RunState::load(&paths)?;
     let state = load_with_recovery(&paths)?;
+    let recovered = before
+        .phases
+        .iter()
+        .zip(&state.phases)
+        .filter(|(old, new)| old.status != new.status && new.status == PhaseStatus::Failed)
+        .map(|(old, _)| old.number)
+        .collect();
     let plan = plan::load(&paths.plan_copy())?;
     Ok(Some(Run {
         git: git.clone(),
         paths,
         state,
         plan,
+        recovered,
     }))
 }
 
@@ -201,7 +229,9 @@ pub fn approve(run: &mut Run) -> Result<()> {
         .phases
         .iter_mut()
         .find(|p| p.status == PhaseStatus::AwaitingReview)
-        .ok_or_else(|| anyhow!("No phase is awaiting review."))?;
+        .ok_or_else(|| {
+            anyhow!("No phase is awaiting review. Run `phasewise status` to see the run.")
+        })?;
     phase.status = PhaseStatus::Done;
     if !run
         .state
@@ -236,7 +266,8 @@ pub fn next(
     execute(run, auto, events, cancel).map(NextOutcome::Ran)
 }
 
-fn check_can_advance(run: &Run) -> Result<()> {
+/// The run must be active and no phasewise process may be running a phase.
+fn check_active_unlocked(run: &Run) -> Result<()> {
     if run.state.status != RunStatus::Active {
         bail!(
             "Run {} is not active. Start a new one with `phasewise run`.",
@@ -252,6 +283,25 @@ fn check_can_advance(run: &Run) -> Result<()> {
             .map_or(0, |p| p.number);
         bail!("Phase {number} is running in process {pid}. Wait for it to finish.");
     }
+    Ok(())
+}
+
+fn on_run_branch(run: &Run) -> Result<bool> {
+    Ok(run.git.current_branch()?.as_deref() == Some(run.state.run_branch.as_str()))
+}
+
+fn check_on_run_branch(run: &Run) -> Result<()> {
+    if !on_run_branch(run)? {
+        bail!(
+            "You are not on the run branch. Run `git switch {}` first.",
+            run.state.run_branch
+        );
+    }
+    Ok(())
+}
+
+fn check_can_advance(run: &Run) -> Result<()> {
+    check_active_unlocked(run)?;
     if let Some(failed) = run
         .state
         .phases
@@ -264,10 +314,7 @@ fn check_can_advance(run: &Run) -> Result<()> {
             failed.number - 1
         );
     }
-    let run_branch = &run.state.run_branch;
-    if run.git.current_branch()?.as_deref() != Some(run_branch.as_str()) {
-        bail!("You are not on the run branch. Run `git switch {run_branch}` first.");
-    }
+    check_on_run_branch(run)?;
     let dirty = dirty_paths(&run.git)?;
     if !dirty.is_empty() {
         bail!(
@@ -279,6 +326,149 @@ or run `phasewise rollback` to discard them.",
     Ok(())
 }
 
+/// Puts a phase back to `pending`, clearing everything but `attempts`.
+fn reset_phase(run: &mut Run, number: usize) {
+    if let Some(phase) = run.state.phase_mut(number) {
+        phase.status = PhaseStatus::Pending;
+        phase.session_id = None;
+        phase.checkpoint_sha = None;
+        phase.summary = None;
+        phase.failure = None;
+        phase.cost_usd = None;
+        phase.started_at = None;
+        phase.finished_at = None;
+    }
+}
+
+/// Reruns the highest-numbered `failed` or `awaiting_review` phase from the
+/// checkpoint before it, in a fresh session, with `note` added to the prompt.
+pub fn retry(
+    run: &mut Run,
+    note: Option<&str>,
+    events: &Sender<EngineEvent>,
+    cancel: &AtomicBool,
+) -> Result<PhaseStatus> {
+    check_active_unlocked(run)?;
+    let number = run
+        .state
+        .phases
+        .iter()
+        .rev()
+        .find(|p| matches!(p.status, PhaseStatus::Failed | PhaseStatus::AwaitingReview))
+        .map(|p| p.number)
+        .ok_or_else(|| {
+            anyhow!(
+                "Nothing to retry: no phase has failed or is awaiting review. \
+Run `phasewise status` to see the run, or `phasewise next` to continue."
+            )
+        })?;
+    check_on_run_branch(run)?;
+    let previous = run
+        .state
+        .checkpoint(number - 1)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "Phase {} has no checkpoint to go back to. Run `phasewise status`, \
+then `phasewise rollback 0` to start over.",
+                number - 1
+            )
+        })?;
+    run.git.reset_hard(&previous)?;
+    run.git.clean_untracked()?;
+    reset_phase(run, number);
+    run.state.save(&run.paths)?;
+    run_one(run, number, note, events, cancel)
+}
+
+/// Checks that `rollback k` can run and returns the SHA it goes back to.
+pub fn prepare_rollback(run: &Run, k: usize) -> Result<String> {
+    check_active_unlocked(run)?;
+    check_on_run_branch(run)?;
+    let valid = |n: usize| run.state.checkpoint(n).map(str::to_string);
+    valid(k).ok_or_else(|| {
+        let mut targets = vec!["0 (initial state)".to_string()];
+        targets.extend(
+            run.state
+                .phases
+                .iter()
+                .filter(|p| p.checkpoint_sha.is_some())
+                .map(|p| p.number.to_string()),
+        );
+        anyhow!(
+            "Phase {k} has no checkpoint to go back to. Valid targets: {}.",
+            targets.join(", ")
+        )
+    })
+}
+
+/// Goes back to the checkpoint of phase `k` (`0` = initial state); later
+/// phases become `pending` again.
+pub fn rollback(run: &mut Run, k: usize) -> Result<()> {
+    let sha = prepare_rollback(run, k)?;
+    run.git.reset_hard(&sha)?;
+    run.git.clean_untracked()?;
+    let numbers: Vec<usize> = run.state.phases.iter().map(|p| p.number).collect();
+    for number in numbers.into_iter().filter(|n| *n > k) {
+        reset_phase(run, number);
+    }
+    run.state.save(&run.paths)
+}
+
+/// Gives the run up: keeps uncommitted work in a commit on the run branch,
+/// returns to the original branch and marks the run `aborted`. Never deletes
+/// the run branch.
+pub fn abort(run: &mut Run) -> Result<AbortOutcome> {
+    check_active_unlocked(run)?;
+    let mut leftovers_sha = None;
+    let mut switched = false;
+    if on_run_branch(run)? {
+        if !dirty_paths(&run.git)?.is_empty() {
+            run.git.add_all()?;
+            let message = format!(
+                "phasewise: abort — uncommitted changes\n\nPhasewise-Run: {}",
+                run.state.run_id
+            );
+            leftovers_sha = Some(run.git.commit(&message, false)?);
+        }
+        run.git.switch(&run.state.original_branch)?;
+        switched = true;
+    }
+    run.state.status = RunStatus::Aborted;
+    run.state.save(&run.paths)?;
+    let current_branch = run
+        .git
+        .current_branch()?
+        .unwrap_or_else(|| "(detached HEAD)".to_string());
+    Ok(AbortOutcome {
+        current_branch,
+        switched,
+        leftovers_sha,
+    })
+}
+
+fn run_one(
+    run: &mut Run,
+    number: usize,
+    note: Option<&str>,
+    events: &Sender<EngineEvent>,
+    cancel: &AtomicBool,
+) -> Result<PhaseStatus> {
+    let agent = agent_for(run.state.agent);
+    let settings = settings(run)?;
+    let mut ctx = PhaseContext {
+        git: &run.git,
+        paths: &run.paths,
+        state: &mut run.state,
+        plan: &run.plan,
+        agent: agent.as_ref(),
+        settings: &settings,
+        events,
+        cancel,
+    };
+    run_phase(&mut ctx, number, note)
+}
+
 /// Runs the first pending phase. With `auto`, approves each phase that reaches
 /// `awaiting_review` and continues while phases remain; the last one stays
 /// `awaiting_review`. Stops at the first failure or on cancellation.
@@ -288,8 +478,6 @@ pub fn execute(
     events: &Sender<EngineEvent>,
     cancel: &AtomicBool,
 ) -> Result<PhaseStatus> {
-    let agent = agent_for(run.state.agent);
-    let settings = settings(run)?;
     loop {
         let number = run
             .state
@@ -300,17 +488,7 @@ pub fn execute(
             .ok_or_else(|| {
                 anyhow!("No phase is pending. Run `phasewise status` to see the run.")
             })?;
-        let mut ctx = PhaseContext {
-            git: &run.git,
-            paths: &run.paths,
-            state: &mut run.state,
-            plan: &run.plan,
-            agent: agent.as_ref(),
-            settings: &settings,
-            events,
-            cancel,
-        };
-        let status = run_phase(&mut ctx, number, None)?;
+        let status = run_one(run, number, None, events, cancel)?;
         let more = run
             .state
             .phases

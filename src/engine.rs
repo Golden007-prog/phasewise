@@ -105,7 +105,9 @@ impl PhaseContext<'_> {
     fn phase_state(&mut self, phase: usize) -> Result<&mut crate::state::PhaseState> {
         self.state
             .phase_mut(phase)
-            .ok_or_else(|| anyhow!("Phase {phase} does not exist in the run state"))
+            .ok_or_else(|| anyhow!(
+                "Phase {phase} does not exist in the run state. Run `phasewise status`; state.json may be damaged"
+            ))
     }
 
     /// Marks the phase `failed`, saves and reports it.
@@ -163,7 +165,9 @@ pub fn run_phase(
         .phases
         .iter()
         .find(|p| p.number == phase)
-        .ok_or_else(|| anyhow!("Phase {phase} does not exist in the plan"))?;
+        .ok_or_else(|| anyhow!(
+                "Phase {phase} does not exist in the plan copy of this run. Start a new run with `phasewise run`"
+            ))?;
     let title = plan_phase.title.clone();
     let mut verify_commands = ctx.plan.config.verify.clone();
     verify_commands.extend(plan_phase.verify.iter().cloned());

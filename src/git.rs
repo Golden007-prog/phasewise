@@ -26,7 +26,7 @@ impl Git {
             .context("Cannot run `git`. Install git and make sure it is on your PATH.")?;
         if !output.status.success() {
             return Err(anyhow!(
-                "Not inside a git repository. Run `git init` first."
+                "Not inside a git repository. Run `git init` or move into a repository."
             ));
         }
         let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -116,7 +116,7 @@ impl Git {
             .context("Cannot run `git`. Install git and make sure it is on your PATH.")?;
         if !output.status.success() {
             return Err(anyhow!(
-                "`git --version` failed: {}",
+                "`git --version` failed: {}. Check your git installation.",
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
@@ -306,7 +306,7 @@ impl Git {
 
 fn failure(args: &[&str], output: &Output) -> anyhow::Error {
     anyhow!(
-        "`git {}` failed: {}",
+        "`git {}` failed: {}. Fix the problem in the repository and try again.",
         args.join(" "),
         String::from_utf8_lossy(&output.stderr).trim()
     )

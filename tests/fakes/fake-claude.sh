@@ -1,7 +1,9 @@
 #!/bin/sh
 # Fake Claude Code for tests. Reads the prompt from stdin and emits stream-json.
 # FAKE_MODE (or FAKE_MODE_<N> per phase): success, fail, fix_on_resume,
-# never_fixes, commit, slow, branch. FAKE_LOG_DIR: append calls to calls.log.
+# never_fixes, broken_once, commit, slow, branch.
+# broken_once: the first fresh session (and its resume) writes broken output; a later
+# fresh session succeeds (needs FAKE_LOG_DIR for its marker file). FAKE_LOG_DIR: append calls to calls.log.
 
 if [ "$1" = "--version" ]; then
     echo "0.0.0-fake (Claude Code)"
@@ -57,6 +59,16 @@ case "$mode" in
         ;;
     never_fixes)
         printf 'broken\n' > "$file"
+        ;;
+    broken_once)
+        marker="$FAKE_LOG_DIR/broken-once-$n"
+        if [ -n "$resume" ] || [ ! -e "$marker" ]; then
+            : > "$marker"
+            printf 'broken\n' > "$file"
+            printf 'leftover\n' > "leftover-$n.txt"
+        else
+            printf 'phase %s\n' "$n" > "$file"
+        fi
         ;;
     commit)
         printf 'phase %s\n' "$n" > "$file"

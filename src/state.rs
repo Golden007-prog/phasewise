@@ -274,7 +274,8 @@ impl RunState {
         if version != Some(u64::from(SCHEMA_VERSION)) {
             let found = version.map_or_else(|| "missing".to_string(), |v| v.to_string());
             bail!(
-                "state.json has schema version {found}; this phasewise understands {SCHEMA_VERSION}"
+                "state.json has schema version {found}; this phasewise understands {SCHEMA_VERSION}. \
+Use the phasewise version that created the run, or start a new run"
             );
         }
         serde_json::from_value(value)
@@ -316,7 +317,9 @@ pub fn lock_holder(paths: &RunPaths) -> Option<u32> {
 impl LockGuard {
     pub fn acquire(paths: &RunPaths) -> Result<LockGuard> {
         if let Some(pid) = lock_holder(paths) {
-            bail!("phase is already running in process {pid}; wait for it or stop it");
+            bail!(
+                "A phase is already running in process {pid}. Wait for it to finish or stop that process."
+            );
         }
         let path = paths.lock_file();
         write_atomic(&path, format!("{}\n", std::process::id()).as_bytes())?;
@@ -426,9 +429,9 @@ mod tests {
         value["schema_version"] = serde_json::json!(2);
         write_atomic(&paths.state_file(), value.to_string().as_bytes()).unwrap();
         let err = RunState::load(&paths).unwrap_err().to_string();
-        assert_eq!(
-            err,
-            "state.json has schema version 2; this phasewise understands 1"
+        assert!(
+            err.starts_with("state.json has schema version 2; this phasewise understands 1."),
+            "{err}"
         );
     }
 
