@@ -7,7 +7,7 @@ use std::time::Duration;
 use common::{TestRepo, isolated_git_env};
 use phasewise::ops::{self, Run};
 use phasewise::state::PhaseStatus;
-use phasewise::tui::data::{load_diff, load_log, load_run_view, load_verify};
+use phasewise::tui::data::{LogLine, load_diff, load_log, load_run_view, load_verify};
 use tempfile::TempDir;
 
 const FAKE_CLAUDE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes/fake-claude.sh");
@@ -76,9 +76,28 @@ fn checkpointed_phase_shows_its_diff_log_and_verify_output() {
     assert_eq!(diff.note, None);
 
     let log = load_log(&run, 1);
-    assert_eq!(log[0], "── attempt 1 ──");
-    assert!(log.contains(&"Working on phase 1.".to_string()), "{log:?}");
-    assert!(log.contains(&"Write phase-1.txt".to_string()), "{log:?}");
+    assert_eq!(
+        log[0],
+        LogLine::Attempt {
+            number: 1,
+            resumed: false
+        }
+    );
+    let events: Vec<(&str, String, String)> = log
+        .iter()
+        .filter_map(|l| match l {
+            LogLine::Event(e) => Some((e.icon, e.label.clone(), e.detail.clone())),
+            LogLine::Attempt { .. } => None,
+        })
+        .collect();
+    assert!(
+        events.contains(&("›", String::new(), "Working on phase 1.".to_string())),
+        "{log:?}"
+    );
+    assert!(
+        events.contains(&("✎", "Write".to_string(), "phase-1.txt".to_string())),
+        "{log:?}"
+    );
 
     assert_ne!(load_verify(&run, 1), "No verification output yet.");
     assert_eq!(load_verify(&run, 3), "No verification output yet.");
@@ -110,7 +129,19 @@ fn failed_phase_shows_the_worktree_diff_and_untracked_files() {
 
     let attempts = run.state.phase(2).expect("phase 2").attempts;
     let log = load_log(&run, 2);
-    let separators = log.iter().filter(|l| l.starts_with("── attempt ")).count();
-    assert_eq!(separators, attempts as usize);
-    assert!(attempts >= 1);
+    let headings: Vec<(u32, bool)> = log
+        .iter()
+        .filter_map(|l| match l {
+            LogLine::Attempt { number, resumed } => Some((*number, *resumed)),
+            LogLine::Event(_) => None,
+        })
+        .collect();
+    assert_eq!(headings.len(), attempts as usize);
+    assert!(attempts >= 2, "the phase must have been retried");
+    // The first attempt starts a session; the retries resume it.
+    assert_eq!(headings[0], (1, false));
+    assert!(
+        headings[1..].iter().all(|(_, resumed)| *resumed),
+        "{headings:?}"
+    );
 }

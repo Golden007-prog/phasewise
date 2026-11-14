@@ -2,7 +2,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::data::{DiffView, RunView};
+use super::data::{DiffView, LogLine, RunView};
 use crate::state::PhaseStatus;
 
 const DEFAULT_PAGE: u16 = 10;
@@ -42,7 +42,23 @@ pub enum Mode {
     ConfirmQuit,
     /// Optional note for a retry, being typed.
     Note(String),
+    /// Popup listing every key.
+    Help,
 }
+
+/// Every key of the review screen, for the help popup.
+pub const HELP_KEYS: [(&str, &str); 10] = [
+    ("j / Down", "next phase"),
+    ("k / Up", "previous phase"),
+    ("Tab", "switch tab (Diff, Log, Verify)"),
+    ("PgUp / PgDn", "scroll the right panel"),
+    ("n", "approve the phase and run the next one"),
+    ("r", "retry the phase, with an optional note"),
+    ("b", "roll back to the checkpoint of the phase"),
+    ("x", "interrupt the running phase"),
+    ("?", "show or hide this help"),
+    ("q / Ctrl-C", "quit"),
+];
 
 /// What the event loop must do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +86,7 @@ pub struct App {
     pub running: Option<usize>,
     pub message: Option<String>,
     pub diff: DiffView,
-    pub log: Vec<String>,
+    pub log: Vec<LogLine>,
     pub verify: String,
 }
 
@@ -113,7 +129,7 @@ impl App {
         self.selected = self.selected.min(self.view.phases.len().saturating_sub(1));
     }
 
-    pub fn set_caches(&mut self, diff: DiffView, log: Vec<String>, verify: String) {
+    pub fn set_caches(&mut self, diff: DiffView, log: Vec<LogLine>, verify: String) {
         self.diff = diff;
         self.log = log;
         self.verify = verify;
@@ -139,6 +155,11 @@ impl App {
                 is_yes(key).then_some(Command::Quit)
             }
             Mode::Note(buffer) => self.key_note(key, buffer),
+            Mode::Help => {
+                // Any key closes the help; `?` is the one that opened it.
+                self.mode = Mode::Normal;
+                None
+            }
         }
     }
 
@@ -172,6 +193,10 @@ impl App {
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit(),
             KeyCode::Char('q') => self.quit(),
+            KeyCode::Char('?') => {
+                self.mode = Mode::Help;
+                None
+            }
             KeyCode::Char('j') | KeyCode::Down => self.select(1),
             KeyCode::Char('k') | KeyCode::Up => self.select(-1),
             KeyCode::Tab => {
@@ -310,6 +335,7 @@ impl App {
                 return vec![("y", "confirm"), ("any other key", "cancel")];
             }
             Mode::Note(_) => return vec![("Enter", "retry"), ("Esc", "cancel")],
+            Mode::Help => return vec![("any key", "close")],
             Mode::Normal => {}
         }
         let mut keys = vec![("j/k", "phase"), ("Tab", "tab"), ("PgUp/PgDn", "scroll")];
@@ -325,6 +351,7 @@ impl App {
         if self.running.is_some() {
             keys.push(("x", "interrupt"));
         }
+        keys.push(("?", "help"));
         keys.push(("q", "quit"));
         keys
     }
@@ -596,15 +623,31 @@ mod tests {
     fn available_keys_follow_the_state() {
         let names = |a: &App| a.available_keys().iter().map(|k| k.0).collect::<Vec<_>>();
         let a = reviewing();
-        assert_eq!(names(&a), ["j/k", "Tab", "PgUp/PgDn", "n", "r", "b", "q"]);
+        assert_eq!(
+            names(&a),
+            ["j/k", "Tab", "PgUp/PgDn", "n", "r", "b", "?", "q"]
+        );
         let mut running = reviewing();
         running.running = Some(3);
-        assert_eq!(names(&running), ["j/k", "Tab", "PgUp/PgDn", "x", "q"]);
+        assert_eq!(names(&running), ["j/k", "Tab", "PgUp/PgDn", "x", "?", "q"]);
         let mut note = reviewing();
         note.mode = Mode::Note(String::new());
         assert_eq!(names(&note), ["Enter", "Esc"]);
         let mut confirm = reviewing();
         confirm.mode = Mode::ConfirmQuit;
         assert_eq!(names(&confirm), ["y", "any other key"]);
+    }
+
+    #[test]
+    fn question_mark_toggles_the_help_popup() {
+        let mut a = reviewing();
+        assert_eq!(a.handle_key(key('?')), None);
+        assert_eq!(a.mode, Mode::Help);
+        // Keys do nothing but close it.
+        assert_eq!(a.handle_key(key('n')), None);
+        assert_eq!(a.mode, Mode::Normal);
+        a.handle_key(key('?'));
+        assert_eq!(a.handle_key(key('?')), None);
+        assert_eq!(a.mode, Mode::Normal);
     }
 }

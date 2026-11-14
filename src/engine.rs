@@ -65,6 +65,10 @@ pub enum EngineEvent {
         phase: usize,
         status: PhaseStatus,
         failure: Option<Failure>,
+        /// Files changed by the phase (successful phases only).
+        files: Option<usize>,
+        /// Cost of the phase when the agent reported one.
+        cost_usd: Option<f64>,
     },
 }
 
@@ -121,6 +125,8 @@ impl PhaseContext<'_> {
             phase,
             status: PhaseStatus::Failed,
             failure: Some(failure),
+            files: None,
+            cost_usd: None,
         });
         Ok(PhaseStatus::Failed)
     }
@@ -589,11 +595,18 @@ user.name and user.email), then run `phasewise retry` to run the phase again"
     state.status = PhaseStatus::AwaitingReview;
     state.finished_at = Some(Timestamp::now());
     ctx.save()?;
+    let cost_usd = ctx.state.phase(phase).and_then(|p| p.cost_usd);
+    let files = ctx
+        .state
+        .checkpoint(phase - 1)
+        .and_then(|from| ctx.git.changed_file_count(from, &sha).ok());
     ctx.emit(EngineEvent::CheckpointCreated { phase, sha });
     ctx.emit(EngineEvent::PhaseFinished {
         phase,
         status: PhaseStatus::AwaitingReview,
         failure: None,
+        files,
+        cost_usd,
     });
     Ok(PhaseStatus::AwaitingReview)
 }

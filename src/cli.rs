@@ -12,13 +12,14 @@ use anyhow::{Context, Result, anyhow};
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
-use crate::display::{describe_event, failure_kind_label, status_label};
+use crate::display::{event_line, failure_kind_label, phase_header, phase_summary, status_label};
 use crate::engine::EngineEvent;
 use crate::git::Git;
 use crate::ops::{self, NextOutcome, Run};
 use crate::plan::{self, AgentKind};
 use crate::process;
 use crate::state::{PhaseStatus, RunStatus};
+use crate::style::{Role, Styler};
 
 // Output to stdout goes through these macros instead of `println!`/`print!`,
 // which panic when stdout is closed (for example `| head`). A closed stdout
@@ -240,11 +241,15 @@ fn check(arg: Option<PathBuf>) -> Result<ExitCode> {
 }
 
 fn print_plan(plan: &plan::Plan, path: &Path) {
+    let st = Styler::for_stdout();
     let config = &plan.config;
     outln!(
-        "{} ({})",
-        plan.title.as_deref().unwrap_or("(untitled)"),
-        path.display()
+        "{}",
+        st.heading(&format!(
+            "{} ({})",
+            plan.title.as_deref().unwrap_or("(untitled)"),
+            path.display()
+        ))
     );
     outln!("Agent: {}", config.agent);
     if config.verify.is_empty() {
@@ -252,7 +257,7 @@ fn print_plan(plan: &plan::Plan, path: &Path) {
     } else {
         outln!("Checks after every phase:");
         for command in &config.verify {
-            outln!("  - {command}");
+            outln!("  {} {command}", st.dim("⚙"));
         }
     }
     outln!("Max retries: {}", config.max_retries);
@@ -260,17 +265,24 @@ fn print_plan(plan: &plan::Plan, path: &Path) {
     outln!("Check timeout: {} s", config.verify_timeout_seconds);
     outln!();
     for phase in &plan.phases {
-        outln!("  {}. {}", phase.number, phase.title);
+        outln!(
+            "  {}",
+            st.heading(&format!("{}. {}", phase.number, phase.title))
+        );
+        // v0.2 part 2 adds the phase's model settings here.
         if phase.verify.is_empty() {
-            outln!("       (no phase-specific checks)");
+            outln!("     {}", st.dim("(no phase-specific checks)"));
         } else {
             for command in &phase.verify {
-                outln!("       - {command}");
+                outln!("     {} {command}", st.dim("⚙"));
             }
         }
     }
     outln!();
-    outln!("{} phases. The plan is valid.", plan.phases.len());
+    outln!(
+        "{}",
+        st.ok(&format!("{} phases. The plan is valid.", plan.phases.len()))
+    );
 }
 
 fn doctor() -> Result<ExitCode> {
@@ -451,6 +463,7 @@ where
 {
     let cancel = process::install_signal_handler(Some(INTERRUPT_NOTICE))?;
     let verify_secs = ops::settings(&run)?.verify_timeout.as_secs();
+    let run_agent_name = run.state.agent.to_string();
     let (tx, rx) = mpsc::channel();
     let worker = thread::spawn(move || {
         let mut run = run;
@@ -458,16 +471,18 @@ where
         (run, result)
     });
     let started = Instant::now();
+    let st = Styler::for_stdout();
+    let agent = run_agent_name;
     for event in rx {
-        if let Some(line) = describe_event(&event, verify_secs) {
-            let secs = started.elapsed().as_secs();
-            // A closed stdout (for example `| head`) must not abort the run.
-            let _ = writeln!(
-                std::io::stdout(),
-                "[{:02}:{:02}] {line}",
-                secs / 60,
-                secs % 60
-            );
+        // A closed stdout (for example `| head`) must not abort the run, so
+        // write errors are ignored by `outln!`.
+        if let Some(header) = phase_header(&event, &agent, None, None, &st) {
+            outln!();
+            outln!("{header}");
+        } else if let Some(line) = event_line(&event, verify_secs) {
+            outln!("{}", line.at(started.elapsed().as_secs()).render(&st));
+        } else if let Some(summary) = phase_summary(&event, &st) {
+            outln!("{summary}");
         }
     }
     let (run, result) = worker
@@ -481,7 +496,7 @@ fn report_outcome(run: &Run, outcome: NextOutcome) -> ExitCode {
     match outcome {
         NextOutcome::Completed => {
             let state = &run.state;
-            outln!("All phases done.");
+            outln!("{}", Styler::for_stdout().ok("All phases done."));
             outln!("To integrate the work:");
             outln!(
                 "  git switch {} && git merge --squash {} && git commit",
@@ -495,18 +510,17 @@ fn report_outcome(run: &Run, outcome: NextOutcome) -> ExitCode {
             ExitCode::from(EXIT_PHASE_FAILED)
         }
         NextOutcome::Ran(_) => {
-            let number = run
-                .state
-                .phases
-                .iter()
-                .rev()
-                .find(|p| p.status == PhaseStatus::AwaitingReview)
-                .map_or(0, |p| p.number);
+            let st = Styler::for_stdout();
             outln!();
-            outln!("Phase {number} is ready for review.");
-            outln!("  phasewise diff      show what changed");
-            outln!("  phasewise review    inspect it interactively");
-            outln!("  phasewise next      approve it and continue");
+            outln!("{}", st.dim("  phasewise diff      show what changed"));
+            outln!(
+                "{}",
+                st.dim("  phasewise review    inspect it interactively")
+            );
+            outln!(
+                "{}",
+                st.dim("  phasewise next      approve it and continue")
+            );
             ExitCode::SUCCESS
         }
     }
@@ -521,24 +535,37 @@ fn print_failure(run: &Run) {
     else {
         return;
     };
+    let st = Styler::for_stdout();
     outln!();
     if let Some(failure) = &phase.failure {
         outln!(
-            "Phase {} failed ({}): {}",
-            phase.number,
-            failure_kind_label(failure.kind),
-            failure.detail
+            "{}",
+            st.fail(&format!(
+                "Phase {} failed ({}): {}",
+                phase.number,
+                failure_kind_label(failure.kind),
+                failure.detail
+            ))
         );
     } else {
-        outln!("Phase {} failed.", phase.number);
+        outln!("{}", st.fail(&format!("Phase {} failed.", phase.number)));
     }
     outln!("Options:");
-    outln!("  phasewise retry [--note \"...\"]   rerun the phase in a new session");
     outln!(
-        "  phasewise rollback {}              go back to the previous checkpoint",
-        phase.number - 1
+        "{}",
+        st.dim("  phasewise retry [--note \"...\"]   rerun the phase in a new session")
     );
-    outln!("  or inspect the working tree; it was left as the agent left it");
+    outln!(
+        "{}",
+        st.dim(&format!(
+            "  phasewise rollback {}              go back to the previous checkpoint",
+            phase.number - 1
+        ))
+    );
+    outln!(
+        "{}",
+        st.dim("  or inspect the working tree; it was left as the agent left it")
+    );
 }
 
 fn status() -> Result<ExitCode> {
@@ -589,6 +616,7 @@ fn status() -> Result<ExitCode> {
             ]
         })
         .collect();
+    // v0.2 part 2 adds a MODEL column before TITLE.
     let headers = ["#", "STATUS", "TRIES", "FILES", "COST"];
     let mut widths = headers.map(str::len);
     for row in &rows {
@@ -596,28 +624,56 @@ fn status() -> Result<ExitCode> {
             *width = (*width).max(cell.chars().count());
         }
     }
-    let line = |cells: [&str; 5], title: &str| {
+    let st = Styler::for_stdout();
+    // Cells are padded before colouring so the ANSI codes do not affect widths.
+    let line = |cells: [&str; 5], title: &str, status_role: Option<Role>| {
         let mut out = String::new();
-        for (cell, width) in cells.iter().zip(widths) {
-            out.push_str(&format!("{cell:<width$}  "));
+        for (i, (cell, width)) in cells.iter().zip(widths).enumerate() {
+            let padded = format!("{cell:<width$}");
+            match (i, status_role) {
+                (1, Some(role)) => out.push_str(&st.paint(role, &padded)),
+                (_, None) => out.push_str(&st.heading(&padded)),
+                _ => out.push_str(&padded),
+            }
+            out.push_str("  ");
         }
-        out.push_str(title);
+        match status_role {
+            None => out.push_str(&st.heading(title)),
+            Some(_) => out.push_str(title),
+        }
         outln!("{out}");
     };
-    line(headers, "TITLE");
+    line(headers, "TITLE", None);
     for (row, phase) in rows.iter().zip(&state.phases) {
-        line([&row[0], &row[1], &row[2], &row[3], &row[4]], &phase.title);
+        line(
+            [&row[0], &row[1], &row[2], &row[3], &row[4]],
+            &phase.title,
+            Some(status_role(phase.status)),
+        );
         if let (PhaseStatus::Failed, Some(failure)) = (phase.status, &phase.failure) {
             outln!(
-                "    {}: {}",
-                failure_kind_label(failure.kind),
-                failure.detail
+                "{}",
+                st.fail(&format!(
+                    "    {}: {}",
+                    failure_kind_label(failure.kind),
+                    failure.detail
+                ))
             );
         }
     }
     outln!();
-    outln!("{}", next_step_hint(&run));
+    outln!("{}", st.dim(&next_step_hint(&run)));
     Ok(ExitCode::SUCCESS)
+}
+
+fn status_role(status: PhaseStatus) -> Role {
+    match status {
+        PhaseStatus::Done => Role::Ok,
+        PhaseStatus::AwaitingReview => Role::Accent,
+        PhaseStatus::Failed => Role::Fail,
+        PhaseStatus::Running | PhaseStatus::Verifying => Role::Warn,
+        PhaseStatus::Pending => Role::Dim,
+    }
 }
 
 fn next_step_hint(run: &Run) -> String {

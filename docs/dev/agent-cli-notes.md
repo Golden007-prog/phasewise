@@ -147,6 +147,34 @@ source of the installed version (`codex-rs/exec/src/exec_events.rs` at tag
 
 The fixtures `tests/fixtures/codex-*.synthetic.jsonl` follow these shapes.
 
+## Models and effort (checked 2026-11-14)
+
+Claude Code 2.1.325 (`claude --help`, <https://code.claude.com/docs/en/model-config>):
+
+- `--model <model>`: an alias or a full model name. Documented aliases:
+  `default` (no override), `best` (= `opus`), `fable`, `opus`, `sonnet`,
+  `haiku`, `opus[1m]`, `sonnet[1m]`, `opusplan`.
+- `--effort <level>`: `low`, `medium`, `high`, `xhigh`, `max`. A model without a
+  level falls back to the highest supported level below it.
+- No non-interactive command lists the models of the account (only the
+  interactive `/model` picker). Managed settings (`availableModels`, …) can
+  restrict them.
+
+Codex 0.160.0 (`codex exec --help`, `codex debug models --help`):
+
+- `-m, --model <MODEL>`; effort through `-c model_reasoning_effort="<level>"`
+  (the key exists in the binary; levels in the catalog: `low`, `medium`,
+  `high`, `xhigh`, `max`, plus `ultra` on one model).
+- Both go before the `resume` subcommand:
+  `codex exec --json --sandbox workspace-write -m X -c model_reasoning_effort="high" resume --help`
+  parses.
+- `codex debug models` prints the model catalog as JSON, `{"models": [...]}`,
+  with `slug`, `display_name`, `description`, `visibility` (`list` or `hide`)
+  and `supported_reasoning_levels` (`[{"effort": ...}]`). It answered in 0.05 s
+  from the local cache; `--bundled` skips the refresh.
+- `--sandbox read-only` exists for read-only runs; `-o, --output-last-message
+  <FILE>` exists but phasewise reads the JSON stream instead.
+
 ## Real smoke test (plan section 8)
 
 **Claude Code: passed on 2026-11-14** with Claude Code 2.1.325, after the

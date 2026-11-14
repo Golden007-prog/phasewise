@@ -15,5 +15,6 @@ pub mod plan;
 pub mod process;
 pub mod prompt;
 pub mod state;
+pub mod style;
 pub mod tui;
 pub mod verify;

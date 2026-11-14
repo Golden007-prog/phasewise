@@ -21,11 +21,12 @@ with the code, and record the reason in `decisions.md`.
 | `agent/claude.rs`, `agent/codex.rs` | Command building and stdout translation per agent. |
 | `engine.rs` | One phase cycle: agent → verify → retries → checkpoint. Emits `EngineEvent`s. |
 | `ops.rs` | Run-level operations shared by CLI and TUI: start, approve/next, retry, rollback, abort, load active run. |
-| `display.rs` | Formatting of engine events and statuses, shared by the CLI and the TUI. |
+| `display.rs` | The one place that turns events into text: structured `EventLine`s (time, icon, label, detail, role), phase header and summary, status labels. Rendered by the CLI (via `Styler`) and the TUI (ratatui styles). See `design-v0.2.md` §1. |
+| `style.rs` | `Styler` and `Role`: ANSI colour for the CLI output, only on a terminal with `NO_COLOR` unset or empty and `TERM` not `dumb`. |
 | `doctor.rs` | `phasewise doctor`: presence and version of git, claude and codex, repository suitability. |
 | `tui/mod.rs` | `phasewise review`: terminal setup/restore, event loop, engine worker threads. |
 | `tui/app.rs` | Pure state machine: key in, `Command` out. |
-| `tui/data.rs` | Read-only loaders of run, diff, log and verify data. |
+| `tui/data.rs` | Read-only loaders of run, diff, log (`LogLine`: attempt headings and `EventLine`s) and verify data. |
 | `tui/view.rs` | Rendering with ratatui (snapshot-tested). |
 
 The engine and `ops` never print. They report through `std::sync::mpsc::Sender<EngineEvent>`; the CLI and the TUI are the two consumers.
@@ -174,7 +175,7 @@ pub enum EngineEvent {
     VerifyFinished { phase: usize, command: String, ok: bool, exit_code: Option<i32>, timed_out: bool },
     Retrying { phase: usize, reason: String },
     CheckpointCreated { phase: usize, sha: String },
-    PhaseFinished { phase: usize, status: PhaseStatus, failure: Option<Failure> },
+    PhaseFinished { phase: usize, status: PhaseStatus, failure: Option<Failure>, files: Option<usize>, cost_usd: Option<f64> },
 }
 ```
 
@@ -185,7 +186,7 @@ pub enum EngineEvent {
 3. Failure → `failed`: cancel → `interrupted`; timeout → `timeout`; non-zero exit, `Finished { ok: false }`, or HEAD no longer on the run branch → `agent_error` (detail includes the exit code, the agent's error text or the last stderr lines). No automatic retry for these. A checkpoint that cannot be created (HEAD moved off the run branch by a verify command, `git add`/`commit` failure) → `checkpoint_failed`.
 4. Status `verifying`, save, run global then phase verify commands.
 5. Verification failed and retries left (`max_retries` per `run_phase` call) → emit `Retrying`, prompt = `resume_prompt(report)` with the resume command if a session id is known, else `fresh_retry_prompt`; back to 2. No retries left → `failed` with `verify_failed`, tree left as is.
-6. Verification passed → `git add -A`, checkpoint commit (`--allow-empty`), `checkpoint_sha = HEAD`, status `awaiting_review`, save, emit `CheckpointCreated` and `PhaseFinished`.
+6. Verification passed → `git add -A`, checkpoint commit (`--allow-empty`), `checkpoint_sha = HEAD`, status `awaiting_review`, save, emit `CheckpointCreated` and `PhaseFinished` (with the changed-file count and the cost, for the end-of-phase summary line).
 
 ## Operations (`ops.rs`)
 

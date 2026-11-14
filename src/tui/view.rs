@@ -6,14 +6,18 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use super::app::{App, Mode, Tab};
-use super::data::DiffView;
-use crate::display::status_label;
+use super::app::{App, HELP_KEYS, Mode, Tab};
+use super::data::{DiffView, LogLine};
+use crate::display::{EventLine, status_label};
 use crate::state::PhaseStatus;
+use crate::style::Role;
 
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 20;
-const LIST_WIDTH: u16 = 30;
+/// The phase panel takes 30 % of the width, within these limits.
+const LIST_PERCENT: u16 = 30;
+const LIST_MIN: u16 = 24;
+const LIST_MAX: u16 = 48;
 const POPUP_WIDTH: u16 = 56;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -28,8 +32,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .areas(area);
-    let [left, right] =
-        Layout::horizontal([Constraint::Length(LIST_WIDTH), Constraint::Min(1)]).areas(body);
+    let [left, right] = Layout::horizontal([
+        Constraint::Length(list_width(area.width)),
+        Constraint::Min(1),
+    ])
+    .areas(body);
     draw_header(frame, app, header);
     draw_phases(frame, app, left);
     draw_detail(frame, app, right);
@@ -57,39 +64,79 @@ fn draw_too_small(frame: &mut Frame, area: Rect) {
     );
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let v = &app.view;
-    let line = Line::from(vec![
-        Span::styled("phasewise", Style::new().add_modifier(Modifier::BOLD)),
-        Span::raw(format!(
-            "  run {}  {}  [{}]  {}",
-            v.run_id, v.plan_title, v.agent, v.run_branch
-        )),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+/// Width of the phase panel for a terminal `total` columns wide.
+pub fn list_width(total: u16) -> u16 {
+    (total * LIST_PERCENT / 100).clamp(LIST_MIN, LIST_MAX)
 }
 
-fn symbol(status: PhaseStatus) -> (&'static str, Color) {
+/// `text` cut to at most `max` characters, ending with `…` when it was cut.
+pub fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let mut out: String = text.chars().take(keep).collect();
+    if max > 0 {
+        out.push('…');
+    }
+    out
+}
+
+/// ratatui style for a role; the same roles the CLI paints with ANSI codes.
+fn role_style(role: Role) -> Style {
+    match role {
+        Role::Default => Style::new(),
+        Role::Heading => Style::new().add_modifier(Modifier::BOLD),
+        Role::Dim => Style::new().fg(Color::DarkGray),
+        Role::Ok => Style::new().fg(Color::Green),
+        Role::Fail => Style::new().fg(Color::Red),
+        Role::Warn => Style::new().fg(Color::Yellow),
+        Role::Accent => Style::new().fg(Color::Cyan),
+        Role::Tool => Style::new().fg(Color::Blue),
+    }
+}
+
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let v = &app.view;
+    let dim = role_style(Role::Dim);
+    let mut spans = vec![Span::styled("phasewise", role_style(Role::Heading))];
+    // v0.2 part 2 adds the model after the agent.
+    for (label, value) in [
+        ("run", v.run_id.as_str()),
+        ("plan", v.plan_title.as_str()),
+        ("agent", v.agent.as_str()),
+        ("branch", v.run_branch.as_str()),
+    ] {
+        spans.push(Span::styled(format!("  {label} "), dim));
+        spans.push(Span::raw(value.to_string()));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn symbol(status: PhaseStatus) -> (&'static str, Role) {
     match status {
-        PhaseStatus::Pending => ("·", Color::DarkGray),
-        PhaseStatus::Running => ("▶", Color::Yellow),
-        PhaseStatus::Verifying => ("◎", Color::Yellow),
-        PhaseStatus::AwaitingReview => ("●", Color::Blue),
-        PhaseStatus::Done => ("✓", Color::Green),
-        PhaseStatus::Failed => ("✗", Color::Red),
+        PhaseStatus::Pending => ("·", Role::Dim),
+        PhaseStatus::Running | PhaseStatus::Verifying => ("●", Role::Warn),
+        PhaseStatus::AwaitingReview => ("◆", Role::Accent),
+        PhaseStatus::Done => ("✓", Role::Ok),
+        PhaseStatus::Failed => ("✗", Role::Fail),
     }
 }
 
 fn draw_phases(frame: &mut Frame, app: &App, area: Rect) {
+    // Border (2) and highlight symbol (2) take columns from the row.
+    let row_width = usize::from(area.width).saturating_sub(4);
     let items: Vec<ListItem> = app
         .view
         .phases
         .iter()
         .map(|p| {
-            let (sym, color) = symbol(p.status);
+            let (sym, role) = symbol(p.status);
+            let prefix = format!(" {} ", p.number);
+            let room = row_width.saturating_sub(1 + prefix.chars().count());
             ListItem::new(Line::from(vec![
-                Span::styled(sym, Style::new().fg(color)),
-                Span::raw(format!(" {} {}", p.number, p.title)),
+                Span::styled(sym, role_style(role)),
+                Span::raw(format!("{prefix}{}", truncate(&p.title, room))),
             ]))
         })
         .collect();
@@ -126,8 +173,8 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let lines = match app.tab {
         Tab::Diff => diff_lines(&app.diff),
-        Tab::Log => app.log.iter().map(|l| Line::raw(l.as_str())).collect(),
-        Tab::Verify => app.verify.lines().map(Line::raw).collect(),
+        Tab::Log => app.log.iter().map(log_line).collect(),
+        Tab::Verify => verify_lines(&app.verify),
     };
     app.page = content.height.max(1);
     let max_scroll = u16::try_from(lines.len())
@@ -135,6 +182,79 @@ fn draw_detail(frame: &mut Frame, app: &mut App, area: Rect) {
         .saturating_sub(content.height);
     app.scroll = app.scroll.min(max_scroll);
     frame.render_widget(Paragraph::new(lines).scroll((app.scroll, 0)), content);
+}
+
+fn event_spans(line: &EventLine) -> Vec<Span<'static>> {
+    let style = role_style(line.role);
+    let mut spans = vec![Span::styled(line.icon, style)];
+    if !line.label.is_empty() {
+        let label = if line.detail.is_empty() {
+            line.label.clone()
+        } else {
+            line.label_column()
+        };
+        spans.push(Span::styled(format!(" {label}"), style));
+    }
+    if !line.detail.is_empty() {
+        spans.push(Span::styled(
+            format!(" {}", line.detail),
+            role_style(line.detail_role()),
+        ));
+    }
+    spans
+}
+
+fn log_line(line: &LogLine) -> Line<'static> {
+    match line {
+        LogLine::Attempt { number, resumed } => Line::styled(
+            LogLine::attempt_heading(*number, *resumed),
+            role_style(Role::Heading),
+        ),
+        LogLine::Event(event) => Line::from(event_spans(event)),
+    }
+}
+
+/// The verification log: `$ command` lines are headings with the result of
+/// the command in front (read from the `exit code:` line that follows it),
+/// output lines are plain, failure trailers are red.
+fn verify_lines(text: &str) -> Vec<Line<'static>> {
+    let all: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in all.iter().enumerate() {
+        if let Some(command) = line.strip_prefix("$ ") {
+            let result = all[i + 1..]
+                .iter()
+                .take_while(|l| !l.starts_with("$ ") && !l.starts_with("=== "))
+                .find_map(|l| {
+                    if *l == "exit code: 0" {
+                        Some(("✓", Role::Ok))
+                    } else if l.starts_with("exit code: ")
+                        || l.starts_with("timed out after ")
+                        || *l == "interrupted"
+                    {
+                        Some(("✗", Role::Fail))
+                    } else {
+                        None
+                    }
+                });
+            let (icon, role) = result.unwrap_or(("⚙", Role::Dim));
+            out.push(Line::from(vec![
+                Span::styled(icon, role_style(role)),
+                Span::raw(" "),
+                Span::styled(format!("$ {command}"), role_style(Role::Heading)),
+            ]));
+        } else if line.starts_with("=== ") {
+            out.push(Line::styled(line.to_string(), role_style(Role::Dim)));
+        } else if (line.starts_with("exit code: ") && *line != "exit code: 0")
+            || line.starts_with("timed out after ")
+            || *line == "interrupted"
+        {
+            out.push(Line::styled(line.to_string(), role_style(Role::Fail)));
+        } else {
+            out.push(Line::raw(line.to_string()));
+        }
+    }
+    out
 }
 
 fn tab_line(active: Tab) -> Line<'static> {
@@ -160,7 +280,10 @@ fn diff_lines(diff: &DiffView) -> Vec<Line<'static>> {
             (Some(a), Some(r)) => format!("+{a} -{r}"),
             _ => "bin".to_string(),
         };
-        lines.push(Line::raw(format!("  {path}  {counts}")));
+        lines.push(Line::styled(
+            format!("  {path}  {counts}"),
+            role_style(Role::Heading),
+        ));
     }
     if let Some(note) = &diff.note {
         lines.push(Line::raw(note.clone()));
@@ -214,8 +337,8 @@ fn diff_line(line: &str) -> Line<'static> {
 fn draw_bottom(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = Vec::new();
     for (key, what) in app.available_keys() {
-        spans.push(Span::styled(key, Style::new().add_modifier(Modifier::BOLD)));
-        spans.push(Span::raw(format!(" {what}  ")));
+        spans.push(Span::styled(key, role_style(Role::Heading)));
+        spans.push(Span::styled(format!(" {what}  "), role_style(Role::Dim)));
     }
     if let Some(message) = &app.message {
         spans.push(Span::styled(
@@ -253,6 +376,19 @@ fn draw_popup(frame: &mut Frame, app: &App, area: Rect) {
                 Line::raw(""),
                 Line::raw("y: confirm   any other key: cancel"),
             ],
+        ),
+        Mode::Help => (
+            " Keys ",
+            HELP_KEYS
+                .iter()
+                .map(|(key, what)| {
+                    Line::from(vec![
+                        Span::styled(format!("{key:<12}"), role_style(Role::Heading)),
+                        Span::raw(*what),
+                    ])
+                })
+                .chain([Line::raw(""), Line::raw("Press any key to close.")])
+                .collect(),
         ),
         Mode::Note(buffer) => (
             " Retry ",
@@ -294,6 +430,8 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use crate::agent::AgentEvent;
+    use crate::display::agent_event_line;
     use crate::tui::data::{PhaseView, RunView};
 
     fn app() -> App {
@@ -355,14 +493,88 @@ mod tests {
     fn log_tab_with_subagent_line() {
         let mut app = app();
         app.tab = Tab::Log;
+        let call = |name: &str, detail: &str, subagent| {
+            LogLine::Event(
+                agent_event_line(&AgentEvent::ToolCall {
+                    name: name.into(),
+                    detail: detail.into(),
+                    subagent,
+                })
+                .expect("tool line"),
+            )
+        };
         app.log = vec![
-            "── attempt 1 ──".into(),
-            "Working on phase 2.".into(),
-            "Write src/parser.rs".into(),
-            "[subagent] Read src/plan.rs".into(),
+            LogLine::Attempt {
+                number: 1,
+                resumed: false,
+            },
+            LogLine::Event(
+                agent_event_line(&AgentEvent::Message {
+                    text: "Working on phase 2.".into(),
+                    subagent: false,
+                })
+                .expect("message line"),
+            ),
+            call("Write", "src/parser.rs", false),
+            call("Read", "src/plan.rs", true),
+            call("Bash", "cargo test", false),
+            LogLine::Attempt {
+                number: 2,
+                resumed: true,
+            },
+            LogLine::Event(
+                agent_event_line(&AgentEvent::Retry {
+                    detail: "rate limited".into(),
+                })
+                .expect("retry line"),
+            ),
         ];
         let terminal = render(&mut app, 100, 30);
         insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn verify_tab() {
+        let mut app = app();
+        app.tab = Tab::Verify;
+        app.verify = "=== attempt 1 ===\n$ cargo test\nrunning 3 tests\nexit code: 0\n$ test -f a.md\nexit code: 1\n$ sleep 9\ntimed out after 1 s\n".to_string();
+        let terminal = render(&mut app, 100, 30);
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn help_popup() {
+        let mut app = app();
+        app.mode = Mode::Help;
+        let terminal = render(&mut app, 100, 30);
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn long_titles_are_truncated_with_an_ellipsis() {
+        let mut app = app();
+        app.view.phases[0].title = "A very long phase title that cannot possibly fit".into();
+        let terminal = render(&mut app, 80, 20);
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn truncate_cuts_on_characters_and_marks_the_cut() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("exactly10!", 10), "exactly10!");
+        assert_eq!(truncate("0123456789ab", 10), "012345678…");
+        assert_eq!(truncate("ñandú ñandú ñandú", 6), "ñandú…");
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("abc", 1), "…");
+    }
+
+    #[test]
+    fn phase_panel_is_30_percent_clamped_to_24_and_48() {
+        assert_eq!(list_width(80), 24);
+        assert_eq!(list_width(100), 30);
+        assert_eq!(list_width(120), 36);
+        assert_eq!(list_width(160), 48);
+        assert_eq!(list_width(400), 48);
     }
 
     #[test]

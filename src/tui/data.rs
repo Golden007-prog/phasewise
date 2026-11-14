@@ -3,10 +3,33 @@
 
 use anyhow::Result;
 
+use crate::agent::AgentEvent;
 use crate::agent::agent_for;
-use crate::display::{describe_agent_event, failure_kind_label, first_line_short};
+use crate::display::{EventLine, agent_event_line, failure_kind_label, first_line_short};
 use crate::ops::Run;
 use crate::state::{PhaseStatus, RunStatus};
+
+/// One line of the Log tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogLine {
+    /// Heading of an attempt; `resumed` when it continued an earlier session.
+    Attempt {
+        number: u32,
+        resumed: bool,
+    },
+    Event(EventLine),
+}
+
+impl LogLine {
+    /// Text of an attempt heading, for example `── attempt 2 · resumed ──`.
+    pub fn attempt_heading(number: u32, resumed: bool) -> String {
+        if resumed {
+            format!("── attempt {number} · resumed ──")
+        } else {
+            format!("── attempt {number} ──")
+        }
+    }
+}
 
 const NO_VERIFY: &str = "No verification output yet.";
 
@@ -144,26 +167,42 @@ pub fn load_diff(run: &Run, phase: usize) -> Result<DiffView> {
     }
 }
 
-/// Normalized agent events of every attempt of `phase`, one line each, with a
-/// separator line per attempt. Missing attempt files are skipped.
-pub fn load_log(run: &Run, phase: usize) -> Vec<String> {
+/// Normalized agent events of every attempt of `phase`, with a heading line
+/// per attempt. Missing attempt files are skipped. An attempt counts as
+/// resumed when its session id was already seen in an earlier attempt.
+pub fn load_log(run: &Run, phase: usize) -> Vec<LogLine> {
     let attempts = run.state.phase(phase).map_or(0, |p| p.attempts);
     let agent = agent_for(run.state.agent);
     let mut lines = Vec::new();
+    let mut seen_sessions: Vec<String> = Vec::new();
     for attempt in 1..=attempts {
         let Ok(raw) = std::fs::read(run.paths.agent_stdout_log(phase, attempt)) else {
             continue;
         };
         let raw = String::from_utf8_lossy(&raw);
         let mut parser = agent.parser(run.git.root());
-        lines.push(format!("── attempt {attempt} ──"));
+        let heading = lines.len();
+        lines.push(LogLine::Attempt {
+            number: attempt,
+            resumed: false,
+        });
+        let mut sessions = Vec::new();
         for line in raw.lines() {
             for event in parser.feed(line) {
-                if let Some(text) = describe_agent_event(&event) {
-                    lines.push(text);
+                if let AgentEvent::SessionStarted { session_id } = &event {
+                    sessions.push(session_id.clone());
+                }
+                if let Some(text) = agent_event_line(&event) {
+                    lines.push(LogLine::Event(text));
                 }
             }
         }
+        let resumed = sessions.iter().any(|id| seen_sessions.contains(id));
+        lines[heading] = LogLine::Attempt {
+            number: attempt,
+            resumed,
+        };
+        seen_sessions.extend(sessions);
     }
     lines
 }

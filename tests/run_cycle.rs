@@ -122,7 +122,16 @@ fn full_cycle(agent_args: &[&str]) {
     run_args.extend_from_slice(agent_args);
     let out = env.ok(&run_args, &[]);
     assert!(out.stdout.contains("phasewise/"), "{}", out.stdout);
-    assert!(out.stdout.contains("Phase 1/3: First"), "{}", out.stdout);
+    assert!(out.stdout.contains("▶ Phase 1/3 · First"), "{}", out.stdout);
+    assert!(out.stdout.contains("attempt 1 · "), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("✓ Phase 1 ready for review · 1 file"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("● Checkpoint "), "{}", out.stdout);
+    // Not a terminal: no colour codes.
+    assert!(!out.stdout.contains('\x1b'), "{}", out.stdout);
     assert!(out.stdout.contains("phasewise next"), "{}", out.stdout);
     assert_eq!(env.statuses(), ["awaiting_review", "pending", "pending"]);
 

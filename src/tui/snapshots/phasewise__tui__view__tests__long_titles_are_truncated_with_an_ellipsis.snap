@@ -1,0 +1,24 @@
+---
+source: src/tui/view.rs
+expression: terminal.backend()
+---
+"phasewise  run 20260101-120000  plan Demo plan  agent claude  branch phasewise/2"
+"┌ Phases ──────────────┐┌ Phase 2: awaiting review (attempt 1) ────────────────┐"
+"│  ✓ 1 A very long pha…││Diff | Log | Verify                                   │"
+"│> ◆ 2 Add the parser  ││                                                      │"
+"│  · 3 Write the docs  ││                                                      │"
+"│  ✗ 4 Release         ││                                                      │"
+"│                      ││                                                      │"
+"│                      ││                                                      │"
+"│                      ││                                                      │"
+"│                      ││                                                      │"
+"│                      ││                                                      │"
+"│                      ││                                                      │"
+"│                      ││                                                      │"
+"│                      ││                                                      │"
+"│                      ││                                                      │"
+"│                      ││                                                      │"
+"│                      ││                                                      │"
+"│                      ││                                                      │"
+"└──────────────────────┘└──────────────────────────────────────────────────────┘"
+"j/k phase  Tab tab  PgUp/PgDn scroll  r retry  b rollback  ? help  q quit       "

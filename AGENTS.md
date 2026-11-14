@@ -14,9 +14,11 @@ branch, and stops for review.
 Module map, internal APIs and invariants: `docs/dev/design.md` (binding).
 Agent CLI facts and exact command lines: `docs/dev/agent-cli-notes.md`.
 Decisions and deviations from the original plan: `docs/dev/decisions.md`.
+v0.2 additions (output, models, `plan`, home screen): `docs/dev/design-v0.2.md`
+(binding, like `design.md`).
 
 Modules (`src/`): `cli` (clap, dispatch, exit codes), `display` (event and
-status formatting shared by CLI and TUI), `plan` (parser), `prompt` (all agent
+status formatting shared by CLI and TUI), `style` (ANSI colour for the CLI), `plan` (parser), `prompt` (all agent
 prompt texts), `git` (the only module that runs `git`), `state` (`state.json`,
 run layout, lock, recovery), `process` (process groups), `verify` (verification
 commands), `agent/` (`mod`, `claude`, `codex`: command lines and output

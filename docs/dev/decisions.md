@@ -255,3 +255,38 @@ deviates from the original plan, with the reason.
   "experimental". Raw captures were not saved as fixtures (personal data).
 - **Real smoke test with Codex passed** (0.160.0, logged in with ChatGPT, run
   without `OPENAI_API_KEY`), 8/8 checks; Codex is now "tested" in the README.
+
+## v0.2 — clearer output
+
+- **Colours.** Role to colour: heading bold, dim dark grey, ok green, fail red,
+  warn yellow, accent cyan, tool blue. The TUI uses the same roles through
+  ratatui styles. "Awaiting review" was blue in the TUI and is now accent
+  (cyan) so that `status` and the TUI agree.
+- **crossterm and `NO_COLOR`.** crossterm drops its own codes when `NO_COLOR`
+  is set, but `Styler` already decides that. `Styler::paint` calls
+  `force_color_output(true)` before painting, so a coloured `Styler` always
+  produces codes and the unit tests do not depend on the environment.
+- **`PhaseFinished` carries `files` and `cost_usd`.** The end-of-phase summary
+  needs them while the engine thread owns the run, so the engine computes them
+  (`git::changed_file_count` between checkpoints) instead of the CLI reading
+  the state back. The cost is the phase total over all its attempts.
+- **Agent exit.** `AgentExited` with code 0 is the `✓ Agent finished` line;
+  another code is `✗ Agent exited with code N`; a stopped agent is `!`.
+- **Hooks for part 2.** `display::phase_header` takes `model` and `effort`
+  (`None` for now); `status`, `check` and the TUI header have comments where
+  the model goes. No fields or flags were added.
+- **Failure block.** After `✗ Phase N failed (kind)` the existing block is
+  kept unchanged, so the detail and the options stay in one place.
+- **"Ready for review" hint.** The old "Phase N is ready for review." line is
+  gone (the summary line says it); the three `phasewise diff/review/next`
+  hints stay, dim.
+- **Resumed attempts in the Log tab.** The log files do not record whether an
+  attempt resumed, so `load_log` marks an attempt as resumed when its session
+  id (from the agent's own `SessionStarted` event) was already seen in an
+  earlier attempt.
+- **Verify tab.** `verify.log` has no ✓/✗ marks, so the TUI derives them from
+  the `exit code: N`, `timed out` or `interrupted` line after each `$ command`.
+  A command still running shows `⚙`.
+- **Help popup.** `?` opens it and any key closes it.
+- **Header bar.** Reads `phasewise  run <id>  plan <title>  agent <a>  branch <b>`
+  with dim labels. At the minimum width (80) a long branch name is cut off.

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Clearer output: phase blocks with icons and a summary line (files and cost), colour on terminals only (`NO_COLOR` and `TERM=dumb` respected), a coloured TUI with a resizable phase panel, attempt headings in the Log tab and a `?` help popup.
 - Markdown plan format with optional TOML front matter (`agent`, `verify`, `max_retries`, `phase_timeout_minutes`, `verify_timeout_seconds`, `agent_args`), per-phase `verify` blocks and line-accurate validation errors.
 - Commands: `init`, `check`, `doctor`, `run`, `next`, `retry`, `rollback`, `status`, `diff`, `review` and `abort`; `phasewise` with no arguments opens the TUI for an active run on a terminal, otherwise prints the help.
 - Phase engine: headless agent run per phase, verification commands with timeouts, automatic retries with the failure report, checkpoint commits with `Phasewise-Run` / `Phasewise-Phase` trailers on the branch `phasewise/<run-id>`.

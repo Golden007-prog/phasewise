@@ -1,0 +1,34 @@
+{
+  "models": [
+    {
+      "slug": "gpt-hidden",
+      "display_name": "GPT-Hidden",
+      "description": "Internal model, not listed.",
+      "visibility": "hide",
+      "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]
+    },
+    {
+      "slug": "gpt-fast",
+      "display_name": "GPT-Fast",
+      "description": "Fast model for simple tasks.",
+      "visibility": "list",
+      "priority": 2,
+      "supported_reasoning_levels": [
+        {"effort": "low", "description": "Quick"},
+        {"effort": "medium"},
+        {"effort": "high"}
+      ],
+      "unknown_field": {"nested": true}
+    },
+    {
+      "display_name": "Entry without slug, skipped",
+      "visibility": "list"
+    },
+    {
+      "slug": "gpt-deep",
+      "display_name": "GPT-Deep",
+      "visibility": "list",
+      "supported_reasoning_levels": ["low", "medium", "high", "xhigh", "max"]
+    }
+  ]
+}
