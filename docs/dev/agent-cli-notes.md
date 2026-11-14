@@ -60,12 +60,27 @@ phase can never wait for a human answer.
 
 ### Event format
 
-Still to be confirmed against a real capture (build phase 5). Expected from the
-documentation: one JSON object per line; `system`/`init` first (possibly after
-hook or plugin events), `assistant`/`user` messages carrying `session_id` and
-`parent_tool_use_id` (non-null for subagents), `system`/`api_retry`, and a final
-`result` with `result`, `session_id`, `total_cost_usd`, `is_error` and
-`permission_denials`.
+Not captured from a real run (see "Real smoke test" below). Checked on
+2026-11-14 against the Agent SDK TypeScript reference
+(<https://code.claude.com/docs/en/agent-sdk/typescript>) and the headless page:
+
+- One JSON object per line; every message carries `session_id` (optional on
+  `user` messages). `system`/`init` comes first, possibly after hook or plugin
+  events.
+- `assistant` / `user`: content blocks in `message.content`;
+  `parent_tool_use_id` is `null` for the main agent and a tool use id for
+  subagent messages.
+- `system`/`api_retry`: `attempt`, `max_retries`, `retry_delay_ms`,
+  `error_status`, `error`.
+- `system`/`permission_denied`: `tool_name`, `tool_use_id`, `message`
+  (best effort; the result's `permission_denials` is authoritative).
+- `result`: `subtype` is `success` or `error_max_turns`,
+  `error_during_execution`, `error_max_budget_usd`,
+  `error_max_structured_output_retries`; `is_error`, `total_cost_usd`,
+  `permission_denials` (`tool_name`, `tool_use_id`, `tool_input`). `result`
+  (final text) exists only on `success`; error subtypes carry `errors: string[]`.
+
+The fixtures `tests/fixtures/claude-*.synthetic.jsonl` follow these shapes.
 
 ## Codex
 
@@ -115,8 +130,33 @@ exercises fresh sessions unless a retry happens).
 
 ### Event format
 
-Still to be confirmed against a real capture (build phase 5). Expected from the
-documentation: JSON Lines with `thread.started` (`thread_id`), `turn.started`,
-`turn.completed` (`usage`), `turn.failed`, `item.started`, `item.completed` and
-`error`. The exact item type string for file changes must come from a real
-capture. Codex reports token usage, not cost, so `cost_usd` stays empty.
+Not captured from a real run (see below). Checked on 2026-11-14 against the
+source of the installed version (`codex-rs/exec/src/exec_events.rs` at tag
+`rust-v0.160.0` of openai/codex):
+
+- Top-level `type`: `thread.started` (`thread_id`), `turn.started`,
+  `turn.completed` (`usage`), `turn.failed` (`error.message`), `item.started`,
+  `item.updated`, `item.completed` (`item`), `error` (`message`).
+- `item` = `id` + `type` (snake_case) + fields: `agent_message` (`text`),
+  `reasoning` (`text`), `command_execution` (`command`, `aggregated_output`,
+  `exit_code`, `status`), `file_change` (`changes: [{path, kind:
+  add|delete|update}]`, `status`), `mcp_tool_call` (`server`, `tool`, …),
+  `collab_tool_call` (subagents: `tool`, `prompt`, …), `web_search` (`query`),
+  `todo_list` (`items`), `error` (`message`).
+- Codex reports token usage, not cost, so `cost_usd` stays empty.
+
+The fixtures `tests/fixtures/codex-*.synthetic.jsonl` follow these shapes.
+
+## Real smoke test (plan section 8)
+
+Not run on 2026-11-14: neither CLI had a session of its own on this machine.
+
+- `claude auth status` (in a clean environment and in the user's login shell):
+  `"loggedIn": false`, `"authMethod": "none"`, and no `ANTHROPIC_API_KEY`.
+- `codex login status`: `Not logged in`; no `~/.codex/auth.json` or
+  `config.toml`. An `OPENAI_API_KEY` for another provider exists in the shell;
+  it was not used, because Codex would send it to OpenAI.
+
+Both agents stay "experimental — not yet verified against a real run" until
+the smoke test passes. To run it after logging in, see
+`docs/dev/smoke-test.md`.

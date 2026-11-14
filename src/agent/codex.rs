@@ -72,15 +72,18 @@ impl CodexParser {
         }
     }
 
-    fn item(&mut self, item: &Value, out: &mut Vec<AgentEvent>) {
+    /// `completed` is true for `item.completed`, false for `item.started` and
+    /// `item.updated`.
+    fn item(&mut self, item: &Value, completed: bool, out: &mut Vec<AgentEvent>) {
         let kind = item.get("type").and_then(Value::as_str);
         let text_of = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
         let id = item.get("id").and_then(Value::as_str);
 
-        // A message is only reported once it has text; the others on first sight.
+        // A message is only reported when completed (earlier sightings may be
+        // partial) and once it has text; the other items on first sight.
         if kind == Some("agent_message") {
             let text = text_of("text");
-            if text.trim().is_empty() {
+            if !completed || text.trim().is_empty() {
                 return;
             }
             self.last_message = text.to_string();
@@ -116,13 +119,28 @@ impl CodexParser {
                 ),
             ),
             Some("web_search") => ("WebSearch", tidy_detail(text_of("query"), &self.root)),
+            // Codex subagents ("collab" tools): the call itself is the only
+            // trace of their activity in the main thread's stream.
+            Some("collab_tool_call") => {
+                let prompt = text_of("prompt").lines().next().unwrap_or_default();
+                let detail = format!("{} {prompt}", text_of("tool"));
+                ("Subagent", tidy_detail(detail.trim(), &self.root))
+            }
+            Some("error") => {
+                if self.first_time(id) {
+                    out.push(AgentEvent::Error {
+                        detail: text_of("message").to_string(),
+                    });
+                }
+                return;
+            }
             _ => return,
         };
         if self.first_time(id) {
             out.push(AgentEvent::ToolCall {
                 name: name.to_string(),
                 detail,
-                subagent: false,
+                subagent: kind == Some("collab_tool_call"),
             });
         }
     }
@@ -155,9 +173,9 @@ impl AgentParser for CodexParser {
             });
         }
         match value.get("type").and_then(Value::as_str) {
-            Some("item.started") | Some("item.completed") => {
+            Some(kind @ ("item.started" | "item.updated" | "item.completed")) => {
                 if let Some(item) = value.get("item") {
-                    self.item(item, &mut out);
+                    self.item(item, kind == "item.completed", &mut out);
                 }
             }
             Some("turn.completed") => out.push(AgentEvent::Finished {
@@ -295,6 +313,49 @@ mod tests {
                 ok: true,
                 summary: String::new(),
                 cost_usd: None
+            }]
+        );
+    }
+
+    #[test]
+    fn updated_items_subagents_and_error_items() {
+        let mut parser = CodexParser::new(Path::new("/work/repo"));
+        let partial =
+            r#"{"type":"item.updated","item":{"id":"m","type":"agent_message","text":"Work"}}"#;
+        assert!(parser.feed(partial).is_empty());
+        let cmd = r#"{"type":"item.updated","item":{"id":"c","type":"command_execution","command":"ls","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#;
+        let cmd_done = r#"{"type":"item.completed","item":{"id":"c","type":"command_execution","command":"ls","aggregated_output":"a","exit_code":0,"status":"completed"}}"#;
+        assert_eq!(
+            parser.feed(cmd),
+            vec![AgentEvent::ToolCall {
+                name: "Shell".into(),
+                detail: "ls".into(),
+                subagent: false
+            }]
+        );
+        assert!(parser.feed(cmd_done).is_empty());
+        let collab = r#"{"type":"item.started","item":{"id":"s","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"t0","receiver_thread_ids":[],"prompt":"Write the tests\nin detail","agents_states":{},"status":"in_progress"}}"#;
+        assert_eq!(
+            parser.feed(collab),
+            vec![AgentEvent::ToolCall {
+                name: "Subagent".into(),
+                detail: "spawn_agent Write the tests".into(),
+                subagent: true
+            }]
+        );
+        let error = r#"{"type":"item.completed","item":{"id":"e","type":"error","message":"model overloaded"}}"#;
+        assert_eq!(
+            parser.feed(error),
+            vec![AgentEvent::Error {
+                detail: "model overloaded".into()
+            }]
+        );
+        let done = r#"{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"Work done."}}"#;
+        assert_eq!(
+            parser.feed(done),
+            vec![AgentEvent::Message {
+                text: "Work done.".into(),
+                subagent: false
             }]
         );
     }

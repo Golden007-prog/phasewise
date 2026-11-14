@@ -170,7 +170,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Some(Command::Init) => init(),
         Some(Command::Check { plan }) => check(plan),
-        Some(Command::Doctor) => not_implemented("doctor"),
+        Some(Command::Doctor) => doctor(),
         Some(Command::Run { plan, agent, auto }) => run_command(plan, agent, auto),
         Some(Command::Next { auto }) => next_command(auto),
         Some(Command::Retry { .. }) => not_implemented("retry"),
@@ -251,6 +251,18 @@ fn print_plan(plan: &plan::Plan, path: &Path) {
     }
     println!();
     println!("{} phases. The plan is valid.", plan.phases.len());
+}
+
+fn doctor() -> Result<ExitCode> {
+    let report = crate::doctor::run(&current_dir()?);
+    for line in &report.lines {
+        println!("{line}");
+    }
+    Ok(if report.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 fn init() -> Result<ExitCode> {

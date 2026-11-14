@@ -54,16 +54,30 @@ impl Git {
         &self.root
     }
 
-    /// Makes sure `pattern` is a line of `.git/info/exclude`. Returns whether
-    /// the file changed.
-    pub fn ensure_excluded(&self, pattern: &str) -> Result<bool> {
+    fn exclude_path(&self) -> Result<PathBuf> {
         let out = self.run(&["rev-parse", "--git-path", "info/exclude"])?;
         let rel = PathBuf::from(out.trim());
-        let path = if rel.is_absolute() {
+        Ok(if rel.is_absolute() {
             rel
         } else {
             self.root.join(rel)
-        };
+        })
+    }
+
+    /// Whether `pattern` is a line of the exclude file. Read-only.
+    pub fn is_excluded(&self, pattern: &str) -> Result<bool> {
+        let path = self.exclude_path()?;
+        match fs::read_to_string(&path) {
+            Ok(text) => Ok(text.lines().any(|l| l == pattern)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("Cannot read {}", path.display())),
+        }
+    }
+
+    /// Makes sure `pattern` is a line of `.git/info/exclude`. Returns whether
+    /// the file changed.
+    pub fn ensure_excluded(&self, pattern: &str) -> Result<bool> {
+        let path = self.exclude_path()?;
         let existing = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),

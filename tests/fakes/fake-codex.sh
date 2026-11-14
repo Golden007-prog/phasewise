@@ -3,6 +3,11 @@
 # FAKE_MODE (or FAKE_MODE_<N> per phase): success, fail, fix_on_resume,
 # never_fixes, commit, slow, branch. FAKE_LOG_DIR: append calls to calls.log.
 
+if [ "$1" = "--version" ]; then
+    echo "codex-cli 0.0.0-fake"
+    exit 0
+fi
+
 prompt=$(cat)
 
 resume=""

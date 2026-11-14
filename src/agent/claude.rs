@@ -207,13 +207,25 @@ impl AgentParser for ClaudeParser {
                     .get("is_error")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                // Success results carry `result`; error subtypes carry
+                // `errors: string[]` instead (Agent SDK reference).
+                let summary = match value.get("result").and_then(Value::as_str) {
+                    Some(text) => text.to_string(),
+                    None => value
+                        .get("errors")
+                        .and_then(Value::as_array)
+                        .map(|errors| {
+                            errors
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        })
+                        .unwrap_or_default(),
+                };
                 out.push(AgentEvent::Finished {
                     ok: !is_error && subtype == Some("success"),
-                    summary: value
-                        .get("result")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
+                    summary,
                     cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),
                 });
             }
@@ -242,6 +254,25 @@ mod tests {
             detail: detail.into(),
             subagent,
         }
+    }
+
+    #[test]
+    fn error_result_uses_errors_array() {
+        let mut parser = ClaudeParser::new(Path::new("/work/repo"));
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s","total_cost_usd":0.5,"permission_denials":[],"errors":["Tool failed","Aborted"]}"#;
+        assert_eq!(
+            parser.feed(line),
+            vec![
+                AgentEvent::SessionStarted {
+                    session_id: "s".into()
+                },
+                AgentEvent::Finished {
+                    ok: false,
+                    summary: "Tool failed; Aborted".into(),
+                    cost_usd: Some(0.5)
+                }
+            ]
+        );
     }
 
     #[test]

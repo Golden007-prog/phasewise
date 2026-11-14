@@ -98,3 +98,27 @@ deviates from the original plan, with the reason.
   lock, a dirty tree, or when not on the run branch.
 - **`status` columns:** `#`, `STATUS`, `TRIES`, `FILES`, `COST`, `TITLE`.
 - `tests/cli.rs` stub test now uses `review` (`status` is implemented).
+
+## Build phase 5
+
+- **Adapters were written in phase 4**, because the fake agents need the real
+  output formats to exercise the engine; phase 5 aligned them with the
+  documented formats and added `doctor`.
+- **Real smoke test not run.** Neither `claude` (not logged in, no API key)
+  nor `codex` (not logged in, no `auth.json`) had a session of their own. The
+  development session's environment carries host-provided credentials of the
+  desktop app; they were not used (rule: never use or copy tokens). The
+  shell's `OPENAI_API_KEY` belongs to another provider and was not sent to
+  OpenAI. Both agents stay "experimental". `scripts/smoke-test.sh` and
+  `docs/dev/smoke-test.md` let the maintainer run the test after logging in.
+- **Event formats without real captures:** Codex checked against its source
+  at tag `rust-v0.160.0` (`exec_events.rs`); Claude Code against the Agent SDK
+  TypeScript reference. Fixtures stay `.synthetic.jsonl`.
+- **Codex parser:** also reads `item.updated`; reports `collab_tool_call`
+  (Codex subagents) as `[subagent]` tool calls and `error` items as errors;
+  agent messages are taken only from `item.completed` (earlier ones may be
+  partial).
+- **Claude parser:** error results carry `errors: string[]` instead of
+  `result`; the summary joins them.
+- **`doctor` does not check logins**: the plan scopes it to presence, version
+  and repository; login subcommands could reach the network.
