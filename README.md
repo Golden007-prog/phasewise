@@ -1,11 +1,11 @@
-<h1 align="center">
+<div align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark) and (max-width: 600px)" srcset="assets/readme/card-narrow-dark.svg">
-    <source media="(max-width: 600px)" srcset="assets/readme/card-narrow-light.svg">
+    <source media="(prefers-color-scheme: dark) and (max-width: 900px)" srcset="assets/readme/card-narrow-dark.svg">
+    <source media="(max-width: 900px)" srcset="assets/readme/card-narrow-light.svg">
     <source media="(prefers-color-scheme: dark)" srcset="assets/readme/card-wide-dark.svg">
     <img src="assets/readme/card-wide-light.svg" alt="phasewise: big plans, one verified phase at a time. Claude Code, Codex and git.">
   </picture>
-</h1>
+</div>
 
 <p align="center">
   <a href="#quick-start"><b>Quick start</b></a> ·
@@ -31,8 +31,8 @@ Give an agent a big plan in one go and you get one enormous change to review, wi
 ## How a run works
 
 <picture>
-  <source media="(prefers-color-scheme: dark) and (max-width: 600px)" srcset="assets/readme/run-graph-narrow-dark.svg">
-  <source media="(max-width: 600px)" srcset="assets/readme/run-graph-narrow-light.svg">
+  <source media="(prefers-color-scheme: dark) and (max-width: 900px)" srcset="assets/readme/run-graph-narrow-dark.svg">
+  <source media="(max-width: 900px)" srcset="assets/readme/run-graph-narrow-light.svg">
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/run-graph-wide-dark.svg">
   <img src="assets/readme/run-graph-wide-light.svg" alt="Your branch, main, stays untouched. A run forks the branch phasewise/run-id from it. Phases 1 to 3 passed their checks and are saved as commits; phase 4 is in review. When you decide, you merge the run branch into main.">
 </picture>
