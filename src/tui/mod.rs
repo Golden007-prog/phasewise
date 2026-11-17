@@ -1317,6 +1317,7 @@ mod tests {
             attempts: 1,
             session_id: None,
             checkpoint_sha: None,
+            start_sha: None,
             summary: None,
             cost_usd: None,
             started_at: None,
