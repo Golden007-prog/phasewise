@@ -67,7 +67,9 @@ For orientation, read [Architecture](docs/ARCHITECTURE.md).
   with `PROPTEST_CASES=20000`.
 - **Agent output fixtures** are in `tests/fixtures/`. A `.synthetic` file was
   written by hand; anything copied from a real run must be cleaned of personal
-  paths, account data and MCP or plugin names first.
+  paths, account data and MCP or plugin names first. `tests/parser_mutations.rs`
+  feeds every fixture line back to both parsers with values changed, keys
+  removed and the line cut short: a new fixture gets that check for free.
 - **TUI snapshots** (`insta`) are in `src/tui/snapshots/`. After an intended
   change, update them with `INSTA_UPDATE=always cargo test --all-features` and
   read `git diff src/tui/snapshots` line by line before committing.
